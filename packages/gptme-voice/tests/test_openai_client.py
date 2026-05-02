@@ -81,6 +81,7 @@ def test_connect_exposes_subagent_tool_as_focused_lookup_only() -> None:
         assert "small, focused workspace lookup or action" in description
         assert "broad investigations" in description
         assert "post-call analysis" in description
+        assert "wait for the real subagent result" in description
         assert fake_ws.closed is True
 
     asyncio.run(_exercise())
@@ -99,6 +100,7 @@ def test_load_project_instructions_includes_post_call_follow_up_guard(
 
     # The preamble was applied (sanity — otherwise we'd get _DEFAULT_INSTRUCTIONS).
     assert "real-time voice conversation" in instructions
+    assert "wait for the actual subagent result" in instructions
 
     # The new POST-CALL FOLLOW-UP section exists.
     assert "POST-CALL FOLLOW-UP:" in instructions
@@ -258,6 +260,180 @@ def test_load_project_instructions_guards_present_without_personality_files(
     assert "real-time voice conversation" in instructions
     assert "POST-CALL FOLLOW-UP:" in instructions
     assert "Do NOT claim, announce, or imply that you have dispatched" in instructions
+    assert "wait for the actual subagent result" in instructions
+
+
+def test_load_project_instructions_includes_hangup_tool_rules(
+    tmp_path: Path,
+) -> None:
+    """Preamble must instruct the model to actually CALL the hangup tool.
+
+    Regression for the 2026-04-29 pre-event call where the model said goodbye
+    five-plus times verbally without ever calling the hangup tool. Once Erik
+    explicitly asked, the model still verbalized "I'll end the call now" three
+    more turns before finally invoking the tool. The fix is a prompt-level
+    instruction that verbal-only goodbyes are the failure mode and the tool
+    must be called whenever the call should end.
+    """
+    (tmp_path / "gptme.toml").write_text(
+        '[prompt]\nfiles = ["ABOUT.md"]\n',
+    )
+    (tmp_path / "ABOUT.md").write_text("# ABOUT\nYou are Bob.\n")
+
+    instructions = _load_project_instructions(str(tmp_path))
+
+    # The dedicated section exists.
+    assert "HANGUP TOOL RULES:" in instructions
+
+    # The core constraint: only the tool ends the call.
+    assert "only ends when you call the hangup tool" in instructions
+
+    # Anti-pattern guidance: don't ask permission, don't verbalize without calling.
+    assert "Do not ask for confirmation" in instructions
+    assert (
+        "without calling the hangup tool in the same turn" in instructions
+        or "without calling the hangup tool" in instructions
+    )
+
+    # Self-recovery hint when the model notices it forgot.
+    assert "you forgot to call the tool" in instructions
+
+
+def test_function_call_subagent_dispatch_does_not_auto_create_response() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        async def _on_function_call(name: str, arguments: dict) -> dict:
+            assert name == "subagent"
+            assert arguments == {"task": "check latest standup"}
+            return {
+                "status": "dispatched",
+                "task_id": "task-1",
+                "message": "Async lookup dispatched. Wait for the subagent result before giving the substantive answer.",
+            }
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                on_function_call=_on_function_call,
+            )
+            await client.connect()
+            await client._handle_event({"type": "session.created"})
+
+            baseline = len(fake_ws.sent)
+            await client._handle_event(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call-1",
+                    "name": "subagent",
+                    "arguments": json.dumps({"task": "check latest standup"}),
+                }
+            )
+
+            new_events = fake_ws.sent[baseline:]
+            assert new_events == [
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": json.dumps(
+                            {
+                                "status": "dispatched",
+                                "task_id": "task-1",
+                                "message": "Async lookup dispatched. Wait for the subagent result before giving the substantive answer.",
+                            }
+                        ),
+                    },
+                }
+            ]
+
+            await client.disconnect()
+
+    asyncio.run(_exercise())
+
+
+def test_function_call_subagent_status_still_auto_creates_response() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        async def _on_function_call(name: str, arguments: dict) -> dict:
+            assert name == "subagent_status"
+            assert arguments == {}
+            return {
+                "status": "ok",
+                "pending_count": 1,
+                "pending": [
+                    {
+                        "task_id": "task-1",
+                        "task": "check latest standup",
+                        "mode": "fast",
+                        "elapsed_seconds": 2.3,
+                        "stage": "running",
+                    }
+                ],
+            }
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                on_function_call=_on_function_call,
+            )
+            await client.connect()
+            await client._handle_event({"type": "session.created"})
+
+            baseline = len(fake_ws.sent)
+            await client._handle_event(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call-2",
+                    "name": "subagent_status",
+                    "arguments": json.dumps({}),
+                }
+            )
+
+            new_events = fake_ws.sent[baseline:]
+            assert new_events == [
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": "call-2",
+                        "output": json.dumps(
+                            {
+                                "status": "ok",
+                                "pending_count": 1,
+                                "pending": [
+                                    {
+                                        "task_id": "task-1",
+                                        "task": "check latest standup",
+                                        "mode": "fast",
+                                        "elapsed_seconds": 2.3,
+                                        "stage": "running",
+                                    }
+                                ],
+                            }
+                        ),
+                    },
+                },
+                {"type": "response.create"},
+            ]
+
+            await client.disconnect()
+
+    asyncio.run(_exercise())
 
 
 def test_disconnect_drains_late_transcript_events_without_sending_late_audio() -> None:
@@ -321,5 +497,134 @@ def test_disconnect_drains_late_transcript_events_without_sending_late_audio() -
         assert user_transcripts == ["final words"]
         assert audio_chunks == []
         assert fake_ws.closed is True
+
+    asyncio.run(_exercise())
+
+
+def test_hold_initial_response_suppresses_greeting() -> None:
+    """_hold_initial_response=True must block the initial greeting even after session ready."""
+
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(
+                    initial_response_instructions="Greet the caller.",
+                ),
+            )
+            client._hold_initial_response = True
+            await client.connect()
+
+            await client._handle_event({"type": "session.created"})
+            assert client._session_ready is not None
+            assert client._session_ready.is_set()
+
+            # No response.create must have been sent while held
+            response_creates = [
+                e for e in fake_ws.sent if e.get("type") == "response.create"
+            ]
+            assert response_creates == [], "greeting must be suppressed while held"
+
+            await client.disconnect()
+
+    asyncio.run(_exercise())
+
+
+def test_activate_session_releases_held_greeting() -> None:
+    """activate_session() must send the greeting on a held but session-ready client."""
+
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(
+                    initial_response_instructions="Hey, what's up?",
+                ),
+            )
+            client._hold_initial_response = True
+            await client.connect()
+            await client._handle_event({"type": "session.created"})
+
+            # Session is ready but greeting is still held
+            assert client._session_ready is not None
+            assert client._session_ready.is_set()
+            assert client._initial_response_sent is False
+
+            # Activating releases the greeting
+            await client.activate_session()
+
+            response_creates = [
+                e for e in fake_ws.sent if e.get("type") == "response.create"
+            ]
+            assert len(response_creates) == 1
+            assert response_creates[0]["response"]["instructions"] == "Hey, what's up?"
+            assert client._initial_response_sent is True
+
+            await client.disconnect()
+
+    asyncio.run(_exercise())
+
+
+def test_activate_session_before_session_ready_sends_greeting_on_ready() -> None:
+    """activate_session() before session.created must still send greeting once ready.
+
+    Race: Twilio's "start" event can arrive before xAI confirms the session on
+    a cold connection.  The greeting must fire only after session.created/updated.
+    """
+
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(
+                    initial_response_instructions="Hello there.",
+                ),
+            )
+            client._hold_initial_response = True
+            await client.connect()
+
+            # Activate before session.created arrives
+            await client.activate_session()
+
+            # Still no response.create — session not ready yet
+            response_creates = [
+                e for e in fake_ws.sent if e.get("type") == "response.create"
+            ]
+            assert response_creates == []
+
+            # Now session arrives
+            await client._handle_event({"type": "session.created"})
+
+            response_creates = [
+                e for e in fake_ws.sent if e.get("type") == "response.create"
+            ]
+            assert len(response_creates) == 1
+            assert response_creates[0]["response"]["instructions"] == "Hello there."
+
+            await client.disconnect()
 
     asyncio.run(_exercise())

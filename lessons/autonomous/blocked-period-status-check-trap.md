@@ -3,13 +3,12 @@ match:
   keywords:
     - blocked period
     - status check
-    - repetitive commits
     - all tasks blocked
-    - status check trap
     - nothing to do
     - waiting for input
     - strategic pause
     - productive while blocked
+  session_categories: [strategic, self-review, cleanup]
 status: active
 ---
 

@@ -1,12 +1,11 @@
 ---
 match:
   keywords:
-    - "updating gptme-contrib submodule"
-    - "verify workspace symlinks"
-    - "agent workspace maintenance"
-    - "workspace symlink verification"
     - "update submodule to latest"
-    - "submodule out of sync"
+    - "submodule is behind"
+    - "update gptme-contrib"
+    - "bump the submodule"
+  session_categories: [cleanup]
 status: active
 ---
 

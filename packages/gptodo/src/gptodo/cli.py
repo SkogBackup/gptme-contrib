@@ -6,6 +6,7 @@
 #     "rich>=13.0.0",
 #     "python-frontmatter>=1.1.0",
 #     "tabulate>=0.9.0",
+#     "tomli>=2.0.1; python_version < '3.11'",
 # ]
 # [tool.uv]
 # exclude-newer = "2024-04-01T00:00:00Z"
@@ -122,6 +123,7 @@ from gptodo.utils import (
     get_cache_path,
     has_new_activity,
     is_task_ready,
+    task_has_waiting_blocker,
     load_cache,
     load_tasks,
     normalize_state,
@@ -941,9 +943,13 @@ def check(fix: bool, task_files: list[str]):
     repo_root = find_repo_root(Path.cwd())
     tasks_dir = repo_root / "tasks"
 
-    # ALWAYS load all tasks to build complete task_ids set for dependency checking
-    all_tasks = load_tasks(tasks_dir)
-    if not all_tasks:
+    # ALWAYS load all tasks to build complete task_ids set for dependency checking.
+    # Capture per-file load errors so we can surface invisible tasks (files that
+    # fail to parse, e.g. broken YAML frontmatter, are otherwise silently dropped
+    # by load_tasks and the user sees a misleading "All N tasks verified" report).
+    load_errors: list[tuple[Path, str]] = []
+    all_tasks = load_tasks(tasks_dir, errors_out=load_errors)
+    if not all_tasks and not load_errors:
         console.print("[yellow]No tasks found in tasks directory![/]")
         return
 
@@ -967,14 +973,18 @@ def check(fix: bool, task_files: list[str]):
                 # Just filename, resolve from tasks_dir
                 path = tasks_dir / path
             try:
-                file_tasks = load_tasks(path.parent, single_file=path)
+                file_errors: list[tuple[Path, str]] = []
+                file_tasks = load_tasks(path.parent, single_file=path, errors_out=file_errors)
+                if file_errors:
+                    existing_paths = {e[0] for e in load_errors}
+                    load_errors.extend(e for e in file_errors if e[0] not in existing_paths)
                 if file_tasks:
                     tasks_to_validate.extend(file_tasks)
                 else:
                     console.print(f"[yellow]Warning: No valid task found in {file}[/]")
             except Exception as e:
                 console.print(f"[red]Error reading {file}: {e}[/]")
-        if not tasks_to_validate:
+        if not tasks_to_validate and not load_errors:
             console.print("[yellow]No valid tasks to validate![/]")
             return
     else:
@@ -1034,6 +1044,15 @@ def check(fix: bool, task_files: list[str]):
 
     # Report results by category
     has_issues = False
+
+    if load_errors:
+        has_issues = True
+        console.print(
+            f"\n[bold red]Unloadable Task Files ({len(load_errors)}) — "
+            "these were silently dropped from selection:[/]"
+        )
+        for unloadable_path, err in load_errors:
+            console.print(f"  • {unloadable_path.relative_to(repo_root)}: {err}")
 
     if validation_issues:
         has_issues = True
@@ -1324,7 +1343,7 @@ def watch(interval: int, fix: bool, once: bool, verbose: bool):
     "set_fields",
     type=(str, str),
     multiple=True,
-    help="Set a field value (state, priority, created)",
+    help="Set a field value (state, priority, created). Pass 'none' to clear an optional field (e.g. --set waiting_since none).",
 )
 @click.option(
     "--add",
@@ -1358,6 +1377,15 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
         tasks edit task-123 --remove tag wip
         tasks edit task-123 --set state active --add tag feature --add depends other-task
         tasks edit task-123 --set-subtask "Handle simple responses" done
+
+    Clearing optional fields:
+        Pass 'none' as the value to clear (unset) an optional field.
+        Useful when transitioning a task to a terminal state (done/cancelled)
+        and removing now-stale waiting metadata:
+
+        tasks edit task-123 --set waiting_for none --set waiting_since none
+        tasks edit task-123 --set priority none
+        tasks edit task-123 --set next_action none
 
     Date formats:
         The created field accepts ISO format dates:
@@ -1393,7 +1421,9 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
         # Optional fields with validation
         "priority": {"type": "enum", "values": ["high", "medium", "low", "none"]},
         "task_type": {"type": "enum", "values": ["project", "action", "none"]},
-        "assigned_to": {"type": "enum", "values": ["agent", "human", "both", "none"]},
+        # Real workspaces use named assignees (bob, erik, alice, etc.).
+        # Keep "none" as the explicit clear value; otherwise accept any string.
+        "assigned_to": {"type": "string"},
         "waiting_since": {"type": "date"},
         # Optional fields with arbitrary string values
         "next_action": {"type": "string"},
@@ -1653,6 +1683,142 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
     console.print(f"[green]✓ Updated {count} task{'s' if count > 1 else ''}[/]")
 
 
+# States that cannot be claimed (already terminal or deliberately deferred/blocked).
+_CLAIM_REFUSED_STATES = {"waiting", "ready_for_review", "someday", "done", "cancelled"}
+# States that get auto-promoted to active on claim.
+_CLAIM_PROMOTABLE_STATES = {"backlog", "todo"}
+
+
+def _resolve_agent_name(repo_root: Path, override: str | None) -> str:
+    """Resolve the agent name for a claim.
+
+    Order:
+        1. ``--agent NAME`` CLI override
+        2. ``GPTODO_AGENT_NAME`` env var
+        3. ``[agent].name`` from ``gptme.toml`` (lowercased)
+        4. fallback ``"agent"``
+    """
+    if override is not None:
+        stripped = override.strip()
+        if stripped:
+            return stripped
+
+    env_name = os.environ.get("GPTODO_AGENT_NAME", "").strip()
+    if env_name:
+        return env_name
+
+    gptme_toml = repo_root / "gptme.toml"
+    if gptme_toml.exists():
+        try:
+            try:
+                import tomllib  # type: ignore[import-not-found]
+            except ModuleNotFoundError:
+                try:
+                    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+                except ModuleNotFoundError:
+                    console.print(
+                        "[yellow]Warning: tomli is required on Python <3.11 to read "
+                        "gptme.toml; falling back to 'agent'[/]"
+                    )
+                    return "agent"
+
+            data = tomllib.loads(gptme_toml.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            console.print(
+                f"[yellow]Warning: Failed to load {gptme_toml}: {exc}. Falling back to 'agent'.[/]"
+            )
+            return "agent"
+
+        agent_section = data.get("agent")
+        if isinstance(agent_section, dict):
+            name = agent_section.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip().lower()
+
+    return "agent"
+
+
+@cli.command("claim")
+@click.argument("task_id")
+@click.option("--agent", "agent_override", default=None, help="Agent name to record as owner.")
+def claim(task_id: str, agent_override: str | None):
+    """Claim a task for the current agent.
+
+    Sets ``state: active`` (for backlog/todo), records ``assigned_to`` and
+    ``assigned_at``, and refuses to claim waiting / ready_for_review /
+    someday / terminal tasks.
+
+    Agent name resolution: --agent flag, then GPTODO_AGENT_NAME env var,
+    then [agent].name from gptme.toml (lowercased), else "agent".
+
+    Examples:
+        gptodo claim my-task
+        gptodo claim my-task --agent bob
+    """
+    console = Console()
+    repo_root = find_repo_root(Path.cwd())
+    tasks_dir = repo_root / "tasks"
+
+    tasks = load_tasks(tasks_dir)
+    if not tasks:
+        console.print("[red]No tasks found[/]")
+        sys.exit(1)
+
+    try:
+        target_tasks = resolve_tasks([task_id], tasks, tasks_dir)
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+
+    if len(target_tasks) != 1:
+        console.print(f"[red]claim requires exactly one task, got {len(target_tasks)}[/]")
+        sys.exit(1)
+
+    task = target_tasks[0]
+    agent = _resolve_agent_name(repo_root, agent_override)
+
+    current_state = normalize_state(task.metadata.get("state", "backlog"), warn=False)
+    current_assignee = task.metadata.get("assigned_to")
+    current_assigned_at = task.metadata.get("assigned_at")
+
+    if current_state in _CLAIM_REFUSED_STATES:
+        console.print(
+            f"[red]Refusing to claim {task.id}: state is '{current_state}'. "
+            "Resolve the blocker (or revive from someday) before claiming.[/]"
+        )
+        sys.exit(1)
+
+    # Idempotent no-op: already active, same owner, has assigned_at.
+    if current_state == "active" and current_assignee == agent and current_assigned_at is not None:
+        console.print(
+            f"[yellow]Already claimed:[/] {task.id} (owner={agent}, since={current_assigned_at})"
+        )
+        return
+
+    post = frontmatter.load(task.path)
+
+    new_state = "active" if current_state in _CLAIM_PROMOTABLE_STATES else current_state
+    if current_state in _CLAIM_PROMOTABLE_STATES:
+        post.metadata["state"] = new_state
+
+    post.metadata["assigned_to"] = agent
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    post.metadata["assigned_at"] = now_utc
+
+    with open(task.path, "w") as f:
+        f.write(frontmatter.dumps(post))
+
+    if current_state in _CLAIM_PROMOTABLE_STATES:
+        console.print(
+            f"[green]✓ Claimed[/] {task.id} (state: {current_state} → active, owner: {agent})"
+        )
+    elif current_assignee != agent:
+        prev = current_assignee or "unassigned"
+        console.print(f"[green]✓ Reassigned[/] {task.id} (owner: {prev} → {agent}, state: active)")
+    else:
+        console.print(f"[green]✓ Re-claimed[/] {task.id} (owner: {agent}, state: active)")
+
+
 @cli.command("tags")
 @click.option("--state", help="Filter by task state")
 @click.option("--list", "show_tasks", is_flag=True, help="List tasks for each tag")
@@ -1753,9 +1919,14 @@ def tags(state: str | None, show_tasks: bool, filter_tags: tuple[str, ...]):
 @cli.command("ready")
 @click.option(
     "--state",
-    type=click.Choice(["backlog", "active", "someday", "both"]),
+    type=click.Choice(["backlog", "active", "ready_for_review", "someday", "both", "actionable"]),
     default="both",
-    help="Filter by task state. 'both' = backlog+active. 'someday' = explicitly query deferred tasks.",
+    help=(
+        "Filter by task state. 'both' = backlog+active (default, current behavior). "
+        "'actionable' = backlog+active+ready_for_review (everything locally workable). "
+        "'ready_for_review' = only tasks awaiting local review/verification. "
+        "'someday' = explicitly query deferred tasks."
+    ),
 )
 @click.option(
     "--json",
@@ -1818,13 +1989,35 @@ def ready(state, output_json, output_jsonl, use_cache):
         filtered_tasks = [task for task in all_tasks if task.state == "backlog"]
     elif state == "active":
         filtered_tasks = [task for task in all_tasks if task.state == "active"]
+    elif state == "ready_for_review":
+        filtered_tasks = [task for task in all_tasks if task.state == "ready_for_review"]
     elif state == "someday":
         filtered_tasks = [task for task in all_tasks if task.state == "someday"]
+    elif state == "actionable":
+        filtered_tasks = [
+            task for task in all_tasks if task.state in ["backlog", "active", "ready_for_review"]
+        ]
     else:  # both
         filtered_tasks = [task for task in all_tasks if task.state in ["backlog", "active"]]
 
-    # Filter for ready (unblocked) tasks
-    ready_tasks = [task for task in filtered_tasks if is_task_ready(task, tasks_dict, issue_cache)]
+    # Filter for ready (unblocked) tasks.
+    # ready_for_review tasks: work is done; skip dependency checks, only check waiting_for.
+    if state == "ready_for_review":
+        ready_tasks = [task for task in filtered_tasks if not task_has_waiting_blocker(task)]
+    elif state == "actionable":
+        # backlog/active go through full is_task_ready; ready_for_review only needs waiting check
+        ready_tasks = [
+            task
+            for task in filtered_tasks
+            if (task.state == "ready_for_review" and not task_has_waiting_blocker(task))
+            or (
+                task.state in ["backlog", "active"] and is_task_ready(task, tasks_dict, issue_cache)
+            )
+        ]
+    else:
+        ready_tasks = [
+            task for task in filtered_tasks if is_task_ready(task, tasks_dict, issue_cache)
+        ]
 
     if not ready_tasks:
         if output_json:

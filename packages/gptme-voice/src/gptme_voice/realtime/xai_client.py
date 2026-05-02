@@ -18,8 +18,15 @@ from .openai_client import OpenAIRealtimeClient, SessionConfig
 logger = logging.getLogger(__name__)
 
 _OPENAI_DEFAULT_VOICE = "echo"
+# Derived from SessionConfig field default — stays in sync without duplication
+_OPENAI_DEFAULT_MODEL: str = next(
+    f.default  # type: ignore[assignment]
+    for f in dataclasses.fields(SessionConfig)
+    if f.name == "model"
+)
 # "rex" = male, confident, clear — matches the Bob persona better than "eve" (female)
 _DEFAULT_XAI_VOICE = "rex"
+_DEFAULT_XAI_MODEL = "grok-voice-think-fast-1.0"
 
 
 def _get_xai_api_key() -> str | None:
@@ -55,24 +62,26 @@ class XAIRealtimeClient(OpenAIRealtimeClient):
         cfg = session_config or SessionConfig()
         if cfg.voice == _OPENAI_DEFAULT_VOICE:
             cfg = dataclasses.replace(cfg, voice=_DEFAULT_XAI_VOICE)
+        if cfg.model == _OPENAI_DEFAULT_MODEL:
+            cfg = dataclasses.replace(cfg, model=_DEFAULT_XAI_MODEL)
 
         # VAD tuning for Grok interruption (from task #651 / Erik feedback)
         # Lower threshold = more sensitive to speech, easier to interrupt
-        # Reduce silence duration so Bob stops faster
+        # Keep end-of-turn silence conservative so noisy lines do not chop up speech
         # Prefix padding reduced to minimize lag
         if cfg.vad_threshold >= 0.65:  # only override default/high values
             cfg = dataclasses.replace(
                 cfg,
                 vad_threshold=0.55,
-                vad_silence_duration_ms=250,
+                vad_silence_duration_ms=500,
                 vad_prefix_padding_ms=150,
             )
 
         super().__init__(api_key=resolved_key, session_config=cfg, **kwargs)
 
     def _get_ws_url(self) -> str:
-        """xAI uses the base URL only — no ?model= parameter."""
-        return self.WS_URL
+        """xAI supports ?model= in the WebSocket URL."""
+        return f"{self.WS_URL}?model={self.session_config.model}"
 
     def _get_ws_headers(self) -> dict[str, str]:
         """xAI auth — bearer token only, no OpenAI-Beta header."""
@@ -82,17 +91,6 @@ class XAIRealtimeClient(OpenAIRealtimeClient):
         """xAI does not support whisper-1; omit transcription config."""
         return None
 
-    async def _handle_event(self, event: dict) -> None:
-        """xAI does not emit session.created — treat session.updated as the ready signal."""
-        await super()._handle_event(event)
-        # xAI sends session.updated but not session.created. If _session_ready is
-        # still unset after session.updated arrives, mark it ready and flush buffered
-        # audio so Twilio audio doesn't sit in the pre-session buffer forever.
-        if (
-            event.get("type") == "session.updated"
-            and self._session_ready is not None
-            and not self._session_ready.is_set()
-        ):
-            logger.info("xAI session.updated received — marking session ready")
-            self._session_ready.set()
-            await self._flush_pending_audio()
+    # xAI does not emit session.created; it emits session.updated instead.
+    # The base class already handles session.updated via _mark_session_ready,
+    # so no override is needed here.

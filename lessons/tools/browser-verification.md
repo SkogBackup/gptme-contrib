@@ -4,11 +4,8 @@ match:
   - "commit web changes without testing"
   - "push without browser check"
   - "claiming fixed without testing"
-  - "forgot to test in browser"
-  - "web change deployed without verification"
-  - "without opening the browser"
-  - "declared fixed without checking browser"
-  - "fix working without verifying in browser"
+  - "javascript fix without testing"
+  session_categories: [code]
 status: active
 ---
 

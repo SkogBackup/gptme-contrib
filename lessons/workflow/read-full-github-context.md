@@ -7,6 +7,18 @@ match:
     - "missing newer comments that supersede earlier"
     - "gh pr view --comments | head"
     - "not reading the whole issue"
+    - "investigate the github issue"
+    - "read the github issue"
+    - "read the issue thread"
+    - "respond to a github issue"
+    - "review pr comments"
+    - "look at the pr discussion"
+    - "check the github discussion"
+    - "reading the issue"
+    - "looking at the issue"
+    - "looking at the pr"
+    - "let me check the issue"
+    - "checking the issue"
 status: active
 ---
 

@@ -154,17 +154,32 @@ is_permission_blocked_merge_ready_pr() {
     [[ "$is_draft" == "false" ]] || return 1
     [[ "$non_success_count" == "0" ]] || return 1
 
-    local last_bob_comment
-    last_bob_comment=$(gh api "repos/$repo/issues/$number/comments" \
-        --jq '[.[] | select(.user.login == "TimeToBuildBob")][-1].body // ""' 2>/dev/null) || return 1
+    # Check Bob's full comment history, not just the last comment — later
+    # routine "CI is now green" status updates often bury the canonical
+    # waiting phrase without invalidating the acknowledgment. Matches the
+    # signal set used by activity-gate.sh so the two suppression paths stay
+    # aligned (see ErikBjare/bob#680).
+    local bot_comments
+    bot_comments=$(gh api "repos/$repo/issues/$number/comments?per_page=100" \
+        --jq '[.[] | select(.user.login == "TimeToBuildBob") | .body] | join("\n")' 2>/dev/null) || return 1
 
-    [[ -n "$last_bob_comment" ]] || return 1
-    case "$last_bob_comment" in
-        *"waiting only on a maintainer click"*|*"waiting only on a maintainer merge click"*) ;;
-        *) return 1 ;;
+    [[ -n "$bot_comments" ]] || return 1
+
+    local lower
+    lower=$(printf '%s' "$bot_comments" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+        *"waiting only on a maintainer click"*) return 0 ;;
+        *"waiting only on a maintainer merge click"*) return 0 ;;
+        *"ready to merge when convenient"*) return 0 ;;
+        *"blocked by missing mergepullrequest permission"*) return 0 ;;
     esac
-
-    return 0
+    # "ready (to|for) merge @<maintainer>" — the @-mention indicates the ball
+    # is explicitly in the maintainer's court. Bare "ready to merge" is too
+    # broad, so we require the @-mention as the maintainer-handoff signal.
+    if printf '%s' "$lower" | grep -qE 'ready (to|for) merge @[a-z0-9_-]+'; then
+        return 0
+    fi
+    return 1
 }
 
 # Helper function to format compactly with smart timestamps (limit 10 per category)

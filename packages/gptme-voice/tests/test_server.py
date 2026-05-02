@@ -5,9 +5,12 @@ import os
 import shlex
 import sys
 import tempfile
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
+from gptme_voice.realtime.audio import AudioConverter
 from gptme_voice.realtime.server import (
     RecentCallRecord,
     TranscriptTurn,
@@ -15,6 +18,7 @@ from gptme_voice.realtime.server import (
     _build_caller_instructions,
     _build_resume_instructions,
     _get_twilio_field,
+    _lookup_caller_identity,
     _truncate_resume_transcript,
 )
 
@@ -22,9 +26,73 @@ from gptme_voice.realtime.server import (
 class _DummyWebSocket:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.binary_messages: list[bytes] = []
 
     async def send_text(self, message: str) -> None:
         self.messages.append(message)
+
+    async def send_bytes(self, message: bytes) -> None:
+        self.binary_messages.append(message)
+
+
+class _DummyBrowserWebSocket:
+    def __init__(self, incoming: list[dict[str, object]]) -> None:
+        self.query_params: dict[str, str] = {}
+        self._incoming = incoming
+        self.accepted = False
+        self.text_messages: list[str] = []
+        self.binary_messages: list[bytes] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def receive(self) -> dict[str, object]:
+        if self._incoming:
+            return self._incoming.pop(0)
+        return {"type": "websocket.disconnect"}
+
+    async def send_text(self, message: str) -> None:
+        self.text_messages.append(message)
+
+    async def send_bytes(self, message: bytes) -> None:
+        self.binary_messages.append(message)
+
+
+class _FakeRealtimeClient:
+    def __init__(self) -> None:
+        self.sent_audio: list[bytes] = []
+        self.commit_count = 0
+        self.disconnect_kwargs: dict[str, object] | None = None
+        self.on_function_call = None
+
+    async def connect(self) -> None:
+        return None
+
+    async def send_audio(self, audio_data: bytes) -> None:
+        self.sent_audio.append(audio_data)
+
+    async def commit_audio(self) -> None:
+        self.commit_count += 1
+
+    async def disconnect(self, **kwargs: object) -> None:
+        self.disconnect_kwargs = kwargs
+
+    async def inject_message(self, _text: str) -> None:
+        return None
+
+
+class _DummyToolBridge:
+    def __init__(self, *args, **kwargs) -> None:
+        return None
+
+    async def handle_function_call(self, _name: str, _args: dict) -> None:
+        return None
+
+    def pending_task_ids(self) -> list[str]:
+        return []
+
+    def get_timings(self) -> list[dict[str, object]]:
+        return []
 
 
 def test_build_caller_instructions_no_number() -> None:
@@ -51,6 +119,21 @@ def test_build_caller_instructions_known_number_from_people_dir() -> None:
     assert "Erik Bjäreholt" in result
     assert "+46700000001" in result
     assert "You are Bob." in result
+
+
+def test_lookup_caller_identity_uses_call_name_when_present() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        people_dir = Path(tmpdir) / "people"
+        people_dir.mkdir()
+        (people_dir / "erik-bjareholt.md").write_text(
+            "# Erik Bjäreholt\n\n- Call name: Erik\nPhone: +46700000001\n"
+        )
+
+        identity = _lookup_caller_identity("+46700000001", tmpdir)
+
+    assert identity is not None
+    assert identity.canonical_name == "Erik Bjäreholt"
+    assert identity.preferred_spoken_name == "Erik"
 
 
 def test_get_twilio_field_prefers_camel_case() -> None:
@@ -80,6 +163,92 @@ def test_send_to_twilio_uses_stream_sid_field_name() -> None:
     }
 
 
+def test_voice_route_disabled_by_default() -> None:
+    server = VoiceServer()
+
+    websocket_paths = {
+        route.path for route in server.app.routes if hasattr(route, "path")
+    }
+
+    assert "/voice" not in websocket_paths
+
+
+def test_voice_route_enabled_when_requested() -> None:
+    server = VoiceServer(enable_browser_transport=True)
+
+    websocket_paths = {
+        route.path for route in server.app.routes if hasattr(route, "path")
+    }
+
+    assert "/voice" in websocket_paths
+
+
+def test_send_browser_audio_uses_binary_frames() -> None:
+    server = VoiceServer(enable_browser_transport=True)
+    websocket = _DummyWebSocket()
+
+    asyncio.run(server._send_browser_audio(websocket, b"\x00\x01"))
+
+    assert websocket.binary_messages == [b"\x00\x01"]
+
+
+def test_send_browser_audio_end_uses_text_control_message() -> None:
+    server = VoiceServer(enable_browser_transport=True)
+    websocket = _DummyWebSocket()
+
+    asyncio.run(server._send_browser_audio_end(websocket))
+
+    assert [json.loads(message) for message in websocket.messages] == [
+        {"type": "audio_end"}
+    ]
+
+
+def test_handle_browser_websocket_resamples_binary_pcm_and_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = VoiceServer(enable_browser_transport=True)
+    websocket = _DummyBrowserWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"\x00\x00\x01\x00"},
+            {"type": "websocket.receive", "text": json.dumps({"type": "commit"})},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    fake_client = _FakeRealtimeClient()
+
+    async def _fake_build_session_instructions(
+        *, caller_id: str, handoff_id: str | None
+    ) -> str:
+        return "You are Bob."
+
+    def _fake_make_client(_session_cfg, **_kwargs):
+        return fake_client
+
+    async def _fake_on_call_end(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(
+        server, "_build_session_instructions", _fake_build_session_instructions
+    )
+    monkeypatch.setattr(server, "_make_client", _fake_make_client)
+    monkeypatch.setattr(server, "_on_call_end", _fake_on_call_end)
+    monkeypatch.setattr("gptme_voice.realtime.server.GptmeToolBridge", _DummyToolBridge)
+
+    asyncio.run(server.handle_browser_websocket(websocket))
+
+    expected_audio = AudioConverter().browser_to_openai(b"\x00\x00\x01\x00")
+    assert websocket.accepted is True
+    assert json.loads(websocket.text_messages[0]) == {
+        "type": "ready",
+        "input_sample_rate": AudioConverter.BROWSER_RATE,
+        "output_sample_rate": AudioConverter.OPENAI_RATE,
+    }
+    assert fake_client.sent_audio == [expected_audio]
+    assert fake_client.commit_count == 1
+    assert fake_client.disconnect_kwargs is not None
+    assert fake_client.disconnect_kwargs["commit_audio"] is True
+
+
 def test_build_resume_instructions_includes_prior_transcript() -> None:
     record = RecentCallRecord(
         caller_id="+46700000001",
@@ -104,14 +273,83 @@ def test_build_session_bootstrap_greets_fresh_calls() -> None:
     server = VoiceServer()
     server._instructions = "You are Bob."
 
-    bootstrap = server._build_session_bootstrap(
-        caller_id="+46700000011",
-        from_number="+46700000011",
+    bootstrap = asyncio.run(
+        server._build_session_bootstrap(
+            caller_id="+46700000011",
+            from_number="+46700000011",
+        )
     )
 
     assert bootstrap.should_greet_first is True
     assert "+46700000011" in bootstrap.instructions
     assert "You are Bob." in bootstrap.instructions
+
+
+def test_build_session_bootstrap_personalizes_known_caller_greeting() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        people_dir = Path(tmpdir) / "people"
+        people_dir.mkdir()
+        (people_dir / "erik-bjareholt.md").write_text(
+            "# Erik Bjäreholt\n\nPhone: +46700000001\n"
+        )
+        server = VoiceServer(workspace=tmpdir)
+        server._instructions = "You are Bob."
+
+        bootstrap = asyncio.run(
+            server._build_session_bootstrap(
+                caller_id="+46700000001",
+                from_number="+46700000001",
+            )
+        )
+
+    assert bootstrap.should_greet_first is True
+    assert "Erik Bjäreholt" in bootstrap.initial_response_instructions
+    assert (
+        "using 'Erik', not their full name" in bootstrap.initial_response_instructions
+    )
+    assert "Do NOT say 'thanks for calling'" in bootstrap.initial_response_instructions
+
+
+def test_build_session_bootstrap_avoids_full_name_warning_for_single_token_name() -> (
+    None
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        people_dir = Path(tmpdir) / "people"
+        people_dir.mkdir()
+        (people_dir / "erik.md").write_text("# Erik\n\nPhone: +46700000002\n")
+        server = VoiceServer(workspace=tmpdir)
+        server._instructions = "You are Bob."
+
+        bootstrap = asyncio.run(
+            server._build_session_bootstrap(
+                caller_id="+46700000002",
+                from_number="+46700000002",
+            )
+        )
+
+    assert bootstrap.should_greet_first is True
+    assert (
+        "The caller is Erik. Greet them by name"
+        in bootstrap.initial_response_instructions
+    )
+    assert "not their full name" not in bootstrap.initial_response_instructions
+
+
+def test_build_session_bootstrap_asks_unknown_caller_to_identify() -> None:
+    server = VoiceServer()
+    server._instructions = "You are Bob."
+
+    bootstrap = asyncio.run(
+        server._build_session_bootstrap(
+            caller_id="+15551234567",
+            from_number="+15551234567",
+        )
+    )
+
+    assert bootstrap.should_greet_first is True
+    assert "caller is unknown" in bootstrap.initial_response_instructions
+    assert "Introduce yourself by name" in bootstrap.initial_response_instructions
+    assert "Who am I speaking to?" in bootstrap.initial_response_instructions
 
 
 def test_truncate_resume_transcript_keeps_line_boundaries() -> None:
@@ -149,7 +387,7 @@ def test_recent_call_is_consumed_within_resume_window() -> None:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
-            resumed = server._consume_recent_call("+46700000001")
+            resumed = asyncio.run(server._consume_recent_call("+46700000001"))
 
         assert resumed is not None
         assert resumed.caller_id == "+46700000001"
@@ -173,7 +411,9 @@ def test_build_session_bootstrap_skips_greeting_for_recent_resume() -> None:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
-            bootstrap = server._build_session_bootstrap(caller_id=record.caller_id)
+            bootstrap = asyncio.run(
+                server._build_session_bootstrap(caller_id=record.caller_id)
+            )
 
         assert bootstrap.should_greet_first is False
         assert "reconnected after a brief disconnect" in bootstrap.instructions
@@ -196,7 +436,7 @@ def test_recent_call_is_ignored_outside_resume_window() -> None:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_400.1)
-            resumed = server._consume_recent_call("+46700000001")
+            resumed = asyncio.run(server._consume_recent_call("+46700000001"))
 
         assert resumed is None
 
@@ -223,9 +463,11 @@ def test_consume_handoff_bootstrap_returns_resume_context_and_deletes_file() -> 
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_200.0)
-            instructions = server._build_session_instructions(
-                caller_id="+46700000007",
-                handoff_id="handoff-123",
+            instructions = asyncio.run(
+                server._build_session_instructions(
+                    caller_id="+46700000007",
+                    handoff_id="handoff-123",
+                )
             )
 
         assert "bob transferred this caller to alice." in instructions
@@ -264,9 +506,11 @@ def test_stale_handoff_bootstrap_falls_back_to_recent_call_resume() -> None:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_600.0)
-            instructions = server._build_session_instructions(
-                caller_id=record.caller_id,
-                handoff_id="handoff-stale",
+            instructions = asyncio.run(
+                server._build_session_instructions(
+                    caller_id=record.caller_id,
+                    handoff_id="handoff-stale",
+                )
             )
 
         assert "Resume the old call" in instructions
@@ -289,21 +533,29 @@ def test_schedule_post_call_runs_configured_command_hook() -> None:
                 metadata={},
             )
             record_path = server._save_call_record(record)
-            observed: dict[str, str] = {}
+            observed: dict[str, object] = {}
 
-            async def _fake_run_post_call(caller_id: str, path: Path) -> None:
+            async def _fake_run_post_call(
+                caller_id: str,
+                paths: list[Path],
+                *,
+                delay_seconds: int = 0,
+                unit_name: str | None = None,
+            ) -> None:
                 observed["caller_id"] = caller_id
-                observed["path"] = str(path)
+                observed["paths"] = [str(path) for path in paths]
+                observed["delay_seconds"] = delay_seconds
+                observed["unit_name"] = unit_name
 
             server._run_post_call_command = _fake_run_post_call  # type: ignore[method-assign]
 
-            await server._schedule_post_call(record.caller_id, record_path)
-            task = server._pending_post_calls[record.caller_id]
-            await task
+            await server._schedule_post_call(record.caller_id, [record_path])
 
             assert observed == {
                 "caller_id": "+46700000001",
-                "path": str(record_path),
+                "paths": [str(record_path)],
+                "delay_seconds": 0,
+                "unit_name": server._pending_post_calls[record.caller_id],
             }
 
     asyncio.run(_exercise())
@@ -359,9 +611,59 @@ def test_consume_recent_call_deletes_state_file() -> None:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
-            server._consume_recent_call("+46700000002")
+            asyncio.run(server._consume_recent_call("+46700000002"))
 
         assert not state_path.exists()
+
+
+def test_prewarm_connect_failure_preserves_resume_state() -> None:
+    """P1 fix: if _prewarm_for_inbound's connect() raises, the on-disk resume
+    state file must NOT be deleted so the cold-path _build_session_bootstrap
+    can still resume the caller normally."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        server = VoiceServer()
+        server.state_dir = Path(tmpdir)
+        server.resume_window_seconds = 300
+        record = RecentCallRecord(
+            caller_id="+46700000099",
+            source="twilio",
+            ended_at=1_000.0,
+            transcript=[TranscriptTurn(role="user", text="Keep this resume")],
+            metadata={},
+        )
+        server._save_recent_call(record)
+        state_path = server._recent_call_path("+46700000099")
+        assert state_path.exists()
+
+        # Simulate a connect() failure inside _prewarm_for_inbound
+        class _FailingClient:
+            async def connect(self):
+                raise ConnectionError("simulated provider failure")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                server,
+                "_make_client",
+                lambda *args, **kwargs: _FailingClient(),  # type: ignore[assignment]
+            )
+            mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
+            asyncio.run(server._prewarm_for_inbound("+46700000099"))
+
+        # Resume file must survive the failed prewarm
+        assert state_path.exists(), (
+            "Resume state file was deleted despite connect() failure — "
+            "caller would get a fresh greeting instead of resuming"
+        )
+
+        # And the cold path must still see the resume context
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_200.0)
+            bootstrap = asyncio.run(
+                server._build_session_bootstrap(caller_id="+46700000099")
+            )
+        assert (
+            not bootstrap.should_greet_first
+        ), "Cold-path bootstrap should resume (no greeting) after failed prewarm"
 
 
 def test_consume_recent_call_keeps_archived_record() -> None:
@@ -381,11 +683,74 @@ def test_consume_recent_call_keeps_archived_record() -> None:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
-            server._consume_recent_call(record.caller_id)
+            asyncio.run(server._consume_recent_call(record.caller_id))
 
         assert archived_path.exists()
         payload = json.loads(archived_path.read_text())
         assert payload["transcript"][0]["text"] == "Archive me"
+
+
+def test_resume_carries_prior_archive_into_next_post_call() -> None:
+    async def _exercise() -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = VoiceServer()
+            server.state_dir = Path(tmpdir)
+            server.resume_window_seconds = 300
+            server.post_call_command = "run-post-call"
+            server.post_call_delay_seconds = 1_000
+            cancelled_units: list[str] = []
+
+            async def _fake_run_post_call(
+                caller_id: str,
+                paths: list[Path],
+                *,
+                delay_seconds: int = 0,
+                unit_name: str | None = None,
+            ) -> None:
+                return None
+
+            server._run_post_call_command = _fake_run_post_call  # type: ignore[method-assign]
+            server._cancel_post_call_schedule = cancelled_units.append  # type: ignore[method-assign]
+
+            first = RecentCallRecord(
+                caller_id="+46700000010",
+                source="twilio",
+                ended_at=1_000.0,
+                transcript=[TranscriptTurn(role="user", text="first leg")],
+                metadata={"call_sid": "CAfirst"},
+            )
+            first_path = server._save_call_record(first)
+            await server._schedule_post_call(first.caller_id, [first_path])
+            first_unit = server._pending_post_calls[first.caller_id]
+            first.archive_record_paths = [str(first_path)]
+            first.pending_post_call_unit = first_unit
+            server._save_recent_call(first)
+
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
+                resumed = await server._consume_recent_call(first.caller_id)
+
+            assert resumed is not None
+            assert cancelled_units == [first_unit]
+            assert server._pending_archive_records[first.caller_id] == [first_path]
+
+            second = RecentCallRecord(
+                caller_id=first.caller_id,
+                source="twilio",
+                ended_at=1_200.0,
+                transcript=[TranscriptTurn(role="user", text="second leg")],
+                metadata={"call_sid": "CAsecond"},
+            )
+            second_path = server._save_call_record(second)
+            await server._schedule_post_call(first.caller_id, [first_path, second_path])
+
+            assert server._pending_archive_records[first.caller_id] == [
+                first_path,
+                second_path,
+            ]
+            assert server._pending_post_calls[first.caller_id] != first_unit
+
+    asyncio.run(_exercise())
 
 
 def test_save_call_record_uses_unique_archive_path_per_call() -> None:
@@ -423,16 +788,30 @@ def test_save_call_record_uses_unique_archive_path_per_call() -> None:
         )
 
 
-def test_schedule_post_call_runner_finally_does_not_evict_newer_task() -> None:
-    """P1 fix: cancelling an old _runner task must not pop the newer task
-    that replaced it in _pending_post_calls."""
+def test_schedule_post_call_replaces_existing_timer_unit() -> None:
+    """Rescheduling a caller should cancel the old transient timer and keep the new one."""
 
     async def _exercise() -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             server = VoiceServer()
             server.state_dir = Path(tmpdir)
             server.post_call_command = "run-post-call"
-            server.post_call_delay_seconds = 1_000  # effectively never fires
+            server.post_call_delay_seconds = 1_000
+            cancelled_units: list[str] = []
+            scheduled_units: list[str] = []
+
+            async def _fake_run_post_call(
+                caller_id: str,
+                paths: list[Path],
+                *,
+                delay_seconds: int = 0,
+                unit_name: str | None = None,
+            ) -> None:
+                if unit_name is not None:
+                    scheduled_units.append(unit_name)
+
+            server._run_post_call_command = _fake_run_post_call  # type: ignore[method-assign]
+            server._cancel_post_call_schedule = cancelled_units.append  # type: ignore[method-assign]
 
             record = RecentCallRecord(
                 caller_id="+46700000003",
@@ -441,27 +820,206 @@ def test_schedule_post_call_runner_finally_does_not_evict_newer_task() -> None:
                 transcript=[],
                 metadata={},
             )
-            record_path = server._save_recent_call(record)
+            record_path = server._save_call_record(record)
+            second_path = server._save_call_record(
+                RecentCallRecord(
+                    caller_id=record.caller_id,
+                    source="twilio",
+                    ended_at=1_001.0,
+                    transcript=[],
+                    metadata={},
+                )
+            )
 
-            # Schedule first task (long sleep — won't complete naturally)
-            await server._schedule_post_call(record.caller_id, record_path)
-            first_task = server._pending_post_calls[record.caller_id]
+            await server._schedule_post_call(record.caller_id, [record_path])
+            first_unit = server._pending_post_calls[record.caller_id]
 
-            # Schedule second task — cancels first and registers itself
-            await server._schedule_post_call(record.caller_id, record_path)
-            second_task = server._pending_post_calls[record.caller_id]
+            await server._schedule_post_call(
+                record.caller_id, [record_path, second_path]
+            )
+            second_unit = server._pending_post_calls[record.caller_id]
 
-            # Wait for the first task's finally-block to run
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-
-            # The second task must still be registered
-            assert server._pending_post_calls.get(record.caller_id) is second_task
-            assert first_task.cancelled()
-
-            second_task.cancel()
+            assert cancelled_units == [first_unit]
+            assert second_unit != first_unit
+            assert scheduled_units == [first_unit, second_unit]
+            assert server._pending_post_calls.get(record.caller_id) == second_unit
 
     asyncio.run(_exercise())
+
+
+def test_consume_recent_call_restores_pending_schedule_after_restart() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        first_server = VoiceServer()
+        first_server.state_dir = Path(tmpdir)
+        record = RecentCallRecord(
+            caller_id="+46700000012",
+            source="twilio",
+            ended_at=1_000.0,
+            transcript=[TranscriptTurn(role="user", text="Restart-safe resume")],
+            metadata={"call_sid": "CArestart"},
+        )
+        record_path = first_server._save_call_record(record)
+        record.archive_record_paths = [str(record_path)]
+        record.pending_post_call_unit = "gptme-voice-post-call-restart"
+        first_server._save_recent_call(record)
+
+        second_server = VoiceServer()
+        second_server.state_dir = Path(tmpdir)
+        cancelled_units: list[str] = []
+        second_server._cancel_post_call_schedule = cancelled_units.append  # type: ignore[method-assign]
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("gptme_voice.realtime.server.time.time", lambda: 1_100.0)
+            resumed = asyncio.run(second_server._consume_recent_call(record.caller_id))
+
+        assert resumed is not None
+        assert cancelled_units == ["gptme-voice-post-call-restart"]
+        assert second_server._pending_archive_records[record.caller_id] == [record_path]
+
+
+def test_on_call_end_persists_pending_post_call_state() -> None:
+    async def _exercise() -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = VoiceServer()
+            server.state_dir = Path(tmpdir)
+            server.post_call_command = "run-post-call"
+            server.post_call_delay_seconds = 300
+
+            async def _fake_run_post_call(
+                caller_id: str,
+                paths: list[Path],
+                *,
+                delay_seconds: int = 0,
+                unit_name: str | None = None,
+            ) -> None:
+                return None
+
+            server._run_post_call_command = _fake_run_post_call  # type: ignore[method-assign]
+
+            await server._on_call_end(
+                caller_id="+46700000013",
+                source="twilio",
+                transcript=[TranscriptTurn(role="user", text="Persist the chain")],
+                metadata={"call_sid": "CApersist"},
+            )
+
+            recent = server._load_recent_call("+46700000013")
+            assert recent is not None
+            assert len(recent.archive_record_paths) == 1
+            assert (
+                recent.pending_post_call_unit
+                == server._pending_post_calls["+46700000013"]
+            )
+            assert Path(recent.archive_record_paths[0]).exists()
+
+    asyncio.run(_exercise())
+
+
+def test_post_call_schedule_survives_scheduler_process_exit(tmp_path: Path) -> None:
+    marker_file = tmp_path / "post-call-fired.txt"
+    launcher_done_file = tmp_path / "launcher-done.txt"
+    wrapper_path = tmp_path / "fake_post_call_wrapper.py"
+    launcher_path = tmp_path / "schedule_call.py"
+
+    wrapper_path.write_text(
+        textwrap.dedent(
+            """\
+import os
+import subprocess
+import sys
+
+delay_seconds = float(os.environ.get("GPTME_VOICE_POST_CALL_DELAY_SECONDS", "0"))
+marker_path = os.environ["MARKER_FILE"]
+launcher_done_path = os.environ["LAUNCHER_DONE_FILE"]
+record_path = sys.argv[1]
+payload = os.environ.get("GPTME_VOICE_POST_CALL_UNIT_NAME", record_path)
+child_code = '''
+import pathlib
+import sys
+import time
+
+done_path = pathlib.Path(sys.argv[1])
+while not done_path.exists():
+    time.sleep(0.05)
+time.sleep(float(sys.argv[2]))
+pathlib.Path(sys.argv[3]).write_text(sys.argv[4])
+'''
+subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        child_code,
+        launcher_done_path,
+        str(delay_seconds),
+        marker_path,
+        payload,
+    ],
+    close_fds=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+"""
+        )
+    )
+
+    launcher_path.write_text(
+        textwrap.dedent(
+            """\
+import asyncio
+import shlex
+import sys
+from pathlib import Path
+
+from gptme_voice.realtime.server import TranscriptTurn, VoiceServer
+
+async def main() -> None:
+    server = VoiceServer()
+    server.state_dir = Path(sys.argv[1])
+    server.post_call_command = (
+        f"{sys.executable} {shlex.quote(str(Path(sys.argv[2])))}"
+    )
+    server.post_call_delay_seconds = 1
+    await server._on_call_end(
+        caller_id="+46700000014",
+        source="twilio",
+        transcript=[TranscriptTurn(role="user", text="Stay durable")],
+        metadata={"call_sid": "CAsubprocess"},
+    )
+    Path(sys.argv[3]).write_text("done")
+
+asyncio.run(main())
+"""
+        )
+    )
+
+    env = os.environ.copy()
+    env["MARKER_FILE"] = str(marker_file)
+    env["LAUNCHER_DONE_FILE"] = str(launcher_done_file)
+    result = os.spawnve(
+        os.P_WAIT,
+        sys.executable,
+        [
+            sys.executable,
+            str(launcher_path),
+            str(tmp_path),
+            str(wrapper_path),
+            str(launcher_done_file),
+        ],
+        env,
+    )
+
+    assert result == 0
+    assert launcher_done_file.exists()
+    assert not marker_file.exists()
+
+    deadline = time.time() + 15
+    while time.time() < deadline and not marker_file.exists():
+        time.sleep(0.05)
+
+    assert marker_file.exists()
+    assert marker_file.read_text().startswith("gptme-voice-post-call-")
 
 
 def test_cancelled_post_call_command_terminates_subprocess() -> None:
@@ -493,7 +1051,7 @@ def test_cancelled_post_call_command_terminates_subprocess() -> None:
             with pytest.MonkeyPatch.context() as mp:
                 mp.setenv("PID_FILE", str(pid_file))
                 task = asyncio.create_task(
-                    server._run_post_call_command("+46700000004", record_path)
+                    server._run_post_call_command("+46700000004", [record_path])
                 )
 
                 deadline = asyncio.get_running_loop().time() + 5
@@ -579,3 +1137,168 @@ def test_twilio_handler_reraises_unrelated_runtimeerror(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="unexpected failure"):
         asyncio.run(server.handle_twilio_websocket(websocket))
+
+
+def test_browser_websocket_ignores_malformed_json_text_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed JSON text frame must not kill the browser voice session (P1 fix)."""
+    server = VoiceServer(enable_browser_transport=True)
+    websocket = _DummyBrowserWebSocket(
+        [
+            {"type": "websocket.receive", "text": "not-valid-json"},
+            {"type": "websocket.receive", "text": json.dumps({"type": "commit"})},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    fake_client = _FakeRealtimeClient()
+
+    async def _fake_build_session_instructions(
+        *, caller_id: str, handoff_id: str | None
+    ) -> str:
+        return "You are Bob."
+
+    def _fake_make_client(_session_cfg, **_kwargs):
+        return fake_client
+
+    async def _fake_on_call_end(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(
+        server, "_build_session_instructions", _fake_build_session_instructions
+    )
+    monkeypatch.setattr(server, "_make_client", _fake_make_client)
+    monkeypatch.setattr(server, "_on_call_end", _fake_on_call_end)
+    monkeypatch.setattr("gptme_voice.realtime.server.GptmeToolBridge", _DummyToolBridge)
+
+    # Should not raise — malformed frame is skipped, commit still fires
+    asyncio.run(server.handle_browser_websocket(websocket))
+
+    assert fake_client.commit_count == 1
+
+
+def test_audio_converter_independent_resample_states() -> None:
+    """Twilio (8kHz) and Browser (16kHz) upsampling must not share resampler state (P2 fix).
+
+    After priming the Twilio (8kHz→24kHz) path, Browser (16kHz→24kHz) output must
+    be identical to a fresh converter that has never seen Twilio audio. If the two
+    paths shared one _resample_state the state from the 8kHz path would corrupt
+    the 16kHz conversion.
+    """
+    twilio_pcm = b"\x00\x00" * 160  # 160 samples @ 8kHz = 20ms
+    browser_pcm = (
+        b"\x01\x00" * 320
+    )  # 320 samples @ 16kHz = 20ms (non-zero to detect corruption)
+
+    # Converter that sees both paths interleaved
+    combined = AudioConverter()
+    combined.twilio_to_openai(twilio_pcm)  # prime 8kHz state
+    combined_browser_out = combined.browser_to_openai(browser_pcm)
+
+    # Fresh converter that has only ever seen browser audio
+    fresh = AudioConverter()
+    fresh_browser_out = fresh.browser_to_openai(browser_pcm)
+
+    # With per-rate state slots the browser path starts fresh regardless of prior
+    # Twilio calls — outputs must be identical.
+    assert combined_browser_out == fresh_browser_out
+
+
+# ── transcript promotion (Phase 3 Step 2) ──────────────────────────────────
+
+
+class TestTranscriptPromotion:
+    """Voice Phase 3: transcript → gptme conversation log."""
+
+    def test_promote_transcript_posts_to_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transcript with turns is POSTed to the gptme server."""
+        calls: list[tuple[str, bytes, str]] = []
+
+        def _fake_post_sync(url: str, payload: bytes, api_key: str) -> None:
+            calls.append((url, payload, api_key))
+
+        monkeypatch.setattr(
+            "gptme_voice.realtime.server._http_post_sync", _fake_post_sync
+        )
+        monkeypatch.setenv("GPTME_VOICE_GPTME_SERVER_URL", "https://gptme.ai")
+        monkeypatch.setenv("GPTME_VOICE_GPTME_SERVER_KEY", "test-key")
+
+        server = VoiceServer()
+        transcript = [
+            TranscriptTurn(role="user", text="Hello"),
+            TranscriptTurn(role="assistant", text="Hi there"),
+        ]
+        metadata = {
+            "call_sid": "CAabc123",
+            "from": "+15551234567",
+        }
+
+        server._promote_transcript_to_gptme("+15551234567", transcript, metadata)
+
+        assert len(calls) == 1
+        url, payload, key = calls[0]
+        assert url == "https://gptme.ai/api/v2/conversations/%2B15551234567/transcript"
+        assert key == "test-key"
+
+        body = json.loads(payload)
+        assert body["call_metadata"]["call_sid"] == "CAabc123"
+        assert len(body["turns"]) == 2
+        assert body["turns"][0] == {"role": "user", "text": "Hello"}
+        assert body["turns"][1] == {"role": "assistant", "text": "Hi there"}
+
+    def test_promote_skips_when_unconfigured(self) -> None:
+        """When GPTME_VOICE_GPTME_SERVER_URL is empty, promotion is a no-op."""
+        server = VoiceServer()
+        assert server.gptme_server_url == ""
+
+        transcript = [TranscriptTurn(role="user", text="Hello")]
+        metadata = {"call_sid": "CAabc123"}
+
+        # Should not raise — just return silently.
+        server._promote_transcript_to_gptme("+15551234567", transcript, metadata)
+
+    def test_promote_skips_empty_transcript(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transcript with no non-whitespace turns is skipped."""
+        calls: list[tuple[str, bytes, str]] = []
+
+        def _fake_post_sync(url: str, payload: bytes, api_key: str) -> None:
+            calls.append((url, payload, api_key))
+
+        monkeypatch.setattr(
+            "gptme_voice.realtime.server._http_post_sync", _fake_post_sync
+        )
+        monkeypatch.setenv("GPTME_VOICE_GPTME_SERVER_URL", "https://gptme.ai")
+        monkeypatch.setenv("GPTME_VOICE_GPTME_SERVER_KEY", "test-key")
+
+        server = VoiceServer()
+        transcript = [TranscriptTurn(role="user", text="   ")]
+        metadata = {"call_sid": "CAabc123"}
+
+        server._promote_transcript_to_gptme("+15551234567", transcript, metadata)
+        assert len(calls) == 0
+
+    def test_promote_skips_missing_call_sid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a call_sid in metadata, promotion is skipped."""
+        calls: list[tuple[str, bytes, str]] = []
+
+        def _fake_post_sync(url: str, payload: bytes, api_key: str) -> None:
+            calls.append((url, payload, api_key))
+
+        monkeypatch.setattr(
+            "gptme_voice.realtime.server._http_post_sync", _fake_post_sync
+        )
+        monkeypatch.setenv("GPTME_VOICE_GPTME_SERVER_URL", "https://gptme.ai")
+        monkeypatch.setenv("GPTME_VOICE_GPTME_SERVER_KEY", "test-key")
+
+        server = VoiceServer()
+        transcript = [TranscriptTurn(role="user", text="Hello")]
+        metadata: dict[str, str] = {}  # no call_sid
+
+        server._promote_transcript_to_gptme("+15551234567", transcript, metadata)
+        assert len(calls) == 0

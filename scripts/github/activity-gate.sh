@@ -56,9 +56,12 @@
 #   open PR (issue comments endpoint). HEAD SHA comes from fetch_pr_data().
 #
 #   Notifications: Filters for actionable reasons (review_requested, mention,
-#   assign, author, comment). State-tracked by notification ID. State files
-#   accumulate in STATE_DIR/notif-*.state. GitHub notifications clear when
-#   marked as read upstream, so old state files become inert.
+#   assign, author, comment). State-tracked by notification ID + updated_at:
+#   follow-ups on the same thread reuse the same ID but advance updated_at, so
+#   the gate re-emits when updated_at advances. State files store the last-seen
+#   updated_at timestamp. State files accumulate in STATE_DIR/notif-*.state.
+#   GitHub notifications clear when marked as read upstream, so old state files
+#   become inert.
 #
 #   Item grouping: This gate emits one item per event (a PR can produce separate
 #   pr_update, ci_failure, and merge_conflict items). Callers that dispatch
@@ -556,6 +559,55 @@ check_greptile_scores() {
     done
 }
 
+# Check if the bot account has already posted a maintainer-facing status comment
+# on this PR indicating that the ball is in the maintainer's court.
+#
+# Signals the bot acknowledged it lacks merge permission on the target repo, so
+# re-emitting merge_ready produces fake-ready churn (the same PR reappears every
+# cooldown window despite nothing being actionable).
+#
+# We check the full comment history (not just the last comment) because later
+# "CI is now green" status updates often overwrite the canonical waiting phrase,
+# but the acknowledgment is still valid — subsequent re-emits would still
+# produce the same "nothing changed" churn.
+#
+# Bot username is resolved from $BOT_USERNAME (default: TimeToBuildBob) to keep
+# the helper reusable across forks.
+#
+# Returns 0 when the maintainer-waiting signal is present (i.e. SUPPRESS),
+# 1 otherwise (emit as normal).
+has_maintainer_waiting_comment() {
+    local repo=$1
+    local number=$2
+    local bot="${BOT_USERNAME:-TimeToBuildBob}"
+
+    local bot_comments
+    bot_comments=$(gh api "repos/$repo/issues/$number/comments?per_page=100" \
+        --jq "[.[] | select(.user.login == \"$bot\") | .body] | join(\"\n\")" 2>/dev/null) || return 1
+
+    [ -n "$bot_comments" ] || return 1
+
+    # Match any of the canonical or real-world phrasings that signal "waiting
+    # only on a maintainer click." Matching is case-insensitive on the anchor
+    # word so minor capitalisation drift doesn't defeat the guard.
+    local lower
+    lower=$(printf '%s' "$bot_comments" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+        *"waiting only on a maintainer click"*) return 0 ;;
+        *"waiting only on a maintainer merge click"*) return 0 ;;
+        *"ready to merge when convenient"*) return 0 ;;
+        *"blocked by missing mergepullrequest permission"*) return 0 ;;
+    esac
+    # "ready (to|for) merge @<maintainer>" — the @-mention indicates the ball
+    # is explicitly in the maintainer's court. Bare "ready to merge" is too
+    # broad (Bob says it about his own PRs in unrelated contexts), so we
+    # require the @-mention as the maintainer-handoff signal.
+    if printf '%s' "$lower" | grep -qE 'ready (to|for) merge @[a-z0-9_-]+'; then
+        return 0
+    fi
+    return 1
+}
+
 # Find PRs that are ready to merge: CI green, no conflicts, and Greptile score
 # is acceptable (>= 5/5, or no Greptile review at all for simple PRs).
 #
@@ -566,8 +618,14 @@ check_greptile_scores() {
 #   Cooldown: 12 hours — merge decisions shouldn't be nagged frequently.
 #   Re-emits when HEAD SHA changes (new commits may change merge readiness).
 #
-# API cost: Zero additional API calls. Reads Greptile score from the state file
-# written by check_greptile_scores() instead of re-fetching issue comments.
+# Suppression: If the bot already left a "waiting only on a maintainer click"
+# status comment (see has_maintainer_waiting_comment), we skip emitting for
+# that HEAD even after the cooldown expires. The state file is still bumped so
+# subsequent runs follow the normal cooldown path once a new HEAD arrives.
+#
+# API cost: +1 comments fetch per CLEAN/MERGEABLE candidate that passes the
+# Greptile and cooldown gates. Typical workload is a handful of PRs per cycle,
+# so the added cost is negligible compared to the existing PR search calls.
 check_merge_ready() {
     local repo=$1
     local prs=$2
@@ -619,6 +677,16 @@ check_merge_ready() {
         fi
         # First-time discovery OR state change — emit immediately (no seed-only behavior)
 
+        # Suppress re-emits when the bot already signalled it is waiting only on
+        # a maintainer merge click. The state file is still updated so we stay
+        # on the normal cooldown schedule once the situation changes (new HEAD,
+        # new review, CI change that forces the "waiting" comment to be
+        # refreshed into a different status).
+        if has_maintainer_waiting_comment "$repo" "$pr_number"; then
+            echo "${head_sha}:${now}" > "$state_file"
+            continue
+        fi
+
         echo "${head_sha}:${now}" > "$state_file"
 
         local detail="CI green, mergeable"
@@ -644,37 +712,55 @@ check_notifications() {
     # Only emitted notifications get state files — unemitted ones retry next run.
     local max_notif_per_run=5
 
+    # Notification state files store the most recently seen `updated_at`. GitHub
+    # re-uses the same notification ID across follow-up comments on the same
+    # thread (only `updated_at` advances), so a presence-only check would dedupe
+    # legitimate follow-up activity. Re-emit when `updated_at` is strictly newer
+    # than the stored timestamp.
     if [ "$FORMAT" = "jsonl" ]; then
         local _notif_emitted=0
         echo "$notifs" | jq -c '{
             id: .id,
+            updated_at: .updated_at,
             type: "notification",
             repo: .repository.full_name,
             number: (.subject.url // "" | split("/") | last | tonumber? // 0),
             title: .subject.title,
             detail: .reason
         }' 2>/dev/null | while IFS= read -r item; do
-            local notif_id state_file
+            local notif_id notif_updated state_file prior
             notif_id=$(echo "$item" | jq -r '.id')
+            notif_updated=$(echo "$item" | jq -r '.updated_at')
             state_file="$STATE_DIR/notif-${notif_id}.state"
-            if [ ! -f "$state_file" ]; then
+            prior=""
+            [ -f "$state_file" ] && prior=$(cat "$state_file" 2>/dev/null || true)
+            # Re-emit if no state file yet OR stored timestamp is older than current.
+            # String comparison works on ISO-8601 timestamps.
+            if [ -z "$prior" ] || [ "$prior" \< "$notif_updated" ]; then
                 _notif_emitted=$((_notif_emitted + 1))
                 if [ "$_notif_emitted" -le "$max_notif_per_run" ]; then
-                    touch "$state_file"
-                    # Strip the id field before emitting (consumer doesn't need it)
-                    echo "$item" | jq -c 'del(.id)'
+                    # Emit first so a jq failure leaves the state file untouched and the
+                    # notification is retried on the next run (emit-before-persist semantics).
+                    echo "$item" | jq -c 'del(.id, .updated_at)'
+                    printf '%s' "$notif_updated" > "$state_file"
                 fi
             fi
         done
     else
         # Count new notifications and create state files (process substitution avoids subshell)
         local new_count=0
-        while IFS= read -r notif_id; do
-            if [ ! -f "$STATE_DIR/notif-${notif_id}.state" ]; then
-                touch "$STATE_DIR/notif-${notif_id}.state"
+        while IFS= read -r line; do
+            local notif_id notif_updated state_file prior
+            notif_id=${line%%$'\t'*}
+            notif_updated=${line#*$'\t'}
+            state_file="$STATE_DIR/notif-${notif_id}.state"
+            prior=""
+            [ -f "$state_file" ] && prior=$(cat "$state_file" 2>/dev/null || true)
+            if [ -z "$prior" ] || [ "$prior" \< "$notif_updated" ]; then
+                printf '%s' "$notif_updated" > "$state_file"
                 new_count=$((new_count + 1))
             fi
-        done < <(echo "$notifs" | jq -r '.id' 2>/dev/null)
+        done < <(echo "$notifs" | jq -r '"\(.id)\t\(.updated_at)"' 2>/dev/null)
         echo "$new_count"
     fi
 }

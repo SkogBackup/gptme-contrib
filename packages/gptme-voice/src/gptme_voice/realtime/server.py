@@ -13,7 +13,11 @@ import json
 import logging
 import os
 import shlex
+import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,14 +49,56 @@ from .xai_client import XAIRealtimeClient, _get_xai_api_key
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class CallerIdentity:
+    canonical_name: str
+    preferred_spoken_name: str
+
+
 _DEFAULT_RESUME_WINDOW_SECONDS = 300
 _DEFAULT_STATE_DIR = "/tmp/gptme-voice-call-state"
 _MAX_RESUME_TRANSCRIPT_CHARS = 2500
-_INITIAL_TWILIO_GREETING_INSTRUCTIONS = (
-    "A fresh inbound phone call has just connected. "
-    "Greet the caller briefly in one sentence, use their name if you know it, "
-    "then stop and wait for them to speak."
-)
+
+
+def _http_post_sync(url: str, payload: bytes, api_key: str) -> None:
+    """Fire-and-forget HTTP POST to the gptme server transcript endpoint.
+
+    Runs in a thread-pool executor so it never blocks the event loop.
+    Failures are logged but never raised — transcript promotion is
+    best-effort.
+    """
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if 200 <= resp.status < 300:
+                logger.info(
+                    "Promoted transcript to gptme server (%d bytes)", len(payload)
+                )
+            else:
+                logger.warning(
+                    "Unexpected %d from transcript endpoint: %s",
+                    resp.status,
+                    body[:200],
+                )
+    except urllib.error.HTTPError as exc:
+        logger.warning(
+            "Transcript promotion HTTP %d: %s",
+            exc.code,
+            exc.read().decode("utf-8", errors="replace")[:200],
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Transcript promotion failed (network): %s", exc)
+
 
 # Delay before actually closing the WebSocket after the model requests hangup,
 # so the goodbye utterance has time to reach the caller.
@@ -75,12 +121,59 @@ class RecentCallRecord:
     transcript: list[TranscriptTurn]
     metadata: dict[str, str]
     subagent_timings: list[dict[str, object]] = field(default_factory=list)
+    archive_record_paths: list[str] = field(default_factory=list)
+    pending_post_call_unit: str | None = None
 
 
 @dataclass
 class SessionBootstrap:
     instructions: str
     should_greet_first: bool = False
+    initial_response_instructions: str = ""
+
+
+def _extract_preferred_spoken_name(text: str, canonical_name: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("- call name:"):
+            value = stripped.split(":", 1)[1].strip()
+            if value:
+                return value
+    parts = canonical_name.split()
+    return parts[0] if parts else canonical_name
+
+
+def _lookup_caller_identity(
+    from_number: str, workspace: str | None
+) -> CallerIdentity | None:
+    if workspace:
+        people_dir = Path(workspace) / "people"
+        if people_dir.is_dir():
+            for md_file in people_dir.glob("*.md"):
+                try:
+                    text = md_file.read_text()
+                    if from_number in text:
+                        first_h1 = next(
+                            (
+                                line.lstrip("# ").strip()
+                                for line in text.splitlines()
+                                if line.startswith("# ")
+                            ),
+                            None,
+                        )
+                        canonical_name = (
+                            first_h1 or md_file.stem.replace("-", " ").title()
+                        )
+                        preferred_spoken_name = _extract_preferred_spoken_name(
+                            text, canonical_name
+                        )
+                        return CallerIdentity(
+                            canonical_name=canonical_name,
+                            preferred_spoken_name=preferred_spoken_name,
+                        )
+                except Exception:
+                    pass
+    return None
 
 
 def _build_caller_instructions(
@@ -95,33 +188,19 @@ def _build_caller_instructions(
     if not from_number:
         return base_instructions
 
-    caller_name: str | None = None
-    if workspace:
-        people_dir = Path(workspace) / "people"
-        if people_dir.is_dir():
-            for md_file in people_dir.glob("*.md"):
-                try:
-                    text = md_file.read_text()
-                    if from_number in text:
-                        # Use the stem as a hint; the file header is the canonical name
-                        first_h1 = next(
-                            (
-                                line.lstrip("# ").strip()
-                                for line in text.splitlines()
-                                if line.startswith("# ")
-                            ),
-                            None,
-                        )
-                        caller_name = first_h1 or md_file.stem.replace("-", " ").title()
-                        break
-                except Exception:
-                    pass
+    caller_identity = _lookup_caller_identity(from_number, workspace)
 
-    if caller_name:
+    if caller_identity:
+        name_hint = (
+            f" On voice calls, prefer '{caller_identity.preferred_spoken_name}' over their full name."
+            if caller_identity.preferred_spoken_name != caller_identity.canonical_name
+            else ""
+        )
         caller_ctx = (
             f"The current caller's phone number is {from_number} "
-            f"({caller_name}). "
+            f"({caller_identity.canonical_name}). "
             f"You know this person — refer to them by name."
+            f"{name_hint}"
         )
     else:
         caller_ctx = (
@@ -130,6 +209,67 @@ def _build_caller_instructions(
         )
 
     return f"{caller_ctx}\n\n{base_instructions}"
+
+
+def _build_fresh_call_greeting_instructions(
+    from_number: str, workspace: str | None
+) -> str:
+    caller_identity = (
+        _lookup_caller_identity(from_number, workspace) if from_number else None
+    )
+    if caller_identity:
+        spoken_name = caller_identity.preferred_spoken_name
+        canonical_name = caller_identity.canonical_name
+        if spoken_name == canonical_name:
+            greeting_target = (
+                f"The caller is {canonical_name}. Greet them by name in one short sentence, "
+                f"for example 'Hi {spoken_name}' or 'Hey {spoken_name}, what's up?'. "
+            )
+        else:
+            greeting_target = (
+                f"The caller is {canonical_name}. On voice calls, greet them using '{spoken_name}', "
+                f"not their full name, in one short sentence, for example 'Hi {spoken_name}' "
+                f"or 'Hey {spoken_name}, what's up?'. "
+            )
+        return (
+            greeting_target
+            + "Do NOT say 'thanks for calling' or use other stock phone greetings. "
+            "Then stop and wait for them to speak."
+        )
+
+    return (
+        "A fresh inbound phone call has just connected and the caller is unknown. "
+        "Introduce yourself by name, then ask exactly: 'Who am I speaking to?' "
+        "Do NOT say 'thanks for calling' or use other stock phone greetings. "
+        "Then stop and wait for them to answer."
+    )
+
+
+def _build_standup_call_instructions(brief_text: str) -> str:
+    """Build initial response instructions for a standup call with a pre-generated brief.
+
+    Guides the voice model to deliver an outbound standup call that sounds
+    deliberate, prepared, and confident — not like a pre-recorded message.
+    """
+    return (
+        "This is an outbound daily standup call you initiated to Erik. "
+        "You are the one calling him, not the other way around — own the opening.\n\n"
+        "1. **Greet first** — say 'Good morning Erik' or 'Hi Erik' in one short sentence. "
+        "Do NOT start with filler like 'Hey...' or 'So...'. "
+        "Do NOT say 'thanks for taking my call' or 'thanks for picking up'.\n\n"
+        "2. **Deliver the brief** — read the brief below naturally. Do NOT announce "
+        "'Here is the standup brief' or 'Let me read you the brief'. "
+        "Just lead into it conversationally. "
+        "Pause briefly between items. Do not rush.\n\n"
+        "3. **Sound deliberate and confident** — speak at a measured pace. "
+        "You prepared this brief for a reason; deliver it like you mean it. "
+        "If something is blocking progress, say so plainly. "
+        "If something went well, acknowledge it.\n\n"
+        "4. **Hand off** — after the brief, say something like "
+        "'That's what I've got — what do you think?' or 'Over to you — any questions?' "
+        "Then stop and wait for Erik to respond.\n\n"
+        f"--- Standup brief ---\n\n{brief_text}"
+    )
 
 
 def _append_transcript_turn(
@@ -220,11 +360,13 @@ class VoiceServer:
         workspace: str | None = None,
         provider: str = _PROVIDER_OPENAI,
         model: str | None = None,
+        enable_browser_transport: bool = False,
     ):
         self.host = host
         self.port = port
         self.provider = provider
         self.model = model
+        self.enable_browser_transport = enable_browser_transport
         if provider == _PROVIDER_GROK:
             self._api_key = _get_xai_api_key()
         else:
@@ -240,6 +382,8 @@ class VoiceServer:
             or self.resume_window_seconds
         )
         self.post_call_command = _get_config_env("GPTME_VOICE_POST_CALL_COMMAND")
+        self.gptme_server_url = _get_config_env("GPTME_VOICE_GPTME_SERVER_URL") or ""
+        self.gptme_server_key = _get_config_env("GPTME_VOICE_GPTME_SERVER_KEY") or ""
         self.state_dir = Path(
             _get_config_env("GPTME_VOICE_STATE_DIR") or _DEFAULT_STATE_DIR
         )
@@ -281,17 +425,24 @@ class VoiceServer:
 
         # Active connections: call_sid -> (twilio_ws, realtime_client)
         self._connections: dict[str, tuple] = {}
-        self._pending_post_calls: dict[str, asyncio.Task[None]] = {}
+        self._pending_post_calls: dict[str, str] = {}
+        self._pending_archive_records: dict[str, list[Path]] = {}
+        # Pre-warmed realtime connections: from_number -> (client, created_at)
+        # Keyed by from_number, claimed and discarded when the Twilio stream starts.
+        self._prewarm_sessions: dict[str, tuple[OpenAIRealtimeClient, float]] = {}
+        # Max seconds a pre-warm session is kept before being discarded
+        self._prewarm_ttl_seconds = 30
 
-        # Create Starlette app
-        self.app = Starlette(
-            routes=[
-                Route("/", self.health_check, methods=["GET"]),
-                Route("/incoming", self.handle_incoming_call, methods=["POST"]),
-                WebSocketRoute("/twilio", self.handle_twilio_websocket),
-                WebSocketRoute("/local", self.handle_local_websocket),
-            ]
-        )
+        routes = [
+            Route("/", self.health_check, methods=["GET"]),
+            Route("/incoming", self.handle_incoming_call, methods=["POST"]),
+            WebSocketRoute("/twilio", self.handle_twilio_websocket),
+            WebSocketRoute("/local", self.handle_local_websocket),
+        ]
+        if self.enable_browser_transport:
+            routes.append(WebSocketRoute("/voice", self.handle_browser_websocket))
+
+        self.app = Starlette(routes=routes)
 
     def _recent_call_path(self, caller_id: str) -> Path:
         digest = hashlib.sha256(caller_id.encode("utf-8")).hexdigest()[:16]
@@ -338,7 +489,9 @@ class VoiceServer:
             / f"{ended_at}-{milliseconds:03d}-{record.source}-{safe_identifier}.json"
         )
 
-    def _record_payload(self, record: RecentCallRecord) -> dict[str, object]:
+    def _record_payload(
+        self, record: RecentCallRecord, *, include_pending_state: bool = False
+    ) -> dict[str, object]:
         payload: dict[str, object] = {
             "caller_id": record.caller_id,
             "source": record.source,
@@ -348,17 +501,37 @@ class VoiceServer:
         }
         if record.subagent_timings:
             payload["subagent_timings"] = record.subagent_timings
+        if include_pending_state and record.archive_record_paths:
+            payload["archive_record_paths"] = record.archive_record_paths
+        if include_pending_state and record.pending_post_call_unit:
+            payload["pending_post_call_unit"] = record.pending_post_call_unit
         return payload
 
-    def _write_call_record(self, path: Path, record: RecentCallRecord) -> Path:
+    def _write_call_record(
+        self,
+        path: Path,
+        record: RecentCallRecord,
+        *,
+        include_pending_state: bool = False,
+    ) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(self._record_payload(record), indent=2, sort_keys=True)
+            json.dumps(
+                self._record_payload(
+                    record, include_pending_state=include_pending_state
+                ),
+                indent=2,
+                sort_keys=True,
+            )
         )
         return path
 
     def _save_recent_call(self, record: RecentCallRecord) -> Path:
-        return self._write_call_record(self._recent_call_path(record.caller_id), record)
+        return self._write_call_record(
+            self._recent_call_path(record.caller_id),
+            record,
+            include_pending_state=True,
+        )
 
     def _save_call_record(self, record: RecentCallRecord) -> Path:
         return self._write_call_record(self._call_record_path(record), record)
@@ -382,6 +555,7 @@ class VoiceServer:
                 subagent_timings = [
                     dict(item) for item in raw_timings if isinstance(item, dict)
                 ]
+                raw_archive_paths = payload.get("archive_record_paths") or []
                 return RecentCallRecord(
                     caller_id=payload["caller_id"],
                     source=payload.get("source", "unknown"),
@@ -393,6 +567,17 @@ class VoiceServer:
                         if value is not None
                     },
                     subagent_timings=subagent_timings,
+                    archive_record_paths=[
+                        str(path)
+                        for path in raw_archive_paths
+                        if isinstance(path, str) and path.strip()
+                    ],
+                    pending_post_call_unit=(
+                        payload.get("pending_post_call_unit")
+                        if isinstance(payload.get("pending_post_call_unit"), str)
+                        and payload.get("pending_post_call_unit")
+                        else None
+                    ),
                 )
             except Exception as exc:
                 logger.warning(
@@ -400,6 +585,59 @@ class VoiceServer:
                 )
 
         return None
+
+    def _dedupe_record_paths(self, record_paths: list[Path]) -> list[Path]:
+        return list(dict.fromkeys(record_paths))
+
+    def _restore_archive_record_paths(self, raw_paths: list[str]) -> list[Path]:
+        restored_paths: list[Path] = []
+        for raw_path in raw_paths:
+            path = Path(raw_path)
+            if path.exists():
+                restored_paths.append(path)
+        return self._dedupe_record_paths(restored_paths)
+
+    def _build_post_call_unit_name(
+        self, caller_id: str, record_paths: list[Path]
+    ) -> str | None:
+        deduped_record_paths = self._dedupe_record_paths(record_paths)
+        if not deduped_record_paths:
+            return None
+
+        digest = hashlib.sha256()
+        digest.update(caller_id.encode("utf-8"))
+        for record_path in deduped_record_paths:
+            digest.update(b"\0")
+            digest.update(str(record_path).encode("utf-8"))
+        return f"gptme-voice-post-call-{digest.hexdigest()[:12]}"
+
+    def _cancel_post_call_schedule(self, unit_name: str | None) -> None:
+        if not unit_name:
+            return
+
+        units = (f"{unit_name}.timer", f"{unit_name}.service")
+        for action in ("stop", "reset-failed"):
+            for unit in units:
+                result = subprocess.run(
+                    ["systemctl", "--user", action, unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    continue
+
+                stderr = (result.stderr or "").strip().lower()
+                if "not loaded" in stderr or "not found" in stderr:
+                    continue
+
+                logger.warning(
+                    "Failed to %s pending post-call unit %s: exit=%s stderr=%s",
+                    action,
+                    unit,
+                    result.returncode,
+                    (result.stderr or "").strip(),
+                )
 
     def _parse_state_timestamp(self, value: object) -> float | None:
         if not isinstance(value, str) or not value.strip():
@@ -471,12 +709,14 @@ class VoiceServer:
         logger.info("Consumed handoff bootstrap %s from %s", handoff_id, path)
         return resume_context
 
-    def _build_session_bootstrap(
+    async def _build_session_bootstrap(
         self,
         *,
         caller_id: str | None,
         from_number: str = "",
         handoff_id: str | None = None,
+        standup_brief: str | None = None,
+        consume_recent: bool = True,
     ) -> SessionBootstrap:
         instructions = self._instructions
         if from_number:
@@ -491,7 +731,18 @@ class VoiceServer:
                 should_greet_first=False,
             )
 
-        recent_call = self._consume_recent_call(caller_id)
+        # standup_brief takes priority over recent-call resume: an explicit outbound
+        # standup should always deliver the brief, not silently resume a prior session.
+        if standup_brief:
+            return SessionBootstrap(
+                instructions=f"{standup_brief}\n\n{instructions}",
+                should_greet_first=True,
+                initial_response_instructions=_build_standup_call_instructions(
+                    standup_brief
+                ),
+            )
+
+        recent_call = await self._consume_recent_call(caller_id, consume=consume_recent)
         if recent_call:
             return SessionBootstrap(
                 instructions=_build_resume_instructions(
@@ -505,22 +756,105 @@ class VoiceServer:
         return SessionBootstrap(
             instructions=instructions,
             should_greet_first=True,
+            initial_response_instructions=_build_fresh_call_greeting_instructions(
+                from_number,
+                self.workspace,
+            ),
         )
 
-    def _build_session_instructions(
+    def _evict_stale_prewarms(self) -> None:
+        """Discard pre-warm entries that exceeded TTL without being claimed."""
+        now = time.monotonic()
+        stale = [
+            num
+            for num, (_, created_at) in self._prewarm_sessions.items()
+            if now - created_at > self._prewarm_ttl_seconds
+        ]
+        for num in stale:
+            client, _ = self._prewarm_sessions.pop(num)
+            logger.info("Evicting stale pre-warm for %s", num)
+            asyncio.create_task(self._disconnect_realtime_client(client))
+
+    async def _prewarm_for_inbound(self, from_number: str) -> None:
+        """Pre-connect to the realtime API while Twilio is setting up the media stream.
+
+        Called as a background task from handle_incoming_call so the provider
+        WebSocket and session handshake complete before the Twilio stream's
+        ``start`` event arrives.  The client is stored with
+        ``hold_initial_response=True`` so no greeting is sent before the
+        call-side WebSocket is ready; activate_session() releases it.
+        """
+        self._evict_stale_prewarms()
+        try:
+            # Peek at the resume record (consume_recent=False) so the on-disk
+            # state file is NOT deleted until connect() succeeds.  If connect()
+            # raises, the file stays intact and the cold-path _build_session_bootstrap
+            # can still resume the caller normally.
+            bootstrap = await self._build_session_bootstrap(
+                caller_id=from_number,
+                from_number=from_number,
+                consume_recent=False,
+            )
+            session_cfg = self._build_session_config(
+                instructions=bootstrap.instructions,
+                initial_response_instructions=(
+                    bootstrap.initial_response_instructions
+                    if bootstrap.should_greet_first
+                    else ""
+                ),
+            )
+            client = self._make_client(session_cfg, hold_initial_response=True)
+            await client.connect()
+            # connect() succeeded — now safely consume the resume state so a
+            # cold-path fallback won't re-inject the same transcript.
+            await self._consume_recent_call(from_number)
+            self._prewarm_sessions[from_number] = (client, time.monotonic())
+            logger.info("Pre-warm ready for %s", from_number)
+        except Exception as exc:
+            logger.warning("Pre-warm failed for %s: %s", from_number, exc)
+
+    def _claim_prewarm(self, from_number: str) -> OpenAIRealtimeClient | None:
+        """Claim and remove a pre-warmed session for from_number if still fresh."""
+        entry = self._prewarm_sessions.pop(from_number, None)
+        if entry is None:
+            return None
+        client, created_at = entry
+        age = time.monotonic() - created_at
+        if age > self._prewarm_ttl_seconds:
+            logger.info(
+                "Discarding stale pre-warm for %s (%.1fs old)", from_number, age
+            )
+            asyncio.create_task(self._disconnect_realtime_client(client))
+            return None
+        logger.info("Claimed pre-warm for %s (%.1fs old)", from_number, age)
+        return client
+
+    async def _build_session_instructions(
         self,
         *,
         caller_id: str | None,
         from_number: str = "",
         handoff_id: str | None = None,
     ) -> str:
-        return self._build_session_bootstrap(
-            caller_id=caller_id,
-            from_number=from_number,
-            handoff_id=handoff_id,
+        return (
+            await self._build_session_bootstrap(
+                caller_id=caller_id,
+                from_number=from_number,
+                handoff_id=handoff_id,
+            )
         ).instructions
 
-    def _consume_recent_call(self, caller_id: str | None) -> RecentCallRecord | None:
+    async def _consume_recent_call(
+        self, caller_id: str | None, *, consume: bool = True
+    ) -> RecentCallRecord | None:
+        """Load the most recent call record for *caller_id*.
+
+        When *consume* is True (default) the on-disk state file is deleted,
+        any pending post-call schedule is cancelled, and archive record paths
+        are restored.  Pass ``consume=False`` to peek at the record without
+        side effects — useful when building bootstrap instructions before a
+        connect() that may fail, to avoid losing resume context.
+        """
         if not caller_id:
             return None
 
@@ -532,10 +866,29 @@ class VoiceServer:
         if age_seconds > self.resume_window_seconds:
             return None
 
-        pending_task = self._pending_post_calls.pop(caller_id, None)
-        if pending_task:
-            pending_task.cancel()
-            logger.info("Cancelled pending post-call follow-up for %s", caller_id)
+        if not consume:
+            return recent_call
+
+        pending_unit = (
+            self._pending_post_calls.pop(caller_id, None)
+            or recent_call.pending_post_call_unit
+        )
+        if pending_unit:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, self._cancel_post_call_schedule, pending_unit
+            )
+            logger.info(
+                "Deferred pending post-call follow-up for resumed caller %s", caller_id
+            )
+
+        restored_archive_paths = self._restore_archive_record_paths(
+            recent_call.archive_record_paths
+        )
+        if restored_archive_paths:
+            self._pending_archive_records[caller_id] = restored_archive_paths
+        else:
+            self._pending_archive_records.pop(caller_id, None)
 
         # Delete the resume-state file(s) so a crash-resume can't re-inject the old
         # transcript, but keep archived per-call records for post-call analysis.
@@ -556,8 +909,20 @@ class VoiceServer:
         )
         return recent_call
 
-    async def _run_post_call_command(self, caller_id: str, record_path: Path) -> None:
+    async def _run_post_call_command(
+        self,
+        caller_id: str,
+        record_paths: list[Path],
+        *,
+        delay_seconds: int = 0,
+        unit_name: str | None = None,
+    ) -> None:
         if not self.post_call_command:
+            return
+        if not record_paths:
+            logger.warning(
+                "Ignoring post-call command for %s with no records", caller_id
+            )
             return
 
         argv = shlex.split(self.post_call_command)
@@ -566,11 +931,18 @@ class VoiceServer:
             return
 
         env = os.environ.copy()
-        env["GPTME_VOICE_POST_CALL_JSON"] = str(record_path)
+        env["GPTME_VOICE_POST_CALL_JSON"] = str(record_paths[0])
+        env["GPTME_VOICE_POST_CALL_JSONS"] = json.dumps(
+            [str(path) for path in record_paths]
+        )
         env["GPTME_VOICE_CALLER_ID"] = caller_id
+        if delay_seconds > 0:
+            env["GPTME_VOICE_POST_CALL_DELAY_SECONDS"] = str(delay_seconds)
+        if unit_name:
+            env["GPTME_VOICE_POST_CALL_UNIT_NAME"] = unit_name
         process = await asyncio.create_subprocess_exec(
             *argv,
-            str(record_path),
+            *(str(path) for path in record_paths),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -605,27 +977,62 @@ class VoiceServer:
                 stdout.decode("utf-8", errors="replace").strip(),
             )
 
-    async def _schedule_post_call(self, caller_id: str, record_path: Path) -> None:
-        existing_task = self._pending_post_calls.pop(caller_id, None)
-        if existing_task:
-            existing_task.cancel()
+    async def _schedule_post_call(
+        self, caller_id: str, record_paths: list[Path]
+    ) -> None:
+        existing_unit = self._pending_post_calls.pop(caller_id, None)
+        if existing_unit:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, self._cancel_post_call_schedule, existing_unit
+            )
 
-        if not self.post_call_command:
+        deduped_record_paths = self._dedupe_record_paths(record_paths)
+        if not deduped_record_paths:
+            self._pending_archive_records.pop(caller_id, None)
+            logger.warning(
+                "Ignoring post-call schedule for %s with no records", caller_id
+            )
             return
 
-        async def _runner() -> None:
-            task = asyncio.current_task()
-            try:
-                await asyncio.sleep(self.post_call_delay_seconds)
-                await self._run_post_call_command(caller_id, record_path)
-            except asyncio.CancelledError:
-                raise
-            finally:
-                # Only remove our own entry — a newer task may have replaced us
-                if self._pending_post_calls.get(caller_id) is task:
-                    self._pending_post_calls.pop(caller_id)
+        self._pending_archive_records[caller_id] = deduped_record_paths
 
-        self._pending_post_calls[caller_id] = asyncio.create_task(_runner())
+        if not self.post_call_command:
+            self._pending_post_calls.pop(caller_id, None)
+            self._pending_archive_records.pop(caller_id, None)
+            return
+
+        unit_name = self._build_post_call_unit_name(caller_id, deduped_record_paths)
+        if unit_name:
+            self._pending_post_calls[caller_id] = unit_name
+
+        if self.post_call_delay_seconds > 0:
+            logger.info(
+                "Post-call delay of %ds for %s is delegated to the external command "
+                "via GPTME_VOICE_POST_CALL_DELAY_SECONDS; the server no longer enforces it directly",
+                self.post_call_delay_seconds,
+                caller_id,
+            )
+
+        # Cap the dispatch command at 30s so a hung systemd-run can't stall _on_call_end
+        # indefinitely. The dispatch command (e.g. post-call-dispatch.sh) is expected to exit
+        # in <1s after scheduling a systemd timer, not after the full post-call delay.
+        try:
+            await asyncio.wait_for(
+                self._run_post_call_command(
+                    caller_id,
+                    deduped_record_paths,
+                    delay_seconds=self.post_call_delay_seconds,
+                    unit_name=unit_name,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Post-call dispatch command timed out after 30s for %s — "
+                "follow-up may not have been scheduled",
+                caller_id,
+            )
 
     def _make_handoff_callback(
         self,
@@ -691,6 +1098,66 @@ class VoiceServer:
 
         return _on_handoff
 
+    def _promote_transcript_to_gptme(
+        self,
+        caller_id: str,
+        transcript: list[TranscriptTurn],
+        metadata: dict[str, str],
+    ) -> None:
+        """POST the call transcript to the gptme server conversation endpoint.
+
+        Called as a fire-and-forget background task after the archive record
+        is written.  Idempotent: the gptme server deduplicates by *call_sid*,
+        so retries are safe.
+
+        Requires ``GPTME_VOICE_GPTME_SERVER_URL`` and
+        ``GPTME_VOICE_GPTME_SERVER_KEY`` env vars.  Silently skips when
+        either is empty or missing.
+        """
+        if not self.gptme_server_url or not self.gptme_server_key:
+            return
+
+        call_sid = metadata.get("call_sid")
+        if not call_sid:
+            logger.warning(
+                "Skipping transcript promotion for %s: no call_sid in metadata",
+                caller_id,
+            )
+            return
+
+        turns = [
+            {"role": turn.role, "text": turn.text}
+            for turn in transcript
+            if turn.text.strip()
+        ]
+        if not turns:
+            logger.info(
+                "Skipping transcript promotion for %s: empty transcript", caller_id
+            )
+            return
+
+        url = f"{self.gptme_server_url.rstrip('/')}/api/v2/conversations/{urllib.parse.quote(caller_id, safe='')}/transcript"
+        payload = json.dumps(
+            {
+                "turns": turns,
+                "call_metadata": {"call_sid": call_sid},
+            }
+        ).encode("utf-8")
+
+        try:
+            loop = asyncio.get_running_loop()
+            fut = loop.run_in_executor(
+                None,
+                _http_post_sync,
+                url,
+                payload,
+                self.gptme_server_key,
+            )
+            fut.add_done_callback(lambda _: None)
+        except RuntimeError:
+            # No running loop (tests / sync context) — post synchronously
+            _http_post_sync(url, payload, self.gptme_server_key)
+
     async def _on_call_end(
         self,
         caller_id: str | None,
@@ -717,9 +1184,20 @@ class VoiceServer:
             metadata={k: v for k, v in metadata.items() if v},
             subagent_timings=subagent_timings,
         )
-        self._save_recent_call(record)
         record_path = self._save_call_record(record)
-        await self._schedule_post_call(caller_id, record_path)
+        pending_record_paths = list(self._pending_archive_records.get(caller_id, []))
+        pending_record_paths.append(record_path)
+        deduped_record_paths = self._dedupe_record_paths(pending_record_paths)
+        record.archive_record_paths = [str(path) for path in deduped_record_paths]
+        record.pending_post_call_unit = self._build_post_call_unit_name(
+            caller_id, deduped_record_paths
+        )
+        self._save_recent_call(record)
+        await self._schedule_post_call(caller_id, deduped_record_paths)
+
+        # Promote transcript to gptme server for persistence in conversation log.
+        # Fire-and-forget — never blocks the call-end teardown.
+        self._promote_transcript_to_gptme(caller_id, transcript, metadata)
 
     def _get_local_caller_id(self, websocket) -> str:
         caller_id = websocket.query_params.get("caller_id")
@@ -791,6 +1269,12 @@ class VoiceServer:
             host = request.headers.get("host", f"{self.host}:{self.port}")
             ws_url = build_stream_url(host)
 
+        # Fire-and-forget: pre-warm the provider connection so it is ready before
+        # Twilio's media-stream WebSocket sends its "start" event.  This eliminates
+        # most of the ~1-3s dead air between call answer and first greeting audio.
+        if from_number:
+            asyncio.create_task(self._prewarm_for_inbound(from_number))
+
         # Forward caller number to WebSocket handler via TwiML custom parameters.
         custom_params: dict[str, str] = {}
         if from_number:
@@ -844,18 +1328,8 @@ class VoiceServer:
                     custom_params = start.get("customParameters", {})
                     from_number = custom_params.get("from_number", "")
                     handoff_id = custom_params.get("handoff_id") or None
+                    standup_brief = custom_params.get("standup_brief") or None
                     caller_id = from_number or call_sid or stream_sid
-                    bootstrap = self._build_session_bootstrap(
-                        caller_id=caller_id,
-                        from_number=from_number,
-                        handoff_id=handoff_id,
-                    )
-                    instructions = bootstrap.instructions
-                    initial_response_instructions = (
-                        _INITIAL_TWILIO_GREETING_INSTRUCTIONS
-                        if bootstrap.should_greet_first
-                        else ""
-                    )
                     metadata = {
                         "from_number": from_number,
                         "call_sid": call_sid,
@@ -865,33 +1339,67 @@ class VoiceServer:
                     if handoff_id:
                         metadata["handoff_id"] = handoff_id
 
-                    if self.model:
-                        session_cfg = SessionConfig(
-                            instructions=instructions,
-                            initial_response_instructions=initial_response_instructions,
-                            model=self.model,
-                            available_agents=self._available_agents,
-                        )
-                    else:
-                        session_cfg = SessionConfig(
-                            instructions=instructions,
-                            initial_response_instructions=initial_response_instructions,
-                            available_agents=self._available_agents,
-                        )
-                    realtime_client = self._make_client(
-                        session_cfg,
-                        on_audio=lambda audio: self._send_to_twilio(
-                            websocket,
-                            stream_sid,
-                            audio_converter.openai_to_twilio(audio),
-                        ),
-                        on_ai_transcript=lambda text: _append_transcript_turn(
-                            transcript, "assistant", text
-                        ),
-                        on_user_transcript=lambda text: _append_transcript_turn(
-                            transcript, "user", text
-                        ),
+                    # Callbacks — closures capture stream_sid and transcript from this scope.
+                    # Use a factory to bind stream_sid by value so the async coroutine
+                    # is detected and awaited by _call_callback.
+                    def _make_on_audio(_stream_sid: str):
+                        async def _on_audio(audio: bytes) -> None:
+                            await self._send_to_twilio(
+                                websocket,
+                                _stream_sid,
+                                audio_converter.openai_to_twilio(audio),
+                            )
+
+                        return _on_audio
+
+                    on_audio = _make_on_audio(stream_sid)
+
+                    def on_ai_transcript(text: str) -> None:
+                        _append_transcript_turn(transcript, "assistant", text)
+
+                    def on_user_transcript(text: str) -> None:
+                        _append_transcript_turn(transcript, "user", text)
+
+                    # Try to claim a pre-warmed session (no handoff/standup for inbound fresh calls)
+                    prewarm_eligible = (
+                        from_number and not handoff_id and not standup_brief
                     )
+                    prewarm_client = (
+                        self._claim_prewarm(from_number) if prewarm_eligible else None
+                    )
+
+                    if prewarm_client is not None:
+                        realtime_client = prewarm_client
+                        realtime_client.on_audio = on_audio
+                        realtime_client.on_ai_transcript = on_ai_transcript
+                        realtime_client.on_user_transcript = on_user_transcript
+                    else:
+                        # Cold path: build session from scratch
+                        bootstrap = await self._build_session_bootstrap(
+                            caller_id=caller_id,
+                            from_number=from_number,
+                            handoff_id=handoff_id,
+                            standup_brief=standup_brief,
+                        )
+                        instructions = bootstrap.instructions
+                        initial_response_instructions = (
+                            bootstrap.initial_response_instructions
+                            if bootstrap.should_greet_first
+                            else ""
+                        )
+                        session_cfg = self._build_session_config(
+                            instructions=instructions,
+                            initial_response_instructions=initial_response_instructions,
+                        )
+                        realtime_client = self._make_client(
+                            session_cfg,
+                            on_audio=on_audio,
+                            on_ai_transcript=on_ai_transcript,
+                            on_user_transcript=on_user_transcript,
+                        )
+
+                    # Wire tool bridge BEFORE connect/activate so on_function_call
+                    # is set when the initial greeting response fires.
                     hangup_ws = websocket
                     hangup_call_sid = call_sid
 
@@ -908,10 +1416,15 @@ class VoiceServer:
                         on_result=realtime_client.inject_message,
                         on_hangup=_twilio_hangup,
                         on_handoff=self._make_handoff_callback([caller_id], transcript),
+                        transcript_provider=lambda: transcript,
                     )
                     realtime_client.on_function_call = tool_bridge.handle_function_call
 
-                    await realtime_client.connect()
+                    if prewarm_client is not None:
+                        await realtime_client.activate_session()
+                    else:
+                        await realtime_client.connect()
+
                     self._connections[call_sid] = (websocket, realtime_client)
 
                 elif event == "media":
@@ -965,9 +1478,25 @@ class VoiceServer:
         }
         await websocket.send_text(json.dumps(message))
 
+    def _build_session_config(
+        self,
+        instructions: str,
+        initial_response_instructions: str = "",
+    ) -> SessionConfig:
+        """Build a SessionConfig with optional model override."""
+        kwargs: dict = dict(
+            instructions=instructions,
+            initial_response_instructions=initial_response_instructions,
+            available_agents=self._available_agents,
+        )
+        if self.model:
+            kwargs["model"] = self.model
+        return SessionConfig(**kwargs)
+
     def _make_client(
         self,
         session_config: SessionConfig,
+        hold_initial_response: bool = False,
         **kwargs,
     ) -> OpenAIRealtimeClient:
         """Instantiate the realtime client for the configured provider."""
@@ -975,11 +1504,13 @@ class VoiceServer:
             return XAIRealtimeClient(
                 api_key=self._api_key,
                 session_config=session_config,
+                hold_initial_response=hold_initial_response,
                 **kwargs,
             )
         return OpenAIRealtimeClient(
             api_key=self._api_key,
             session_config=session_config,
+            hold_initial_response=hold_initial_response,
             **kwargs,
         )
 
@@ -999,21 +1530,11 @@ class VoiceServer:
         transcript: list[TranscriptTurn] = []
 
         try:
-            instructions = self._build_session_instructions(
+            instructions = await self._build_session_instructions(
                 caller_id=caller_id,
                 handoff_id=handoff_id,
             )
-            if self.model:
-                session_cfg = SessionConfig(
-                    instructions=instructions,
-                    model=self.model,
-                    available_agents=self._available_agents,
-                )
-            else:
-                session_cfg = SessionConfig(
-                    instructions=instructions,
-                    available_agents=self._available_agents,
-                )
+            session_cfg = self._build_session_config(instructions=instructions)
             realtime_client = self._make_client(
                 session_cfg,
                 on_audio=lambda audio: self._send_local_audio(websocket, audio),
@@ -1040,6 +1561,7 @@ class VoiceServer:
                 on_result=realtime_client.inject_message,
                 on_hangup=_local_hangup,
                 on_handoff=self._make_handoff_callback([caller_id], transcript),
+                transcript_provider=lambda: transcript,
             )
             realtime_client.on_function_call = tool_bridge.handle_function_call
 
@@ -1075,6 +1597,119 @@ class VoiceServer:
             await self._on_call_end(
                 caller_id,
                 "local",
+                transcript,
+                {
+                    "caller_id": caller_id,
+                    "provider": self.provider,
+                    **({"handoff_id": handoff_id} if handoff_id else {}),
+                },
+                tool_bridge=tool_bridge,
+            )
+
+    async def handle_browser_websocket(self, websocket):
+        """
+        Handle WebSocket connection for browser voice transport.
+
+        Accepts raw binary PCM16 audio frames at 16kHz from the browser side.
+        Control messages remain JSON text frames.
+        """
+        await websocket.accept()
+
+        caller_id = self._get_local_caller_id(websocket)
+        handoff_id = self._get_local_handoff_id(websocket)
+        realtime_client: OpenAIRealtimeClient | None = None
+        tool_bridge: GptmeToolBridge | None = None
+        transcript: list[TranscriptTurn] = []
+        audio_converter = AudioConverter()
+
+        try:
+            instructions = await self._build_session_instructions(
+                caller_id=caller_id,
+                handoff_id=handoff_id,
+            )
+            session_cfg = self._build_session_config(instructions=instructions)
+            realtime_client = self._make_client(
+                session_cfg,
+                on_audio=lambda audio: self._send_browser_audio(websocket, audio),
+                on_audio_end=lambda: self._send_browser_audio_end(websocket),
+                on_ai_transcript=lambda text: _append_transcript_turn(
+                    transcript, "assistant", text
+                ),
+                on_user_transcript=lambda text: _append_transcript_turn(
+                    transcript, "user", text
+                ),
+            )
+            browser_ws = websocket
+
+            async def _browser_hangup(reason: str | None) -> None:
+                await self._schedule_hangup(
+                    browser_ws,
+                    source="browser",
+                    reason=reason,
+                    call_sid=None,
+                )
+
+            tool_bridge = GptmeToolBridge(
+                workspace=self.workspace,
+                on_result=realtime_client.inject_message,
+                on_hangup=_browser_hangup,
+                on_handoff=self._make_handoff_callback([caller_id], transcript),
+                transcript_provider=lambda: transcript,
+            )
+            realtime_client.on_function_call = tool_bridge.handle_function_call
+
+            await realtime_client.connect()
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "ready",
+                        "input_sample_rate": AudioConverter.BROWSER_RATE,
+                        "output_sample_rate": AudioConverter.OPENAI_RATE,
+                    }
+                )
+            )
+
+            while True:
+                message = await websocket.receive()
+                message_type = message.get("type")
+                if message_type == "websocket.disconnect":
+                    break
+
+                audio_data = message.get("bytes")
+                if isinstance(audio_data, bytes):
+                    await realtime_client.send_audio(
+                        audio_converter.browser_to_openai(audio_data)
+                    )
+                    continue
+
+                text = message.get("text")
+                if not isinstance(text, str):
+                    continue
+
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Browser websocket: ignoring malformed JSON text frame"
+                    )
+                    continue
+                if data.get("type") == "commit":
+                    await realtime_client.commit_audio()
+
+        except WebSocketDisconnect:
+            pass
+        except RuntimeError as exc:
+            if "not connected" not in str(exc).lower():
+                raise
+            logger.debug("Browser websocket already closed before receive: %s", exc)
+        except Exception as e:
+            logger.exception("Error handling browser connection: %s", e)
+        finally:
+            if realtime_client:
+                await self._disconnect_realtime_client(realtime_client)
+            await self._on_call_end(
+                caller_id,
+                "browser",
                 transcript,
                 {
                     "caller_id": caller_id,
@@ -1139,6 +1774,15 @@ class VoiceServer:
         message = {"type": "audio_end"}
         await websocket.send_text(json.dumps(message))
 
+    async def _send_browser_audio(self, websocket, audio_data: bytes):
+        """Send raw PCM audio frames to the browser transport."""
+        await websocket.send_bytes(audio_data)
+
+    async def _send_browser_audio_end(self, websocket):
+        """Signal to the browser transport that playback is complete."""
+        message = {"type": "audio_end"}
+        await websocket.send_text(json.dumps(message))
+
     def run(self):
         """Run the server."""
         uvicorn.run(self.app, host=self.host, port=self.port)
@@ -1163,6 +1807,11 @@ class VoiceServer:
         "unless you need a specific model alias from the xAI console."
     ),
 )
+@click.option(
+    "--enable-browser-transport",
+    is_flag=True,
+    help="Expose /voice WebSocket for browser PCM transport.",
+)
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 def main(
     host: str,
@@ -1170,6 +1819,7 @@ def main(
     workspace: str | None,
     provider: str,
     model: str | None,
+    enable_browser_transport: bool,
     debug: bool,
 ):
     """Voice Interface Server for gptme."""
@@ -1187,10 +1837,13 @@ def main(
         workspace=workspace,
         provider=provider,
         model=model,
+        enable_browser_transport=enable_browser_transport,
     )
 
     logger.info(f"Starting voice server on {host}:{port} (provider={provider})")
     logger.info(f"Local test endpoint: ws://{host}:{port}/local")
+    if enable_browser_transport:
+        logger.info(f"Browser test endpoint: ws://{host}:{port}/voice")
 
     server.run()
 

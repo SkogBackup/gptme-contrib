@@ -16,6 +16,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "credential-slots",
     "gptmail",
     "gptme-ace",
     "gptme-activity-summary",
@@ -24,6 +25,7 @@ members = [
     "gptme-consortium",
     "gptme-contrib-lib",
     "gptme-contrib-workspace",
+    "gptme-daily-briefing",
     "gptme-dashboard",
     "gptme-forum",
     "gptme-gptodo",
@@ -900,6 +902,24 @@ toml = [
 ]
 
 [[package]]
+name = "credential-slots"
+version = "0.2.0"
+source = { editable = "packages/credential-slots" }
+
+[package.optional-dependencies]
+test = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
+    { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4.0" },
+]
+provides-extras = ["test"]
+
+[[package]]
 name = "cryptography"
 version = "46.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1356,7 +1376,7 @@ provides-extras = ["oauth", "test"]
 [[package]]
 name = "gptme"
 version = "0.31.0"
-source = { editable = "../gptme" }
+source = { git = "https://github.com/gptme/gptme.git?branch=master#771528ed806cb3bfcfeb263fa1230e042c27191c" }
 dependencies = [
     { name = "anthropic" },
     { name = "bashlex" },
@@ -1727,6 +1747,36 @@ dev = [
     { name = "pytest-mock", specifier = ">=3.12.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
+
+[[package]]
+name = "gptme-daily-briefing"
+version = "0.1.0"
+source = { editable = "packages/gptme-daily-briefing" }
+dependencies = [
+    { name = "pyyaml" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+]
+sessions = [
+    { name = "gptme-sessions" },
+]
+test = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "gptme-sessions", marker = "extra == 'sessions'", editable = "packages/gptme-sessions" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
+]
+provides-extras = ["sessions", "test", "dev"]
 
 [[package]]
 name = "gptme-dashboard"
@@ -2277,6 +2327,7 @@ dependencies = [
     { name = "python-frontmatter" },
     { name = "rich" },
     { name = "tabulate" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -2301,6 +2352,7 @@ requires-dist = [
     { name = "python-frontmatter", specifier = ">=1.1.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "tabulate", specifier = ">=0.9.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.1" },
 ]
 provides-extras = ["dev", "test"]
 
@@ -4772,27 +4824,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7b/3f/9f2167401c2e94833ca3b69535bad89e533b5de75fefe4197a2c224baec2/pypdf-6.10.2.tar.gz", hash = "sha256:7d09ce108eff6bf67465d461b6ef352dcb8d84f7a91befc02f904455c6eea11d", size = 5315679, upload-time = "2026-04-15T16:37:36.978Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/d6/1d5c60cc17bbdf37c1552d9c03862fc6d32c5836732a0415b2d637edc2d0/pypdf-6.10.2-py3-none-any.whl", hash = "sha256:aa53be9826655b51c96741e5d7983ca224d898ac0a77896e64636810517624aa", size = 336308, upload-time = "2026-04-15T16:37:34.851Z" },
-]
-
-[[package]]
-name = "pypika"
-version = "0.51.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f8/78/cbaebba88e05e2dcda13ca203131b38d3640219f20ebb49676d26714861b/pypika-0.51.1.tar.gz", hash = "sha256:c30c7c1048fbf056fd3920c5a2b88b0c29dd190a9b2bee971fd17e4abe4d0ebe", size = 80919, upload-time = "2026-02-04T11:27:48.304Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/57/83/c77dfeed04022e8930b08eedca2b6e5efed256ab3321396fde90066efb65/pypika-0.51.1-py2.py3-none-any.whl", hash = "sha256:77985b4d7ce71b9905255bf12468cf598349e98837c037541cfc240e528aec46", size = 60585, upload-time = "2026-02-04T11:27:46.251Z" },
-]
-
-[[package]]
-name = "pyproject-hooks"
-version = "1.2.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e7/82/28175b2414effca1cdac8dc99f76d660e7a4fb0ceefa4b4ab8f5f6742925/pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8", size = 19228, upload-time = "2024-09-29T09:24:13.293Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bd/24/12818598c362d7f300f18e74db45963dbcb85150324092410c8b49405e42/pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", size = 10216, upload-time = "2024-09-29T09:24:11.978Z" },
 ]
 
 [[package]]

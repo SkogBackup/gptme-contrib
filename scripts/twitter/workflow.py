@@ -52,6 +52,7 @@ from typing import (
 
 import click
 import yaml
+from dotenv import load_dotenv
 
 # Import monitoring utilities
 from gptmail.communication_utils.monitoring import (  # type: ignore[import-not-found]
@@ -136,6 +137,7 @@ POSTED_DIR = TWEETS_DIR / "posted"
 REJECTED_DIR = TWEETS_DIR / "rejected"
 CACHE_DIR = TWEETS_DIR / "cache"
 MAX_POSTS_PER_CYCLE = 2  # Rate limit to prevent mass posting in auto mode
+DRAFT_FILE_SUFFIXES = (".yml", ".yaml", ".md")
 
 # Ensure directories exist
 for dir in [NEW_DIR, REVIEW_DIR, APPROVED_DIR, POSTED_DIR, REJECTED_DIR, CACHE_DIR]:
@@ -180,6 +182,39 @@ def load_from_cache(tweet_id: str) -> Tuple[dict | None, dict | None]:
         cache_data = json.load(f)
 
     return cache_data.get("evaluation"), cache_data.get("response")
+
+
+def _list_draft_files(directory: Path) -> List[Path]:
+    """Return draft files for all supported draft formats."""
+    files_by_name: dict[str, Path] = {}
+    for suffix in DRAFT_FILE_SUFFIXES:
+        for path in directory.glob(f"*{suffix}"):
+            files_by_name[path.name] = path
+    return [files_by_name[name] for name in sorted(files_by_name)]
+
+
+def _parse_markdown_frontmatter(text: str) -> tuple[dict[str, Any], str] | None:
+    """Split markdown frontmatter and body if present."""
+    if not text.startswith("---"):
+        return None
+
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip() != "---":
+        return None
+
+    end_idx = next(
+        (i for i, line in enumerate(lines[1:], start=1) if line.rstrip() == "---"),
+        None,
+    )
+    if end_idx is None:
+        return None
+
+    metadata = yaml.safe_load("\n".join(lines[1:end_idx])) or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("Markdown frontmatter must be a YAML dictionary")
+
+    body = "\n".join(lines[end_idx + 1 :]).strip()
+    return metadata, body
 
 
 class TweetDraft:
@@ -271,14 +306,38 @@ class TweetDraft:
 
     def save(self, path: Path) -> None:
         """Save draft to file"""
+        if path.suffix == ".md":
+            data = self.to_dict()
+            body = data.pop("text", "").strip()
+            with path.open("w") as f:
+                f.write("---\n")
+                yaml.safe_dump(data, f, sort_keys=False)
+                f.write("---\n")
+                if body:
+                    f.write("\n")
+                    f.write(body)
+                    f.write("\n")
+            return
+
         with path.open("w") as f:
-            yaml.dump(self.to_dict(), f)
+            yaml.safe_dump(self.to_dict(), f, sort_keys=False)
 
     @classmethod
     def load(cls, path: Path) -> "TweetDraft":
         """Load draft from file"""
-        with path.open("r") as f:
-            data = yaml.safe_load(f)
+        text = path.read_text()
+        frontmatter = (
+            _parse_markdown_frontmatter(text) if path.suffix == ".md" else None
+        )
+        if frontmatter is not None:
+            data, body = frontmatter
+            if body and not data.get("text") and not data.get("content"):
+                data["text"] = body
+        else:
+            data = yaml.safe_load(text)
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid draft payload in {path}")
         return cls.from_dict(data)
 
 
@@ -611,16 +670,28 @@ def find_draft(
     if "/" in draft_id:
         draft_path = Path(draft_id)
         if not draft_path.exists() and not draft_path.suffix:
-            draft_path = draft_path.with_suffix(".yml")
-        if draft_path.exists():
+            for suffix in DRAFT_FILE_SUFFIXES:
+                candidate = draft_path.with_suffix(suffix)
+                if candidate.exists():
+                    return candidate
+        elif draft_path.exists():
             return draft_path
     else:
         # Search in specified directories
         search_dirs = [status_dirs[status]] if status else status_dirs.values()
         for dir in search_dirs:
-            for path in [dir / draft_id, (dir / draft_id).with_suffix(".yml")] + list(
-                dir.glob(f"*{draft_id}*.yml")
-            ):
+            candidates = [dir / draft_id]
+            if not Path(draft_id).suffix:
+                candidates.extend(
+                    (dir / draft_id).with_suffix(suffix)
+                    for suffix in DRAFT_FILE_SUFFIXES
+                )
+            candidates.extend(
+                path
+                for path in _list_draft_files(dir)
+                if draft_id in path.stem or draft_id in path.name
+            )
+            for path in candidates:
                 if path.exists():
                     return path
 
@@ -628,7 +699,7 @@ def find_draft(
         status_msg = f" in {status} directory" if status else ""
         console.print(f"[red]No draft found{status_msg}: {draft_id}")
         console.print(
-            "[yellow]ID can be: simple ID, filename, or full path (e.g., tweet_20250419, reply_*.yml, tweets/new/*.yml)"
+            "[yellow]ID can be: simple ID, filename, or full path (e.g., tweet_20250419, reply_*.yml, manual-draft.md)"
         )
 
     return None
@@ -647,20 +718,58 @@ def list_drafts(status: str) -> List[Path]:
     if status not in status_dirs:
         raise ValueError(f"Invalid status: {status}")
 
-    return sorted(status_dirs[status].glob("*.yml"))
+    return _list_draft_files(status_dirs[status])
 
 
 @click.group()
 @click.option(
     "--model",
-    default=os.getenv("MODEL", "anthropic/claude-sonnet-4-5"),
+    default=None,
     help="Model to use for LLM operations",
 )
 def cli(model: str | None = None) -> None:
     """Twitter Workflow Manager"""
+    # Sibling scripts (twitter.py, check_replies.py) call load_dotenv() at
+    # import time. workflow.py historically relied on twitter-loop.sh exporting
+    # envs like TWITTER_HANDLE, so direct CLI invocations crashed inside the
+    # LLM grader with `ValueError: TWITTER_HANDLE env var must be set`. Load
+    # .env at CLI entry so `workflow.py` works regardless of how it is invoked.
+    # override=False so values already in the environment (e.g. set by the
+    # systemd loop) still win.
+    load_dotenv(override=False)
+    # Defer MODEL resolution until after load_dotenv() so .env takes effect.
+    if model is None:
+        model = os.getenv("MODEL", "anthropic/claude-sonnet-4-5")
     init_gptme(
         model=model, interactive=False, tool_allowlist=[], tool_format="markdown"
     )
+
+
+def _validate_urls_in_text(text: str) -> list[tuple[str, int]]:
+    """HEAD-check any http(s) URLs in tweet text. Return [(url, status)] for unreachable ones (4xx/5xx).
+
+    Network errors are treated as non-fatal (returns nothing for those URLs) — the goal is to
+    catch deterministic 404s like the recurring `/YYYY/MM/DD/title/` vs `/blog/title/` permalink
+    bug, not to require connectivity. Mirrors the check in scripts/twitter/post-blog-tweet.py.
+    """
+    import re
+    import urllib.error
+    import urllib.request
+
+    url_pattern = re.compile(r"https?://[^\s\"'<>)]+")
+    bad: list[tuple[str, int]] = []
+    for url in url_pattern.findall(text):
+        url = url.rstrip(".,;:!?")
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            req.add_header("User-Agent", "Mozilla/5.0 (URL checker)")
+            with urllib.request.urlopen(req, timeout=5):
+                pass  # 4xx/5xx raise HTTPError before reaching here
+        except urllib.error.HTTPError as e:
+            bad.append((url, e.code))
+        except Exception:
+            pass
+    return bad
 
 
 @cli.command()
@@ -670,11 +779,35 @@ def cli(model: str | None = None) -> None:
 )
 @click.option("--reply-to", help="Tweet ID to reply to")
 @click.option("--schedule", help="Schedule time (ISO format)")
-def draft(text: str, type: str, reply_to: str | None, schedule: str | None) -> None:
+@click.option(
+    "--skip-url-check",
+    is_flag=True,
+    help="Skip HEAD-check of URLs in tweet text (use for pre-publish drafts)",
+)
+def draft(
+    text: str,
+    type: str,
+    reply_to: str | None,
+    schedule: str | None,
+    skip_url_check: bool,
+) -> None:
     """Create a new tweet draft"""
     op = metrics.start_operation("draft_creation", "twitter")
 
     try:
+        if not skip_url_check:
+            bad_urls = _validate_urls_in_text(text)
+            if bad_urls:
+                for url, status in bad_urls:
+                    console.print(
+                        f"[red]✗ URL returns {status}: {url}[/red]",
+                    )
+                console.print(
+                    "[red]Aborting draft — fix URLs or pass --skip-url-check.[/red]"
+                )
+                op.complete(success=False, error="bad_url")
+                sys.exit(1)
+
         scheduled_time = datetime.fromisoformat(schedule) if schedule else None
 
         draft = TweetDraft(
@@ -722,7 +855,7 @@ def _check_for_duplicate_replies_internal(draft: TweetDraft) -> dict[str, list[P
             continue
 
         matching_drafts = []
-        for draft_path in status_dir.glob("*.yml"):
+        for draft_path in _list_draft_files(status_dir):
             try:
                 other_draft = TweetDraft.load(draft_path)
                 if other_draft.in_reply_to == tweet_id:
@@ -734,6 +867,37 @@ def _check_for_duplicate_replies_internal(draft: TweetDraft) -> dict[str, list[P
             duplicates[status] = matching_drafts
 
     return duplicates
+
+
+def _find_live_duplicate_reply_ids(client, tweet_id: str) -> list[str]:
+    """Return recent live reply tweet IDs we already posted to ``tweet_id``.
+
+    This closes the gap where file-based draft history is missing (for example after
+    a branch checkout) but the reply already exists on Twitter.
+    """
+    try:
+        me = cached_get_me(client, user_auth=False)
+        username = getattr(getattr(me, "data", None), "username", None)
+        if not username:
+            return []
+
+        thread_context = get_conversation_thread(client, tweet_id)
+        tweet_id = str(tweet_id)
+        username = username.lower()
+
+        duplicate_ids = {
+            str(tweet["id"])
+            for tweet in thread_context
+            if str(tweet.get("replied_to_id")) == tweet_id
+            and str(tweet.get("author", "")).lower() == username
+        }
+        return sorted(duplicate_ids)
+    except Exception as e:
+        logger.warning(
+            "Live duplicate reply lookup failed",
+            extra={"tweet_id": str(tweet_id), "error": str(e)},
+        )
+        return []
 
 
 @cli.command()
@@ -1087,16 +1251,29 @@ def post(
 
             # Check for already posted duplicates
             duplicates = _check_for_duplicate_replies_internal(draft)
-            if "posted" in duplicates:
-                console.print(
-                    f"\n[red]⚠ WARNING: Already posted {len(duplicates['posted'])} reply(ies) to this tweet![/red]"
+            live_duplicate_ids = []
+            if "posted" not in duplicates:
+                live_duplicate_ids = _find_live_duplicate_reply_ids(
+                    client, str(draft.in_reply_to)
                 )
-                for dup_path in duplicates["posted"]:
-                    dup_draft = TweetDraft.load(dup_path)
-                    console.print(f"[red]  - Posted: {dup_draft.text[:80]}...[/red]")
+
+            if "posted" in duplicates or live_duplicate_ids:
                 console.print(
-                    "[red]This would be a duplicate reply. Consider rejecting instead.[/red]\n"
+                    "\n[red]⚠ WARNING: Already posted reply to this tweet![/red]"
                 )
+                if "posted" in duplicates:
+                    for dup_path in duplicates["posted"]:
+                        dup_draft = TweetDraft.load(dup_path)
+                        console.print(
+                            f"[red]  - Posted draft: {dup_draft.text[:80]}...[/red]"
+                        )
+                for live_tweet_id in live_duplicate_ids:
+                    console.print(
+                        f"[red]  - Live tweet on Twitter: {live_tweet_id}[/red]"
+                    )
+                console.print("[red]Skipping duplicate reply.[/red]\n")
+                move_draft(path, "rejected")
+                continue
 
         console.print(f"[white]{draft.text}")
 
@@ -1161,6 +1338,33 @@ def should_evaluate_tweet(tweet_text: str, min_length: int = 50) -> Tuple[bool, 
     return True, ""
 
 
+def is_reply_restricted(tweet, from_mentions: bool = False) -> bool:
+    """Return True if the tweet's author has restricted who can reply.
+
+    Twitter's reply_settings field can be one of:
+    - "everyone" (or None): anyone can reply
+    - "mentionedUsers": only mentioned users can reply
+    - "following": only accounts the author follows can reply
+    - "verified": only verified accounts can reply
+    - "subscribers": only paid subscribers can reply
+
+    Bob is rarely in any of the restricted categories for arbitrary timeline
+    accounts, so any non-"everyone" setting effectively blocks reply attempts
+    with a 403 from the API. Detect this upfront to avoid wasting LLM cycles
+    drafting replies that cannot be posted.
+
+    When from_mentions=True the tweet came from get_users_mentions, meaning Bob
+    was mentioned and is therefore in the allowed-replier set for "mentionedUsers"
+    tweets — those should NOT be skipped.
+    """
+    reply_settings = getattr(tweet, "reply_settings", None)
+    if reply_settings is None:
+        return False
+    if from_mentions and reply_settings == "mentionedUsers":
+        return False
+    return bool(reply_settings != "everyone")
+
+
 def process_timeline_tweets(
     tweets,
     users,
@@ -1170,6 +1374,7 @@ def process_timeline_tweets(
     dry_run: bool = False,
     max_drafts: int | None = None,
     max_auto_posts: int = 5,
+    from_mentions: bool = False,
 ) -> int:
     """Process tweets from timeline
 
@@ -1181,7 +1386,7 @@ def process_timeline_tweets(
     tweets_skipped_prefilter = 0
 
     # Count existing drafts in new/ directory
-    existing_drafts = len(list(NEW_DIR.glob("*.yml")))
+    existing_drafts = len(_list_draft_files(NEW_DIR))
     total_drafts = existing_drafts + drafts_generated
 
     # Check if we're already at or over the limit
@@ -1204,7 +1409,7 @@ def process_timeline_tweets(
         status_dir = TWEETS_DIR / status_dir_name
         if not status_dir.exists():
             continue
-        for draft_path in status_dir.glob("*.yml"):
+        for draft_path in _list_draft_files(status_dir):
             try:
                 other_draft = TweetDraft.load(draft_path)
                 if other_draft.in_reply_to is not None:
@@ -1245,6 +1450,21 @@ def process_timeline_tweets(
                     else str(tweet.author_id)
                 )
                 console.print(f"[dim]Skip: {skip_reason} - @{username_for_skip}[/dim]")
+                tweets_skipped_prefilter += 1
+                continue
+
+            # Skip tweets with restricted reply_settings — replying would 403
+            if is_reply_restricted(tweet, from_mentions=from_mentions):
+                author_for_skip = user_lookup.get(tweet.author_id)
+                username_for_skip = (
+                    author_for_skip.username
+                    if author_for_skip
+                    else str(tweet.author_id)
+                )
+                reply_setting = getattr(tweet, "reply_settings", "unknown")
+                console.print(
+                    f"[dim]Skip: reply_settings={reply_setting} - @{username_for_skip}[/dim]"
+                )
                 tweets_skipped_prefilter += 1
                 continue
 
@@ -1562,6 +1782,7 @@ def monitor(
                         "author_id",
                         "public_metrics",
                         "conversation_id",
+                        "reply_settings",
                     ],
                     expansions=["author_id"],
                     user_fields=["username", "public_metrics"],
@@ -1575,6 +1796,7 @@ def monitor(
                         "author_id",
                         "public_metrics",
                         "conversation_id",
+                        "reply_settings",
                     ],
                     expansions=["author_id"],
                     user_fields=["username", "public_metrics"],
@@ -1708,6 +1930,7 @@ def auto(
                     "author_id",
                     "public_metrics",
                     "conversation_id",
+                    "reply_settings",
                 ],
                 expansions=["author_id", "referenced_tweets.id"],
                 user_fields=["username", "public_metrics"],
@@ -1727,6 +1950,7 @@ def auto(
                     times=max_drafts - total_drafts_generated,
                     dry_run=dry_run,
                     max_drafts=max_drafts - total_drafts_generated,
+                    from_mentions=True,
                 )
 
                 # Update counters
@@ -1756,6 +1980,7 @@ def auto(
                         "author_id",
                         "public_metrics",
                         "conversation_id",
+                        "reply_settings",
                     ],
                     expansions=["author_id"],
                     user_fields=["username", "public_metrics"],
@@ -1769,6 +1994,7 @@ def auto(
                         "author_id",
                         "public_metrics",
                         "conversation_id",
+                        "reply_settings",
                     ],
                     expansions=["author_id"],
                     user_fields=["username", "public_metrics"],
@@ -1896,10 +2122,20 @@ def auto(
 
                     # Check for already posted duplicates
                     duplicates = _check_for_duplicate_replies_internal(draft)
-                    if "posted" in duplicates:
+                    live_duplicate_ids = []
+                    if "posted" not in duplicates:
+                        live_duplicate_ids = _find_live_duplicate_reply_ids(
+                            client, str(draft.in_reply_to)
+                        )
+
+                    if "posted" in duplicates or live_duplicate_ids:
                         console.print(
                             f"[red]⚠ Skipping duplicate reply to {draft.in_reply_to}[/red]"
                         )
+                        for live_tweet_id in live_duplicate_ids:
+                            console.print(
+                                f"[red]  - Live tweet on Twitter: {live_tweet_id}[/red]"
+                            )
                         move_draft(path, "rejected")
                         continue
 

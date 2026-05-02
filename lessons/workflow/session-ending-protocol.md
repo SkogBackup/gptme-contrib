@@ -1,6 +1,7 @@
 ---
 match:
-  keywords: ["session ending", "land the plane", "session complete", "finish session", "ending session"]
+  keywords: ["session complete"]
+  session_categories: [code, cross-repo, infrastructure, cleanup]
 status: active
 ---
 

@@ -2,11 +2,11 @@
 match:
   keywords:
   - close the loop
-  - reply to issue comment
-  - update the requestor
-  - silent work completion
-  - memory failure response
-  - completed action without response
+  - update the issue
+  - reply to the issue
+  - comment on the issue
+  - follow up on the request
+  session_categories: [triage, cross-repo]
 status: active
 ---
 

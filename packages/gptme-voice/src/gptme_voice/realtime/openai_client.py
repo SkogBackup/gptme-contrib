@@ -124,6 +124,9 @@ def _load_project_instructions(workspace: str | None = None) -> str:
         "SUBAGENT TOOL RULES:\n"
         "- Use the subagent tool ONLY for small, specific lookups: a single task status, "
         "a recent journal entry, a quick file check. One focused question per call.\n"
+        "- If you need a live lookup, you may say one short acknowledgement before "
+        "calling subagent (for example: 'One moment, checking that.'). After dispatch, "
+        "wait for the actual subagent result instead of narrating progress or guessing.\n"
         "- Do NOT dispatch broad investigation tasks (e.g. 'investigate the whole system', "
         "'run a full review') — these always time out and leave the call hanging.\n"
         "- NEVER use the subagent tool to run post-call analysis, summarise the session, "
@@ -146,6 +149,20 @@ def _load_project_instructions(workspace: str | None = None) -> str:
         "happened yet and you are not the one who starts it.\n"
         "- It is fine to acknowledge that follow-up will happen automatically after "
         "hangup if the user asks. Just do not take credit for dispatching it.\n\n"
+        "HANGUP TOOL RULES:\n"
+        "- The call only ends when you call the hangup tool. A spoken goodbye does NOT "
+        "end the call by itself — verbal-only goodbyes leave the line open and frustrate "
+        "the caller.\n"
+        "- Once the caller has clearly said goodbye OR asked you to end the call, call "
+        "the hangup tool immediately. Do not ask for confirmation ('Would you like me "
+        "to end the call?') — their goodbye is the confirmation.\n"
+        "- Do not say 'I'll end the call now', 'one moment while I end the call', or "
+        "similar without calling the hangup tool in the same turn. Saying it without "
+        "calling the tool is the failure mode.\n"
+        "- Say a brief farewell first if you want; then call the tool. The 5-second "
+        "farewell delay gives your goodbye time to play before the line drops.\n"
+        "- If you have already said goodbye verbally and the caller is still on the "
+        "line, that means you forgot to call the tool. Call it now.\n\n"
         "HANDOFF TO ANOTHER AGENT:\n"
         "- Use handoff_to_agent ONLY when the caller explicitly asks to speak with "
         "Alice, Gordon, or Sven, or when the topic is clearly outside your expertise "
@@ -219,6 +236,7 @@ class OpenAIRealtimeClient:
         on_ai_transcript: Callable[[str], None] | None = None,
         on_user_transcript: Callable[[str], None] | None = None,
         on_function_call: Callable[[str, dict], Any] | None = None,
+        hold_initial_response: bool = False,
     ):
         self.api_key = api_key or _get_openai_api_key()
         if not self.api_key:
@@ -247,6 +265,10 @@ class OpenAIRealtimeClient:
         self._pending_audio_dropped = 0
         self._event_notice: asyncio.Event | None = None
         self._initial_response_sent = False
+        # When True, the initial response is held back even after session.created.
+        # Set this on pre-warmed sessions; call activate_session() once the
+        # call-side WebSocket is ready to receive audio.
+        self._hold_initial_response = hold_initial_response
 
     def _get_ws_url(self) -> str:
         """WebSocket URL for this provider (override in subclasses)."""
@@ -304,8 +326,10 @@ class OpenAIRealtimeClient:
                         "Use it only for one small, focused workspace lookup or action: "
                         "check one task, inspect one file, run one quick command, or verify "
                         "one recent fact. Do not use it for broad investigations, full "
-                        "reviews, or post-call analysis. Describe one concrete request in "
-                        "natural language."
+                        "reviews, or post-call analysis. Say at most one brief "
+                        "acknowledgement before calling it, then wait for the real "
+                        "subagent result instead of answering early. Describe one "
+                        "concrete request in natural language."
                     ),
                     "parameters": {
                         "type": "object",
@@ -370,10 +394,15 @@ class OpenAIRealtimeClient:
                     "type": "function",
                     "name": "hangup",
                     "description": (
-                        "End the current voice call cleanly. Use this only when the caller "
-                        "has clearly said goodbye or explicitly asked to hang up. Do not use "
-                        "this to interrupt ongoing work or avoid a question. "
-                        "Say a brief farewell first; the call will terminate shortly after."
+                        "End the current voice call. This is the ONLY way the call ends — "
+                        "saying goodbye verbally does not hang up. Call this tool whenever "
+                        "the caller has said goodbye or explicitly asked to end the call. "
+                        "Do not ask for confirmation; the caller's goodbye is the "
+                        "confirmation. Do not announce 'I'll end the call now' without "
+                        "calling the tool in the same turn. Say a brief farewell first if "
+                        "you like — the call drops a few seconds after the tool fires so "
+                        "your goodbye still reaches the caller. Do not use this tool to "
+                        "interrupt ongoing work or avoid a question."
                     ),
                     "parameters": {
                         "type": "object",
@@ -462,6 +491,22 @@ class OpenAIRealtimeClient:
             },
         )
         await self._send_event("response.create", {})
+
+    @staticmethod
+    def _should_auto_respond_after_function_output(name: str, result: Any) -> bool:
+        """Decide whether a function-call result should trigger immediate speech.
+
+        Async subagent dispatch only returns a receipt. Auto-responding to that
+        receipt makes the model talk as if it already has the answer. The real
+        spoken answer should wait for the injected subagent result instead.
+        """
+        if (
+            name == "subagent"
+            and isinstance(result, dict)
+            and result.get("status") == "dispatched"
+        ):
+            return False
+        return True
 
     async def disconnect(
         self,
@@ -586,7 +631,11 @@ class OpenAIRealtimeClient:
     async def _send_initial_response_if_needed(self) -> None:
         """Trigger a one-shot startup response once the provider session is ready."""
         instructions = self.session_config.initial_response_instructions.strip()
-        if self._initial_response_sent or not instructions:
+        if (
+            self._initial_response_sent
+            or not instructions
+            or self._hold_initial_response
+        ):
             return
 
         self._initial_response_sent = True
@@ -599,6 +648,16 @@ class OpenAIRealtimeClient:
                 }
             },
         )
+
+    async def activate_session(self) -> None:
+        """Release the held initial response on a pre-warmed session.
+
+        Call this after attaching audio/transcript callbacks to a pre-warmed
+        client so the greeting fires once the call-side WebSocket is ready.
+        """
+        self._hold_initial_response = False
+        if self._session_ready is not None and self._session_ready.is_set():
+            await self._send_initial_response_if_needed()
 
     async def _flush_pending_audio(self) -> None:
         """Send any audio that was buffered before the session was ready."""
@@ -742,8 +801,10 @@ class OpenAIRealtimeClient:
                         }
                     },
                 )
-                # Trigger a new response after function output
-                await self._send_event("response.create", {})
+                if self._should_auto_respond_after_function_output(name, result):
+                    # Trigger a new response after function output when the
+                    # tool returned an answer the caller should hear now.
+                    await self._send_event("response.create", {})
 
         # Errors
         elif event_type == "error":
