@@ -1,4 +1,5 @@
 ---
+description: "When uncertain whether an action requires human approval, apply the reversibility and blast-radius tests before proceeding"
 match:
   keywords:
   - "should I ask the user or proceed autonomously"
@@ -7,6 +8,7 @@ match:
   - "risky action requiring approval"
   - "irreversible change decision point"
 status: active
+target_grade: harm
 ---
 
 # Escalation vs Autonomy Decision Framework

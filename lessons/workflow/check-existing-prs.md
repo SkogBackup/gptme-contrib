@@ -1,11 +1,10 @@
 ---
+description: "Before opening a new PR, check for existing open PRs on the same branch or topic to avoid duplicates"
 match:
   keywords:
-  - gh pr create
-  - git checkout -b fix-
-  - gh pr list --search
+  - gh api graphql
   session_categories: [cross-repo, code, triage]
-status: active
+status: archived
 ---
 
 # Check for Existing PRs Before Creating
@@ -29,6 +28,24 @@ Check before creating:
 # Search by issue number and topic
 gh pr list --state open --search "605 in:body"
 gh pr list --state open --search "mcp config"
+
+# Also check GitHub's issue -> closing PR metadata
+gh api graphql \
+  -f owner=OWNER \
+  -f repo=REPO \
+  -F issue=605 \
+  -f query='query($owner:String!, $repo:String!, $issue:Int!) {
+    repository(owner:$owner, name:$repo) {
+      issue(number:$issue) {
+        closedByPullRequestsReferences(first:10) {
+          nodes { number title url state }
+        }
+      }
+    }
+  }' \
+  --jq '.data.repository.issue.closedByPullRequestsReferences.nodes[]'
+
+# Do not use /issues/605 --jq '.pull_request'; that only says whether 605 is itself a PR.
 
 # If found: Review and coordinate
 # If not found: Proceed with new PR

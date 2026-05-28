@@ -9,7 +9,9 @@ match:
     - "won't forget"
     - "for next time"
     - "should write this down"
+  session_categories: [research, cleanup, code, infrastructure, strategic, knowledge]
 status: active
+description: "When you say you have noted or learned something, immediately persist it to a core file before continuing."
 ---
 
 # Persist Before Noting

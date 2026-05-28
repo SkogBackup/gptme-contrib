@@ -4,12 +4,8 @@ match:
     - "doesn't have a flag for"
     - "wrap the command to add"
     - "before patching the wrapper"
-    - "no built-in option for"
-    - "let me read the source to figure out"
-    - "doesn't seem to support"
-    - "build a wrapper around"
-    - "monkey-patch the CLI"
 status: active
+description: "Before examining source code or making assumptions about a CLI tool's capabilities, run the command with --help to discover available options, subcommands, and flags that can simplify your approach."
 ---
 
 # Check CLI --help Before Reading Source Code

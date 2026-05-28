@@ -1,9 +1,8 @@
 ---
+description: "Follow a structured 4-phase approach (status check, task selection, execution, commit) for autonomous sessions to maximise productivity and proper task management"
 match:
   keywords:
   - "autonomous session"
-  - "task selection"
-  - "work queue"
   session_categories: [strategic, self-review]
 status: active
 ---

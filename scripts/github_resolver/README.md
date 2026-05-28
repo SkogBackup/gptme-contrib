@@ -12,6 +12,30 @@ This is distinct from the warning-only issue-hygiene Action: hygiene never
 touches code, resolver is authorised to make edits but deliberately never
 auto-merges.
 
+## Using in your own repo (reusable workflow)
+
+Call the workflow from any repo without copying any scripts:
+
+```yaml
+# .github/workflows/issue-resolver.yml in your repo
+name: Issue Resolver
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  resolve:
+    uses: gptme/gptme-contrib/.github/workflows/issue-resolver.yml@master
+    secrets:
+      gptme-provider-key: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+The reusable workflow fetches its own resolver scripts from gptme-contrib at
+runtime (into `$RUNNER_TEMP`, outside your workspace), so your repo stays
+clean.
+
 ## Design invariants (Phase 1)
 
 - **Opt-in only.** The workflow's `if:` gate only fires on an explicit
@@ -26,6 +50,12 @@ auto-merges.
   comment.
 - **Observable.** The gptme stdout log + final status JSON are uploaded as a
   workflow artifact (`gptme-resolver-output`, 30-day retention).
+- **Branch-safe execution.** The agent run gets a restricted tool set
+  (`read,save,patch,shell`), a shimmed `git`/`gh`, and no GitHub credentials;
+  only the orchestrator is allowed to push branches, open PRs, or comment.
+- **Fail-closed git invariant.** If the agent still changes HEAD or switches
+  branches directly, the orchestrator treats that as an error and preserves the
+  result on the attempt branch instead of trusting the run as a clean success.
 
 ## How trusted users invoke it
 

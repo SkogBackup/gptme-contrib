@@ -1,4 +1,5 @@
 ---
+description: "Gate autonomous sessions on rule checks (claim verification, scope discipline) before executing significant work"
 status: active
 category: autonomous
 tags:
@@ -9,13 +10,6 @@ tags:
 - orchestration
 match:
   keywords:
-  - inference cost
-  - monitoring sessions
-  - session gating
-  - no-op sessions
-  - skip session
-  - session orchestration
-  - routine monitoring
   - cost optimization
 ---
 

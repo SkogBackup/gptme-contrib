@@ -12,7 +12,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import websockets  # type: ignore
 from gptme.config import get_config, get_project_config
@@ -39,6 +39,11 @@ _MAX_INSTRUCTIONS_LEN = 4096
 # than enough for any realistic session-handshake delay while still capping
 # memory growth if the provider never confirms the session.
 _MAX_PENDING_AUDIO_CHUNKS = 500
+# OpenAI's model catalog currently markets `gpt-realtime-2`, while the
+# Realtime API reference may still enumerate the older generic alias instead.
+# Keep the newer default, but retry once with the generic alias if the
+# websocket handshake rejects the newer name.
+_OPENAI_MODEL_FALLBACKS = {"gpt-realtime-2": "gpt-realtime"}
 # Event types that carry transcript text — only these reset the drain idle timer.
 _TRANSCRIPT_EVENT_TYPES = frozenset(
     {
@@ -125,8 +130,13 @@ def _load_project_instructions(workspace: str | None = None) -> str:
         "- Use the subagent tool ONLY for small, specific lookups: a single task status, "
         "a recent journal entry, a quick file check. One focused question per call.\n"
         "- If you need a live lookup, you may say one short acknowledgement before "
-        "calling subagent (for example: 'One moment, checking that.'). After dispatch, "
-        "wait for the actual subagent result instead of narrating progress or guessing.\n"
+        "calling subagent (for example: 'One moment, checking that.'). That "
+        "acknowledgement is only allowed when you call the subagent tool in the same "
+        "turn. After dispatch, wait for the actual subagent result instead of "
+        "narrating progress or guessing.\n"
+        "- Do NOT say you are checking, looking it up, or using the subagent unless "
+        "you call the subagent tool in the same turn. If you are not calling the tool, "
+        "answer from current context or say you cannot verify it live yet.\n"
         "- Do NOT dispatch broad investigation tasks (e.g. 'investigate the whole system', "
         "'run a full review') — these always time out and leave the call hanging.\n"
         "- NEVER use the subagent tool to run post-call analysis, summarise the session, "
@@ -197,8 +207,10 @@ def _load_project_instructions(workspace: str | None = None) -> str:
 class SessionConfig:
     """Configuration for OpenAI Realtime API session."""
 
-    model: str = "gpt-4o-realtime-preview-2024-12-17"
+    model: str = "gpt-realtime-2"
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
     voice: str = "echo"
+    output_speed: float | None = None
     instructions: str = ""
     initial_response_instructions: str = ""
     input_format: str = "pcm16"
@@ -212,6 +224,18 @@ class SessionConfig:
     available_agents: list[str] = field(
         default_factory=lambda: ["alice", "gordon", "sven"]
     )
+    # When True, configure the OpenAI session to send/receive G.711 μ-law at
+    # 8kHz directly. The Twilio bridge uses this to skip an otherwise-required
+    # PCM16 ↔ μ-law and 8k ↔ 24k resampling round on the OpenAI branch.
+    # Has no effect on the xAI/Grok client (Grok requires PCM).
+    g711_passthrough: bool = False
+
+    def __post_init__(self) -> None:
+        if self.g711_passthrough:
+            self.input_format = "g711_ulaw"
+            self.output_format = "g711_ulaw"
+            self.input_sample_rate = 8000
+            self.output_sample_rate = 8000
 
 
 class OpenAIRealtimeClient:
@@ -276,14 +300,43 @@ class OpenAIRealtimeClient:
 
     def _get_ws_headers(self) -> dict[str, str]:
         """Auth headers for this provider (override in subclasses)."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1",
-        }
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     def _get_transcription_config(self) -> dict | None:
         """Transcription config for session.update (override to None to omit)."""
         return {"model": "whisper-1"}
+
+    def _get_reasoning_config(self) -> dict[str, str] | None:
+        """Reasoning config for session.update (override to omit or customize)."""
+        effort = self.session_config.reasoning_effort
+        if effort is None:
+            return None
+        return {"effort": effort}
+
+    def _handshake_fallback_model(self, exc: websockets.InvalidStatus) -> str | None:
+        """Return a one-shot fallback model for known alias drift.
+
+        OpenAI may reject `gpt-realtime-2` at the websocket URL while still
+        accepting the older `gpt-realtime` alias. Only retry on 400/404-style
+        handshake failures that look model-related, and only for the known
+        generic alias pair.
+        """
+        current_model = self.session_config.model
+        fallback_model = _OPENAI_MODEL_FALLBACKS.get(current_model)
+        if fallback_model is None:
+            return None
+
+        status_code = exc.response.status_code
+        if status_code not in {400, 404}:
+            return None
+
+        body = exc.response.body.decode("utf-8", errors="ignore").lower()
+        if not body or not any(
+            token in body for token in ("model", current_model.lower(), "realtime")
+        ):
+            return None
+
+        return fallback_model
 
     async def connect(self) -> None:
         """Connect to OpenAI Realtime API."""
@@ -297,7 +350,24 @@ class OpenAIRealtimeClient:
 
         url = self._get_ws_url()
         headers = self._get_ws_headers()
-        self._ws = await websockets.connect(url, additional_headers=headers)
+        try:
+            self._ws = await websockets.connect(url, additional_headers=headers)
+        except websockets.InvalidStatus as exc:
+            fallback_model = self._handshake_fallback_model(exc)
+            if fallback_model is None:
+                raise
+
+            logger.warning(
+                "OpenAI Realtime rejected model %s during websocket handshake "
+                "(%s %s). Retrying once with %s.",
+                self.session_config.model,
+                exc.response.status_code,
+                exc.response.reason_phrase,
+                fallback_model,
+            )
+            self.session_config.model = fallback_model
+            url = self._get_ws_url()
+            self._ws = await websockets.connect(url, additional_headers=headers)
 
         instructions = self.session_config.instructions or _DEFAULT_INSTRUCTIONS
         logger.info(
@@ -328,8 +398,9 @@ class OpenAIRealtimeClient:
                         "one recent fact. Do not use it for broad investigations, full "
                         "reviews, or post-call analysis. Say at most one brief "
                         "acknowledgement before calling it, then wait for the real "
-                        "subagent result instead of answering early. Describe one "
-                        "concrete request in natural language."
+                        "subagent result instead of answering early. Never narrate "
+                        "or promise a lookup without actually emitting the tool "
+                        "call. Describe one concrete request in natural language."
                     ),
                     "parameters": {
                         "type": "object",
@@ -340,12 +411,13 @@ class OpenAIRealtimeClient:
                             },
                             "mode": {
                                 "type": "string",
-                                "enum": ["smart", "fast"],
+                                "enum": ["fast", "smart"],
                                 "description": (
-                                    "Response urgency. 'fast' uses a smaller model for speed — "
-                                    "prefer this for simple lookups. 'smart' (default) uses a "
-                                    "larger model when accuracy matters. Both are for small, "
-                                    "focused lookups only — never for broad investigations."
+                                    "Response urgency. 'fast' (default) uses a smaller model for speed — "
+                                    "prefer this for most live-call lookups. 'smart' uses a "
+                                    "larger model when accuracy matters more than latency. "
+                                    "Both are for small, focused lookups only — never for broad "
+                                    "investigations."
                                 ),
                             },
                         },
@@ -461,6 +533,11 @@ class OpenAIRealtimeClient:
                 },
             ],
         }
+        if self.session_config.output_speed is not None:
+            session_params["output"] = {"speed": self.session_config.output_speed}
+        reasoning = self._get_reasoning_config()
+        if reasoning is not None:
+            session_params["reasoning"] = reasoning
         transcription = self._get_transcription_config()
         if transcription is not None:
             session_params["input_audio_transcription"] = transcription

@@ -23,6 +23,9 @@ HARM_CATEGORY_TAXONOMY: dict[str, str] = {
 }
 HARM_CATEGORY_LABELS: list[str] = list(HARM_CATEGORY_TAXONOMY.keys())
 
+# Valid values for the dropout_depth field.
+DROPOUT_DEPTH_VALUES: frozenset[str] = frozenset(["shallow", "deep"])
+
 # Normalize model names to short canonical forms
 MODEL_ALIASES: dict[str, str] = {
     # Anthropic Claude models (bare) — dash and dot variants
@@ -177,7 +180,9 @@ class SessionRecord:
 
     # Identity
     session_id: str = ""
-    timestamp: str = ""  # ISO 8601
+    timestamp: str = ""  # ISO 8601 — record-creation time
+    start_time: str | None = None  # ISO 8601 — session start (populated by post_session)
+    end_time: str | None = None  # ISO 8601 — session end (populated by post_session)
     session_name: str | None = None  # human-readable name (e.g. "dancing-blue-fish")
     project: str | None = None  # workspace/project path
 
@@ -194,6 +199,7 @@ class SessionRecord:
     category: str | None = None  # inferred from commits/files (what actually happened)
     recommended_category: str | None = None  # from Thompson sampling / CASCADE (what was intended)
     selector_mode: str | None = None  # e.g. scored, llm-context
+    cascade_intent: dict[str, Any] | None = None  # structured CASCADE reasons + constraints dict
 
     # Outcome
     outcome: str = "unknown"  # productive, noop, failed
@@ -204,9 +210,19 @@ class SessionRecord:
     output_tokens: int | None = None
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
+    sys_prompt_tokens: int | None = None
+    context_peak_tokens: int | None = None
+    context_window: int | None = None
+
+    # Byte-level context metrics (model-independent; #738)
+    sys_prompt_bytes: int | None = None  # system messages before first user msg
+    first_turn_bytes: int | None = None  # all messages before first assistant msg
+    context_peak_bytes: int | None = None  # max per-turn context bytes before assistant
+    session_total_bytes: int | None = None  # total bytes of all message content
 
     # Artifacts
     deliverables: list[str] = field(default_factory=list)  # commit SHAs, PR URLs
+    deliverable_details: list[dict[str, Any]] = field(default_factory=list)
     trajectory_path: str | None = None  # path to trajectory JSONL file (for deduplication)
     journal_path: str | None = None  # path to human-written journal entry
 
@@ -226,6 +242,14 @@ class SessionRecord:
     # --classify-harm-category classifier in compute-harm-signal.py.
     # One of HARM_CATEGORY_LABELS, or None when not classified.
     harm_category: str | None = None
+
+    # Random dropout sampling (ErikBjare/bob#793)
+    # Flag set by the autonomous-run.sh reconcile pass when the session is
+    # drawn for deeper post-hoc review. Dropout sessions get a richer secondary
+    # analysis beyond the standard LLM judge run.
+    dropout_selected: bool | None = None
+    dropout_reason: str | None = None  # "random_sampling" for selected sessions; None otherwise
+    dropout_depth: str | None = None  # "shallow" (standard judge) or "deep" (extra analysis)
 
     # Per-tool-call span aggregates (Phase 3 of span-level tracing, idea #158).
     # Dict shape mirrors SpanAggregates fields (total_spans, error_spans,
@@ -255,6 +279,8 @@ class SessionRecord:
         # Guard against JSON null for integer field
         if self.duration_seconds is None:
             self.duration_seconds = 0
+        if self.deliverable_details is None:
+            self.deliverable_details = []
         if self.grades is None:
             self.grades = {}
         if self.grade_reasons is None:
@@ -266,6 +292,15 @@ class SessionRecord:
         # so downstream --by-category consumers never see unexpected keys.
         if self.harm_category is not None and self.harm_category not in HARM_CATEGORY_LABELS:
             self.harm_category = None
+        # Discard unrecognized dropout_depth values so typos don't silently reach consumers.
+        if self.dropout_depth is not None and self.dropout_depth not in DROPOUT_DEPTH_VALUES:
+            self.dropout_depth = None
+        # Cross-field consistency: when explicitly not selected (False), the detail fields
+        # have no meaning — clear them to prevent downstream consumers from reading an
+        # inconsistent combination (e.g. dropout_selected=False, dropout_depth="deep").
+        if self.dropout_selected is False:
+            self.dropout_reason = None
+            self.dropout_depth = None
 
     def set_productivity_grade(self, score: float) -> None:
         """Store the productivity dimension alongside the legacy scalar field."""
@@ -330,7 +365,8 @@ class SessionRecord:
 
         Chooses the extractor based on ``harness_hint`` (or ``self.harness``
         when not given): ``"claude-code"`` → CC JSONL, ``"gptme"`` → gptme
-        JSONL. Stores ``SpanAggregates.from_spans(...)`` serialized as a dict
+        JSONL, ``"codex"`` → codex rollout JSONL. Stores
+        ``SpanAggregates.from_spans(...)`` serialized as a dict
         on ``self.span_aggregates`` (including the computed ``error_rate``).
 
         Returns ``True`` when aggregates were populated, ``False`` when the
@@ -342,6 +378,7 @@ class SessionRecord:
         from gptme_sessions.spans import (
             SpanAggregates,
             extract_spans_from_cc_jsonl,
+            extract_spans_from_codex_jsonl,
             extract_spans_from_gptme_jsonl,
         )
 
@@ -356,6 +393,8 @@ class SessionRecord:
             spans = extract_spans_from_cc_jsonl(traj, session_id=self.session_id)
         elif harness == "gptme":
             spans = extract_spans_from_gptme_jsonl(traj, session_id=self.session_id)
+        elif harness == "codex":
+            spans = extract_spans_from_codex_jsonl(traj, session_id=self.session_id)
         else:
             return False
 
@@ -423,6 +462,14 @@ class SessionRecord:
             and not filtered["journal_path"].endswith(".md")
         ):
             filtered["trajectory_path"] = filtered.pop("journal_path")
+        # Migrate legacy records: dropout_selection (bool, added in #963) was
+        # replaced by dropout_selected/dropout_reason/dropout_depth in #965.
+        # Forward the flag so records written between the two deploys aren't silently lost.
+        if "dropout_selection" in legacy and "dropout_selected" not in filtered:
+            if legacy["dropout_selection"]:
+                filtered["dropout_selected"] = True
+                filtered["dropout_reason"] = "random_sampling"
+            del legacy["dropout_selection"]
         if legacy:
             filtered["_legacy_fields"] = legacy
         return cls(**filtered)

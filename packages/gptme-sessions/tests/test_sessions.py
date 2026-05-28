@@ -1475,6 +1475,36 @@ def test_grade_signals_noop():
     assert grade_signals(sigs) == 0.25
 
 
+def test_grade_signals_monitoring_no_work_with_errors():
+    """Monitoring sessions that correctly find no work get neutral 0.35
+    even when they have minor errors (e.g. gh CLI returning non-zero
+    for 'no results'). Without this, low-error monitoring scans get
+    penalized at 0.25 or 0.15, suppressing the monitoring category in
+    Thompson sampling."""
+    sigs = {
+        "git_commits": [],
+        "file_writes": [],
+        "error_count": 2,
+        "retry_count": 0,
+        "tool_calls": {"Bash": 8},
+    }
+    # Without category hint: regular floor 0.25, minus error-rate penalty
+    # error_rate = 2/8 = 0.25 > 0.15 → -0.10 → 0.25 - 0.10 = 0.15
+    assert grade_signals(sigs) == pytest.approx(0.15)
+    # With monitoring category: neutral 0.35 floor, same error penalty
+    # 0.35 - 0.10 = 0.25 — improved from 0.15 without the fix
+    assert grade_signals(sigs, category="pm-react") == pytest.approx(0.25)
+    # For monitoring with very low errors (<5%): full neutral 0.35
+    sigs_low_err = {
+        "git_commits": [],
+        "file_writes": [],
+        "error_count": 0,
+        "retry_count": 0,
+        "tool_calls": {"Bash": 8},
+    }
+    assert grade_signals(sigs_low_err, category="pm-react") == pytest.approx(0.35)
+
+
 def test_grade_signals_productive():
     """Grade is higher when commits are present."""
     msgs = _make_cc_msgs(commits=2)
@@ -1629,6 +1659,8 @@ def test_extract_usage_cc_basic():
     assert usage["cache_read_tokens"] == 500
     assert usage["total_tokens"] == 880
     assert usage["model"] == "claude-sonnet-4-6"
+    assert usage["sys_prompt_tokens"] == 300
+    assert usage["context_peak_tokens"] == 510
 
 
 def test_extract_usage_cc_empty():
@@ -1669,6 +1701,8 @@ def test_extract_usage_cc_no_usage_field():
     assert usage["input_tokens"] == 5
     assert usage["output_tokens"] == 3
     assert usage["total_tokens"] == 8
+    assert usage["sys_prompt_tokens"] == 5
+    assert usage["context_peak_tokens"] == 5
 
 
 def test_detect_format_cc_with_preamble():
@@ -2386,6 +2420,8 @@ def test_extract_usage_gptme_metadata():
     assert usage["total_tokens"] == 380
     assert abs(usage["cost"] - 0.008) < 1e-9
     assert usage["model"] == "anthropic/claude-sonnet-4-6"
+    assert usage["sys_prompt_tokens"] == 100
+    assert usage["context_peak_tokens"] == 200
 
 
 def test_extract_usage_gptme_empty():
@@ -2394,7 +2430,7 @@ def test_extract_usage_gptme_empty():
 
 
 def test_extract_usage_gptme_no_metadata():
-    """Messages without metadata are skipped."""
+    """Messages without metadata still return byte metrics (token-less gptme sessions)."""
     msgs = [
         {
             "role": "assistant",
@@ -2402,7 +2438,149 @@ def test_extract_usage_gptme_no_metadata():
             # no metadata field
         }
     ]
-    assert extract_usage_gptme(msgs) == {}
+    result = extract_usage_gptme(msgs)
+    # Byte metrics are returned even without token metadata (the primary gptme use case)
+    assert result["session_total_bytes"] == len("test".encode())
+    assert result["total_tokens"] == 0
+    assert result["cost"] == 0.0
+
+
+def test_extract_usage_gptme_truly_empty():
+    """Truly empty message list (no content, no tokens) returns {}."""
+    assert extract_usage_gptme([]) == {}
+
+
+def test_extract_usage_gptme_byte_metrics_without_token_data():
+    """Byte metrics are returned for token-less gptme sessions (the primary target use case).
+
+    Regression test for Greptile finding on PR #846: the early-return guard
+    `if total_tokens == 0 and cost == 0.0: return {}` must not discard byte
+    metrics for gptme sessions that have no token metadata.
+    """
+    sys_content = "You are a helpful assistant."
+    user_content = "Hello, world!"
+    asst_content = "Hi there!"
+    msgs = [
+        {"role": "system", "content": sys_content},
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": asst_content},  # no metadata → no tokens
+    ]
+    result = extract_usage_gptme(msgs)
+    assert result, "Should return non-empty dict even with no token metadata"
+    # sys_prompt_bytes: bytes before first user turn (system message only)
+    assert result["sys_prompt_bytes"] == len(sys_content.encode())
+    # first_turn_bytes: bytes before first assistant (system + user, not including assistant)
+    assert result["first_turn_bytes"] == len(sys_content.encode()) + len(user_content.encode())
+    # session_total_bytes: all messages
+    assert result["session_total_bytes"] == (
+        len(sys_content.encode()) + len(user_content.encode()) + len(asst_content.encode())
+    )
+    # context_peak_bytes: bytes before first (and only) assistant turn
+    assert result["context_peak_bytes"] == len(sys_content.encode()) + len(user_content.encode())
+    # Token fields are zero since no metadata
+    assert result["total_tokens"] == 0
+    assert result["cost"] == 0.0
+
+
+def test_extract_usage_gptme_sys_prompt_bytes_from_system_role():
+    """Regression: system-role messages must be counted in sys_prompt_bytes.
+
+    Bug: the original condition `role != 'system'` skipped actual system messages,
+    so sys_prompt_bytes was always 0 for the system prompt.
+    """
+    sys_text = "You are a helpful assistant."
+    msgs = [
+        {"role": "system", "content": sys_text},
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"},
+    ]
+    result = extract_usage_gptme(msgs)
+    assert result["sys_prompt_bytes"] == len(sys_text.encode())
+
+
+def test_extract_usage_gptme_first_turn_bytes_excludes_assistant():
+    """Regression: first_turn_bytes must NOT include the first assistant message.
+
+    Bug: bytes were added before checking role=='assistant', so the first
+    assistant message was included in first_turn_bytes.
+    """
+    user_text = "Hello"
+    assistant_text = "Hi there, how can I help?"
+    msgs = [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": assistant_text},
+        {"role": "user", "content": "Another question"},
+    ]
+    result = extract_usage_gptme(msgs)
+    # first_turn_bytes = only the user message before first assistant reply
+    assert result["first_turn_bytes"] == len(user_text.encode())
+    assert result["session_total_bytes"] == len(
+        (user_text + assistant_text + "Another question").encode()
+    )
+
+
+def test_extract_usage_gptme_token_less_returns_bytes():
+    """Regression: token-less gptme sessions must not be silently dropped.
+
+    Bug: `if total_tokens == 0 and cost == 0.0: return {}` fired before
+    byte fields were included, discarding all byte data for gptme sessions
+    that have no token metadata — exactly the population this feature targets.
+    """
+    msgs = [
+        {"role": "system", "content": "System prompt here"},
+        {"role": "user", "content": "Query"},
+        {"role": "assistant", "content": "Response without token metadata"},
+    ]
+    result = extract_usage_gptme(msgs)
+    assert result != {}, "token-less gptme sessions must return byte metrics"
+    assert result["session_total_bytes"] is not None
+    assert result["sys_prompt_bytes"] == len("System prompt here".encode())
+    assert result["total_tokens"] == 0
+
+
+def test_extract_usage_gptme_metadata_no_token_data():
+    """Metadata present but without token data should not lock sys_prompt_tokens at 0.
+
+    Regression test for Greptile finding on PR #845: the gptme extractor must not
+    set sys_prompt_tokens unconditionally on the first metadata-bearing turn when
+    no real token data is present. A later turn with actual data should still be
+    captured as sys_prompt.
+    """
+    msgs = [
+        {
+            "role": "user",
+            "content": "Hello",
+        },
+        {
+            "role": "assistant",
+            "content": "First response",
+            "metadata": {"model": "test-model"},
+            # metadata without any token fields
+        },
+        {
+            "role": "user",
+            "content": "Do something",
+        },
+        {
+            "role": "assistant",
+            "content": "Second response",
+            "metadata": {
+                "model": "test-model",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cost": 0.002,
+            },
+        },
+    ]
+    usage = extract_usage_gptme(msgs)
+    assert usage, "Should return non-empty dict when token data exists"
+    assert usage["sys_prompt_tokens"] == 100, (
+        "sys_prompt_tokens should be the first turn WITH real token data, "
+        "not the first metadata-bearing turn"
+    )
+    assert usage["context_peak_tokens"] == 100
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 50
 
 
 def test_extract_usage_gptme_non_assistant_ignored():
@@ -2497,6 +2675,8 @@ def test_extract_from_path_gptme_includes_usage(tmp_path: Path):
     assert result["usage"]["input_tokens"] == 500
     assert result["usage"]["output_tokens"] == 100
     assert result["usage"]["model"] == "anthropic/claude-sonnet-4-6"
+    assert result["usage"]["sys_prompt_tokens"] == 500
+    assert result["usage"]["context_peak_tokens"] == 500
 
 
 def test_extract_usage_gptme_cache_tokens():
@@ -2812,6 +2992,8 @@ def test_post_session_token_count_from_trajectory(tmp_path: Path):
     )
     assert result.token_count == 1800  # 1000+500+200+100
     assert result.record.token_count == 1800
+    assert result.record.sys_prompt_tokens == 1300
+    assert result.record.context_peak_tokens == 1300
 
 
 def test_post_session_missing_trajectory(tmp_path: Path):
@@ -3000,6 +3182,20 @@ def test_post_session_deliverables_from_trajectory(tmp_path: Path):
     )
     assert "/tmp/foo.py" in result.record.deliverables
     assert "/tmp/bar.py" in result.record.deliverables
+    assert result.record.deliverable_details == [
+        {
+            "value": "/tmp/foo.py",
+            "kind": "file",
+            "provenance_class": "tool_authored",
+            "evidence": {"source": "trajectory", "tool_name": "Write"},
+        },
+        {
+            "value": "/tmp/bar.py",
+            "kind": "file",
+            "provenance_class": "tool_authored",
+            "evidence": {"source": "trajectory", "tool_name": "Edit"},
+        },
+    ]
 
 
 def test_post_session_metadata_fields(tmp_path: Path):
@@ -3039,12 +3235,12 @@ def test_post_session_warns_on_duplicate_journal_path(tmp_path: Path, caplog):
     assert "first" in caplog.text
 
 
-def test_post_session_noop_overridden_by_deliverables(tmp_path: Path):
-    """Trajectory says noop but explicit deliverables exist → productive.
+def test_post_session_traj_noop_drops_unvalidated_deliverables(tmp_path: Path):
+    """Trajectory-authoritative noop drops caller commits absent from trajectory.
 
-    Regression test: trajectory signal extraction may miss commits that the
-    caller detected via git diff.  If deliverables are provided, the session
-    produced real work regardless of trajectory analysis.
+    Regression test: git-range deliverables can include commits from concurrent
+    sessions on the same branch. When trajectory extraction says noop and found
+    no deliverables of its own, caller-supplied SHAs must not override that.
     """
     import json as _json
 
@@ -3092,10 +3288,10 @@ def test_post_session_noop_overridden_by_deliverables(tmp_path: Path):
         trajectory_path=traj,
         deliverables=["abc123", "def456"],
     )
-    # Should be productive because deliverables exist, even though trajectory
-    # had no commits/writes
-    assert result.record.outcome == "productive"
-    assert result.record.deliverables == ["abc123", "def456"]
+    # Trajectory is authoritative here: noop + no trajectory deliverables means
+    # caller SHAs are treated as concurrent-session contamination.
+    assert result.record.outcome == "noop"
+    assert result.record.deliverables == []
 
 
 def test_post_session_single_file_write_stays_noop(tmp_path: Path):
@@ -3641,7 +3837,7 @@ def test_extract_signals_codex_commit_in_long_output():
 
 
 def test_extract_usage_codex():
-    """Extract model and rate-limit info from Codex trajectory."""
+    """Extract model, token, and rate-limit info from Codex trajectory."""
     msgs = [
         {
             "type": "turn_context",
@@ -3651,6 +3847,19 @@ def test_extract_usage_codex():
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 12000,
+                        "output_tokens": 100,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 12000,
+                        "cached_input_tokens": 9000,
+                        "output_tokens": 100,
+                        "total_tokens": 12100,
+                    },
+                    "model_context_window": 200000,
+                },
                 "rate_limits": {
                     "limit_id": "codex",
                     "primary": {"used_percent": 8.0, "window_minutes": 300},
@@ -3663,12 +3872,51 @@ def test_extract_usage_codex():
     assert usage["model"] == "gpt-5.3-codex"
     assert usage["rate_limit_primary_pct"] == 8.0
     assert usage["rate_limit_secondary_pct"] == 2.0
+    assert usage["sys_prompt_tokens"] == 12000
+    assert usage["context_peak_tokens"] == 12000
+    assert usage["context_window"] == 200000
+    assert usage["input_tokens"] == 12000
+    assert usage["cached_input_tokens"] == 9000
+    assert usage["output_tokens"] == 100
+    assert usage["total_tokens"] == 12100
 
 
 def test_extract_usage_codex_empty():
     """Empty dict when no model/usage data."""
     assert extract_usage_codex([]) == {}
     assert extract_usage_codex([{"type": "session_meta", "payload": {}}]) == {}
+
+
+def test_extract_usage_codex_without_model_omits_model_key():
+    """Usage-only Codex records should not emit a ``model: None`` placeholder."""
+    msgs = [
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 4000,
+                        "output_tokens": 50,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 4000,
+                        "output_tokens": 50,
+                        "total_tokens": 4050,
+                    },
+                },
+            },
+        }
+    ]
+
+    usage = extract_usage_codex(msgs)
+
+    assert "model" not in usage
+    assert usage["sys_prompt_tokens"] == 4000
+    assert usage["context_peak_tokens"] == 4000
+    assert usage["input_tokens"] == 4000
+    assert usage["output_tokens"] == 50
+    assert usage["total_tokens"] == 4050
 
 
 # ============================================================
@@ -3969,7 +4217,9 @@ def test_extract_from_path_copilot(tmp_path: Path):
     assert result["format"] == "copilot"
     assert result["tool_calls"]["bash"] == 1
     # Model extracted from session.start.selectedModel
-    assert result["usage"] == {"model": "claude-opus-4.6"}
+    assert result["usage"]["model"] == "claude-opus-4.6"
+    assert "sys_prompt_bytes" not in result["usage"]
+    assert "first_turn_bytes" not in result["usage"]
 
 
 def test_extract_usage_copilot_model_change():
@@ -3994,7 +4244,7 @@ def test_extract_usage_copilot_model_change():
         },
     ]
     usage = extract_usage_copilot(msgs)
-    assert usage == {"model": "claude-sonnet-4.6"}
+    assert usage["model"] == "claude-sonnet-4.6"
 
 
 def test_extract_usage_copilot_session_start_selected_model():
@@ -4016,11 +4266,11 @@ def test_extract_usage_copilot_session_start_selected_model():
         },
     ]
     usage = extract_usage_copilot(msgs)
-    assert usage == {"model": "claude-opus-4.6"}
+    assert usage["model"] == "claude-opus-4.6"
 
 
 def test_extract_usage_copilot_no_model():
-    """extract_usage_copilot returns empty dict when no model info available."""
+    """extract_usage_copilot can still return byte metrics when model info is absent."""
     from gptme_sessions.signals import extract_usage_copilot
 
     msgs = [
@@ -4029,12 +4279,19 @@ def test_extract_usage_copilot_no_model():
             "data": {"sessionId": "test", "producer": "copilot-agent"},
         },
         {
+            "type": "user.message",
+            "data": {"content": "hello"},
+        },
+        {
             "type": "assistant.message",
-            "data": {"toolRequests": []},
+            "data": {"content": "hi", "toolRequests": []},
         },
     ]
     usage = extract_usage_copilot(msgs)
-    assert usage == {}
+    assert "model" not in usage
+    assert usage["first_turn_bytes"] == len("hello".encode())
+    assert usage["context_peak_bytes"] == len("hello".encode())
+    assert usage["session_total_bytes"] == len("hellohi".encode())
 
 
 def test_extract_usage_copilot_multiple_model_changes():
@@ -4052,7 +4309,89 @@ def test_extract_usage_copilot_multiple_model_changes():
         },
     ]
     usage = extract_usage_copilot(msgs)
-    assert usage == {"model": "gpt-5.4"}
+    assert usage["model"] == "gpt-5.4"
+
+
+def test_extract_usage_copilot_includes_byte_metrics():
+    """extract_usage_copilot includes byte-level context metrics for Copilot sessions."""
+    from gptme_sessions.signals import extract_usage_copilot
+
+    system_text = "SYS"
+    user_text = "USER"
+    assistant_text = "ASSIST"
+    tool_requests = [{"name": "bash", "arguments": {"command": "echo hi"}}]
+    tool_result = {"content": "OUT"}
+
+    msgs = [
+        {
+            "type": "session.start",
+            "data": {
+                "sessionId": "test",
+                "producer": "copilot-agent",
+                "selectedModel": "gpt-5.4",
+            },
+        },
+        {"type": "system.message", "data": {"content": system_text}},
+        {"type": "user.message", "data": {"content": user_text}},
+        {
+            "type": "assistant.message",
+            "data": {"content": assistant_text, "toolRequests": tool_requests},
+        },
+        {"type": "tool.execution_complete", "data": {"result": tool_result, "success": True}},
+    ]
+
+    usage = extract_usage_copilot(msgs)
+
+    assert usage["model"] == "gpt-5.4"
+    assert usage["sys_prompt_bytes"] == len(system_text.encode())
+    assert usage["first_turn_bytes"] == len(system_text.encode()) + len(user_text.encode())
+    assert usage["context_peak_bytes"] == len(system_text.encode()) + len(user_text.encode())
+    assert usage["session_total_bytes"] > usage["context_peak_bytes"]
+    assert usage["session_total_bytes"] > usage["first_turn_bytes"]
+
+
+def test_extract_usage_copilot_output_tokens():
+    """extract_usage_copilot sums outputTokens from assistant.message events."""
+    from gptme_sessions.signals import extract_usage_copilot
+
+    msgs = [
+        {
+            "type": "session.start",
+            "data": {"sessionId": "test", "producer": "copilot-agent", "selectedModel": "gpt-5.4"},
+        },
+        {"type": "system.message", "data": {"content": "SYS"}},
+        {"type": "user.message", "data": {"content": "hi"}},
+        {
+            "type": "assistant.message",
+            "data": {"content": "hello", "outputTokens": 300},
+        },
+        {"type": "user.message", "data": {"content": "continue"}},
+        {
+            "type": "assistant.message",
+            "data": {"content": "world", "outputTokens": 150},
+        },
+    ]
+
+    usage = extract_usage_copilot(msgs)
+
+    assert usage["output_tokens"] == 450
+    assert usage["model"] == "gpt-5.4"
+
+
+def test_extract_usage_copilot_no_output_tokens():
+    """extract_usage_copilot omits output_tokens when no outputTokens present."""
+    from gptme_sessions.signals import extract_usage_copilot
+
+    msgs = [
+        {
+            "type": "session.start",
+            "data": {"sessionId": "test", "producer": "copilot-agent", "selectedModel": "gpt-5.4"},
+        },
+        {"type": "assistant.message", "data": {"content": "hello"}},
+    ]
+
+    usage = extract_usage_copilot(msgs)
+    assert "output_tokens" not in usage
 
 
 def test_extract_from_path_copilot_with_model(tmp_path: Path):
@@ -4800,6 +5139,46 @@ def test_discover_date_shown_in_output(tmp_path: Path, capsys, monkeypatch):
                 "file_writes": ["journal/2026-03-06/session.md", "journal/2026-03-06/work.md"],
             },
             None,
+        ),
+        # strategic scope → strategic category (×2 scope weight so only 1 scope commit needed)
+        (
+            {"git_commits": ["docs(strategic): update idea backlog priorities (abc1234)"]},
+            "strategic",
+        ),
+        # research scope → research category
+        (
+            {"git_commits": ["feat(research): peer research on trycua (abc1234)"]},
+            "research",
+        ),
+        # cross-repo scope → cross-repo category
+        (
+            {"git_commits": ["fix(cross-repo): update gptme-contrib pins (abc1234)"]},
+            "cross-repo",
+        ),
+        # monitoring scope → monitoring category
+        (
+            {"git_commits": ["feat(monitoring): add factory-ingest health check (abc1234)"]},
+            "monitoring",
+        ),
+        # self-review scope → self-review category (2 commits to meet threshold)
+        (
+            {
+                "git_commits": [
+                    "docs(self-review): write weekly review (abc1234)",
+                    "docs(self-review): add goals section (def5678)",
+                ]
+            },
+            "self-review",
+        ),
+        # social scope → social category (2 commits to meet threshold)
+        (
+            {
+                "git_commits": [
+                    "docs(social): update reply threads (abc1234)",
+                    "docs(social): draft friend replies (def5678)",
+                ]
+            },
+            "social",
         ),
     ],
 )
@@ -5660,6 +6039,23 @@ def test_sync_captures_gptme_model_from_config(tmp_path: Path, capsys, monkeypat
     assert records[0].model_normalized == "sonnet"
 
 
+def test_assign_if_missing_no_false_positive_on_zero():
+    """_assign_if_missing must not return True when current == value == 0."""
+    from gptme_sessions import SessionRecord
+    from gptme_sessions.cli import _assign_if_missing
+
+    record = SessionRecord(harness="copilot-cli", trajectory_path="/tmp/x.jsonl")
+    record.duration_seconds = 0
+    changed = _assign_if_missing(record, "duration_seconds", 0)
+    assert not changed, "zero == zero should not be treated as a change"
+    assert record.duration_seconds == 0
+
+    # Sanity-check: a real new value must still trigger a change.
+    changed = _assign_if_missing(record, "duration_seconds", 42)
+    assert changed
+    assert record.duration_seconds == 42
+
+
 def test_sync_signals_backfills_existing_records(tmp_path: Path, capsys, monkeypatch):
     """sync --signals updates existing records that have outcome=unknown."""
     import sys
@@ -5715,6 +6111,128 @@ def test_sync_signals_backfills_existing_records(tmp_path: Path, capsys, monkeyp
     assert records[0].outcome == "productive"
     assert records[0].duration_seconds == 300
     assert records[0].category == "code"
+
+
+def test_sync_signals_import_persists_usage_fields(tmp_path: Path, capsys, monkeypatch):
+    """sync --signals persists extracted usage/context fields on new records."""
+    import sys
+
+    from gptme_sessions import SessionStore
+    from gptme_sessions.cli import main
+
+    fake_file = tmp_path / "session.jsonl"
+    fake_file.touch()
+
+    monkeypatch.setattr("gptme_sessions.cli.discover_gptme_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr("gptme_sessions.cli.discover_cc_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr("gptme_sessions.cli.discover_codex_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "gptme_sessions.cli.discover_copilot_sessions", lambda *a, **kw: [fake_file]
+    )
+    monkeypatch.setattr(
+        "gptme_sessions.cli.extract_from_path",
+        lambda p: {
+            "productive": True,
+            "session_duration_s": 45,
+            "deliverables": [],
+            "inferred_category": "monitoring",
+            "usage": {
+                "model": "gpt-5.4",
+                "sys_prompt_bytes": 100,
+                "first_turn_bytes": 200,
+                "context_peak_bytes": 200,
+                "session_total_bytes": 350,
+            },
+        },
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gptme-sessions", "--sessions-dir", str(sessions_dir), "sync", "--signals"],
+    )
+    rc = main()
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Imported 1" in captured.out
+
+    store = SessionStore(sessions_dir=sessions_dir)
+    records = store.load_all()
+    assert len(records) == 1
+    assert records[0].harness == "copilot-cli"
+    assert records[0].model == "gpt-5.4"
+    assert records[0].sys_prompt_bytes == 100
+    assert records[0].first_turn_bytes == 200
+    assert records[0].context_peak_bytes == 200
+    assert records[0].session_total_bytes == 350
+
+
+def test_sync_signals_backfills_usage_for_existing_known_record(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """sync --signals backfills missing usage/context fields even when outcome is known."""
+    import sys
+
+    from gptme_sessions import SessionRecord, SessionStore
+    from gptme_sessions.cli import main
+
+    fake_file = tmp_path / "session.jsonl"
+    fake_file.touch()
+
+    monkeypatch.setattr("gptme_sessions.cli.discover_gptme_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr("gptme_sessions.cli.discover_cc_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr("gptme_sessions.cli.discover_codex_sessions", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "gptme_sessions.cli.discover_copilot_sessions", lambda *a, **kw: [fake_file]
+    )
+    monkeypatch.setattr(
+        "gptme_sessions.cli.extract_from_path",
+        lambda p: {
+            "productive": True,
+            "session_duration_s": 90,
+            "deliverables": [],
+            "inferred_category": "monitoring",
+            "usage": {
+                "model": "gpt-5.4",
+                "sys_prompt_bytes": 120,
+                "first_turn_bytes": 260,
+                "context_peak_bytes": 260,
+                "session_total_bytes": 400,
+            },
+        },
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir=sessions_dir)
+    store.append(
+        SessionRecord(
+            harness="copilot-cli",
+            trajectory_path=str(fake_file),
+            outcome="productive",
+            duration_seconds=12,
+        )
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gptme-sessions", "--sessions-dir", str(sessions_dir), "sync", "--signals"],
+    )
+    rc = main()
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "updated 1" in captured.out
+
+    records = store.load_all()
+    assert len(records) == 1
+    assert records[0].outcome == "productive"
+    assert records[0].duration_seconds == 12
+    assert records[0].model == "gpt-5.4"
+    assert records[0].sys_prompt_bytes == 120
+    assert records[0].first_turn_bytes == 260
+    assert records[0].context_peak_bytes == 260
+    assert records[0].session_total_bytes == 400
 
 
 def test_sync_signals_does_not_overwrite_existing_deliverables(tmp_path: Path, capsys, monkeypatch):
@@ -7144,7 +7662,7 @@ def test_grade_signals_category_aware_monitoring():
     # Without category: effective_writes=2 < 3 → floor at 0.40
     assert grade_signals(sigs) == pytest.approx(0.40)
     # With monitoring category: any interaction clears 0.55 tier
-    assert grade_signals(sigs, category="monitoring") == pytest.approx(0.55)
+    assert grade_signals(sigs, category="pm-react") == pytest.approx(0.55)
 
 
 def test_grade_signals_category_aware_triage():
@@ -7164,7 +7682,7 @@ def test_grade_signals_category_aware_triage():
 
 
 def test_grade_signals_category_aware_no_interaction():
-    """Non-commit category with 0 gh_interactions still floors at 0.25 (active but empty)."""
+    """Non-commit category with 0 gh_interactions but clean execution gets neutral grade."""
     sigs = {
         "git_commits": [],
         "file_writes": [],
@@ -7175,8 +7693,32 @@ def test_grade_signals_category_aware_no_interaction():
         "prs_submitted": [],
         "issues_closed": 0,
     }
-    # Category hint does not help when there's nothing to show for the session
-    assert grade_signals(sigs, category="monitoring") == pytest.approx(0.25)
+    # Monitoring sessions that ran tools without errors but found no work are
+    # "correctly empty" rather than failed. They get a neutral 0.35 instead
+    # of the 0.25 floor to avoid systematic bias in bandit updates.
+    assert grade_signals(sigs, category="pm-react") == pytest.approx(0.35)
+
+
+def test_grade_signals_category_aware_no_interaction_with_errors():
+    """Non-commit category at the error-rate boundary gets the raised 0.35 floor.
+
+    error_rate = 1/20 = 0.05, which is NOT > 0.05, so no error penalty applies.
+    The PR that removed the `errors == 0` gate means non-commit categories now
+    get 0.35 regardless of error count (penalty still applies for >5% error rate).
+    """
+    sigs = {
+        "git_commits": [],
+        "file_writes": [],
+        "error_count": 1,
+        "retry_count": 0,
+        # Keep error_rate at 0.05 so this test isolates the pre-penalty branch
+        # selection instead of the downstream error-rate penalty.
+        "tool_calls": {"Bash": 20},
+        "gh_interactions": 0,
+        "prs_submitted": [],
+        "issues_closed": 0,
+    }
+    assert grade_signals(sigs, category="pm-react") == pytest.approx(0.35)
 
 
 def test_grade_signals_category_does_not_affect_commit_tiers():
@@ -7193,7 +7735,7 @@ def test_grade_signals_category_does_not_affect_commit_tiers():
     }
     # effective_units=1 < 1.5 → 0.60 regardless of category
     assert grade_signals(sigs) == pytest.approx(0.60)
-    assert grade_signals(sigs, category="monitoring") == pytest.approx(0.60)
+    assert grade_signals(sigs, category="pm-react") == pytest.approx(0.60)
 
 
 def test_grade_signals_backward_compat():
@@ -7219,7 +7761,7 @@ def test_infer_category_monitoring_fallback():
         "file_writes": [],
         "gh_interactions": 3,
     }
-    assert infer_category(sigs) == "monitoring"
+    assert infer_category(sigs) == "pm-react"
 
 
 def test_infer_category_monitoring_not_triggered_with_commits():
@@ -7258,9 +7800,9 @@ def test_grade_signals_monitoring_via_infer_category():
     }
     # Without wiring: category=None → effective_writes=2 < 3 → 0.40
     assert grade_signals(sigs, category=None) == pytest.approx(0.40)
-    # With infer_category providing "monitoring" → relaxed threshold → 0.55
+    # With infer_category providing "pm-react" → relaxed threshold → 0.55
     category = infer_category(sigs)
-    assert category == "monitoring"
+    assert category == "pm-react"
     assert grade_signals(sigs, category=category) == pytest.approx(0.55)
 
 

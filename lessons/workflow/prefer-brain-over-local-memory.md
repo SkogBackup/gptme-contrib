@@ -1,13 +1,11 @@
 ---
 match:
   keywords:
-    - auto-memory
     - MEMORY.md
     - brain repo
-    - claude memory
-    - local memory
   session_categories: [self-review, infrastructure]
 status: active
+description: "When an agent has a brain repo (git workspace), persist knowledge there — not in runtime-local memory systems like Claude Code's `~/.claude/projects/*/memory/`."
 ---
 
 # Prefer Brain Repo Over Local Machine Memory

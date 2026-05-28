@@ -55,6 +55,8 @@ class JudgeVerdict(TypedDict, total=False):
     score: float
     reason: str
     model: str
+    alignment_score: float | None
+    pivot_verdict: str | None
     meta: JudgeMetadata
 
 
@@ -64,28 +66,180 @@ Return ONLY a JSON object with two keys: "score" (float 0.0-1.0) and "reason" (s
 Do not wrap in markdown code blocks."""
 
 JUDGE_PROMPT_TEMPLATE = """\
-## Agent Goals (ordered by priority)
-{goals}
-
 ## Session Category
 {category}
-
+{routing_context}
+{intent_context}
 ## Session Journal
 {journal}
 
 ## Scoring Rubric
 Rate the strategic value of this session's output on 0.0-1.0:
 - 0.9-1.0: Major progress on a top-priority goal (shipped key feature, unblocked critical path)
-- 0.7-0.8: Meaningful progress on a priority goal (solid PR, design doc, real bug fix)
-- 0.5-0.6: Useful but not top-priority work (minor improvements, maintenance)
+- 0.7-0.8: Meaningful progress on any goal — priority or compounding support (solid PR, durable infra win, real bug fix)
+- 0.5-0.6: Low-impact output in any category (weak improvements, thrashing-lite)
 - 0.3-0.4: Low-value work (tiny PRs, busywork, over-engineering)
 - 0.1-0.2: Minimal output (mostly blocked, NOOP-adjacent)
 - 0.0: No output / pure NOOP
 
-Key principle: ONE impactful deliverable > FIVE small deliverables.
-Evaluate impact and goal-alignment, not quantity.
+## Category Interpretation
+Sessions are routed across categories. Some categories (code, content,
+cross-repo) directly target top-priority product/revenue goals. Others
+(infrastructure, monitoring, cleanup, knowledge, research, self-review,
+triage, news, social, novelty, strategic) are support work that compounds
+future capability. Score on **within-category value**, not on whether the
+category itself targets goal #1:
 
-Return JSON: {{"score": <float>, "reason": "<1 sentence>"}}"""
+- A clean infrastructure / instrumentation / measurement session that
+  meaningfully reduces future friction or persists durable learning is
+  goal-aligned — score 0.7-0.9, do not cap it for "not revenue work".
+- A well-executed research, knowledge, or strategic session that yields
+  genuine insight or a durable artifact is goal-aligned — score 0.7-0.9,
+  do not cap it for "not revenue work".
+- Penalize all categories equally for thrashing, no-shipped-artifact,
+  over-engineering, or work the agent invented to fill the session.
+- Reserve 0.9-1.0 for sessions where the deliverable plausibly moves a
+  top-priority goal *or* is a category-best example of compounding work.
+
+Key principle: ONE impactful deliverable > FIVE small deliverables.
+
+## Agent Goals (ordered by priority)
+{goals}
+
+## Worked Examples
+The following worked examples show how the rubric applies to real session
+shapes, explaining *why* specific categories earn their score range:
+
+**Example 1 (infrastructure, ~0.78)**: A session normalizes a flaky CI health
+check that has been producing false alerts for a week. It discovers the stale
+worker accumulation, removes the redundant probes, and adds a regression test.
+This session scores ~0.78 because:
+- Infrastructure compounding: every future session inherits a cleaner CI signal.
+- The artifact (test + config fix) is self-verifying and durable.
+- The work is not "revenue work" — that is irrelevant. The within-category
+  value is high: it permanently reduced future friction.
+
+**Example 2 (cleanup, ~0.75)**: A session audits lesson keywords using the LOO
+analysis tool, removes 8 dead keywords whose delta was harmfully negative, and
+updates a companion doc with the audit rationale. This session scores ~0.75
+because:
+- The removed keywords measurably improved agent behavior (validated by
+  LOO effect-size delta).
+- The artifact (keyword changes + companion doc) is durable — every future
+  agent session benefits without extra effort.
+- Busywork-versus-value boundary: the session only removed *harmful* keywords,
+  not all dead weight. It stopped at the value line.
+
+**Example 3 (research, ~0.72)**: A session reads an arXiv paper on tool-use
+reliability, writes a structured research note connecting the findings to the
+agent's architecture, and files a targeted idea-backlog entry. This session
+scores ~0.72 because:
+- The research note is a durable artifact that future sessions reference.
+- It connects abstract findings to concrete, actionable next steps (e.g.,
+  "try two-pass prompting on high-stakes turns").
+- It does *not* score higher because it produced no code change, no test, no
+  automated verification — the impact is mediated through future sessions'
+  ability to use the insight.
+
+Key principle across all three: the grade follows from *within-category*
+execution quality, compounding value, and durability — not from whether the
+category number matches a top goal.
+
+## Forbidden Constructions
+Do NOT invoke any of the following as a penalty rationale:
+- "low priority", "Tier 3", "Tier 5", "not a top goal"
+- "misaligned with top goals" or "misaligned with top-priority"
+- "not revenue-generating" or "not revenue work"
+- "below the top revenue-generating goal"
+- "fallback tier" or "lower-tier work" (in a negative sense)
+
+These phrases are category signals, NOT quality signals. Penalize only
+on actual execution quality: thrashing, no-shipped-artifact, over-engineering,
+or invented work — not on what tier or priority the category occupies.
+
+## Routing-Aware Adjustment
+If a `## Routing Context` block above states the session legitimately
+routed to lower-tier work because higher-tier work was unavailable
+(blocked / waiting / no actionable items), score primarily on execution
+quality within the chosen scope. Do not penalize for non-advancement of
+top-priority goals beyond −0.15 below the execution-quality score: the
+selector — not the agent — decided what was eligible.
+If no `## Routing Context` block is present, ignore this adjustment and
+apply the default rubric.
+
+## Intent→Outcome Alignment
+When a `## Session Intent` block is present above, separately rate how well
+the session's actual output matched its declared intent. This is a *separate*
+axis from the execution-quality score — a good pivot still gets a high
+execution score but lower alignment.
+
+If no `## Session Intent` block is present, omit the alignment fields.
+
+**Alignment scale**:
+- 0.9-1.0: Session exactly hit its declared objective and produced the
+  expected artifact (or superseded it with a better outcome).
+- 0.7-0.8: Session achieved its objective but the artifact was partial or
+  the scope drifted slightly.
+- 0.5-0.6: Session delivered something useful, but it materially diverged
+  from the declared objective (pivot).
+- 0.3-0.4: Session touched the intent area but produced a different or
+  weakly-related outcome.
+- 0.0-0.2: Session output is unrelated to the declared intent.
+
+**Alignment verdict** (`pivot_verdict`):
+- ``"on_track"``: The session hit its declared objective and produced the
+  expected artifact (or clearly superseded it with a better outcome).
+- ``"partial"``: The session mostly achieved the objective, but the artifact
+  was partial or the scope drifted slightly.
+- ``"pivot"``: The session delivered something useful, but it materially
+  diverged from the declared objective.
+- ``"off_target"``: The session output is unrelated or only weakly related
+  to the declared intent.
+
+**Self-assigned calibration**: If the session already self-assigned an
+alignment verdict (``on_track`` / ``partial`` / ``pivot`` / ``off_target``),
+use it as calibration — your score should agree in direction unless you
+have strong evidence otherwise.
+
+Return JSON: {{"score": <float>, "reason": "<1 sentence>", "alignment_score": <float or null>, "pivot_verdict": <"on_track"|"partial"|"pivot"|"off_target"|null>}}"""
+
+
+def format_intent_context(intent: dict | None) -> str:
+    """Render an `## Session Intent` block from a pre-session intent payload.
+
+    Returns an empty string when ``intent`` is None or lacks the required fields.
+    The string is plugged into ``JUDGE_PROMPT_TEMPLATE`` between the Routing
+    Context and Session Journal blocks (before the rubric).
+
+    Expected keys (all required for a non-empty return):
+    - ``session_id`` (str): Canonical session ID.
+    - ``lane`` (str): CASCADE tier/category, e.g. ``"Tier3:internal-code"``.
+    - ``objective`` (str): One-sentence session goal.
+    - ``expected_artifact`` (str): One-sentence concrete output.
+    - ``outcome_alignment`` (str | None): Self-assigned alignment verdict
+      (``"on_track"``, ``"partial"``, ``"pivot"``, ``"off_target"``, or None).
+
+    The presence of ``outcome_alignment`` switches the block from pre-session
+    intent (no self-grade yet) to post-session intent (self-assigned verdict
+    included as judge calibration signal).
+    """
+    if not intent or not isinstance(intent, dict):
+        return ""
+    required = {"objective", "expected_artifact", "lane"}
+    if not required.issubset(intent):
+        return ""
+    lines = [
+        "",
+        "## Session Intent",
+        f"- **Objective**: {intent['objective']}",
+        f"- **Expected artifact**: {intent['expected_artifact']}",
+        f"- **Lane**: {intent['lane']}",
+    ]
+    alignment = intent.get("outcome_alignment")
+    if alignment is not None:
+        lines.append(f"- **Self-assigned alignment**: {alignment}")
+    return "\n".join(lines) + "\n"
+
 
 DEFAULT_GOALS = """\
 The agent is a general-purpose autonomous AI assistant.
@@ -93,6 +247,49 @@ The agent is a general-purpose autonomous AI assistant.
 2. Write high-quality code and documentation
 3. Self-improve through lessons and patterns
 4. Contribute to open-source projects"""
+
+
+def format_routing_context(cascade_context: dict | None) -> str:
+    """Render a `## Routing Context` block from a CASCADE selector payload.
+
+    Returns an empty string when ``cascade_context`` is None or doesn't
+    describe a legitimate lower-tier route. The string is plugged into
+    JUDGE_PROMPT_TEMPLATE between Session Category and Session Journal.
+
+    Recognised keys (all optional):
+    - ``tier`` (int): CASCADE tier the selector landed on. 1/2 are
+      ignored (those *are* top-priority work). 3 enables the block.
+    - ``blocked_tier1_2_count`` (int): how many higher-tier tasks were
+      unactionable at selection time.
+    - ``selector_reason`` (str): human-readable selector rationale,
+      typically the top item from cascade_intent["reasons"].
+
+    The block intentionally only fires for Tier 3 + explicit blocked
+    context, so callers without that data degrade to "no adjustment".
+    """
+    if not cascade_context or not isinstance(cascade_context, dict):
+        return ""
+    tier = cascade_context.get("tier")
+    if tier != 3:
+        return ""
+    blocked = cascade_context.get("blocked_tier1_2_count")
+    _reason_raw = cascade_context.get("selector_reason")
+    reason = _reason_raw if isinstance(_reason_raw, str) else ""
+    lines = [
+        "",
+        "## Routing Context",
+        "Session legitimately routed to Tier 3 (self-improvement / strategic /",
+        "cleanup / knowledge / research / content / novelty) because higher-tier",
+        "work was unavailable at selection time.",
+    ]
+    if isinstance(blocked, int) and not isinstance(blocked, bool) and blocked > 0:
+        lines.append(f"- Higher-tier tasks blocked / waiting at selection time: {blocked}")
+    if reason:
+        # Keep selector reasoning short; one line is enough signal for the judge.
+        lines.append(f"- Selector reason: {reason[:200]}")
+    return "\n".join(lines) + "\n"
+
+
 NO_THINK_PREFILL = "<think></think>\n"
 NO_THINK_PREFILL_MODELS = frozenset({"lmstudio/qwen/qwen3.6-35b-a3b"})
 
@@ -243,21 +440,52 @@ def _build_judge_meta(*, model: str) -> JudgeMetadata:
     }
 
 
+VALID_ALIGNMENT_VALUES = frozenset({"on_track", "partial", "pivot", "off_target"})
+
+
+def _coerce_alignment_score(raw: Any) -> float | None:
+    """Normalize an alignment_score value to float 0.0-1.0 or None."""
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+        if not (0.0 <= val <= 1.0):
+            return None
+        return val
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_pivot_verdict(raw: Any) -> str | None:
+    """Normalize a pivot_verdict/alignment label to a recognised string or None."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s if s in VALID_ALIGNMENT_VALUES else None
+
+
 def normalize_judge_verdict(payload: dict[str, Any]) -> JudgeVerdict:
-    """Attach stable metadata to a raw judge verdict."""
+    """Attach stable metadata to a raw judge verdict.
+
+    When the payload includes ``alignment_score`` and/or ``pivot_verdict``
+    (Phase 3: intent contract), those fields are preserved in the output.
+    """
     model = str(payload.get("model", ""))
     raw_meta = payload.get("meta")
     meta = raw_meta if isinstance(raw_meta, dict) else {}
     base_meta = _build_judge_meta(model=model)
-    return {
+    verdict: JudgeVerdict = {
         "score": max(0.0, min(1.0, float(payload.get("score", 0.5)))),
         "reason": str(payload.get("reason", "")),
         "model": model,
+        "alignment_score": _coerce_alignment_score(payload.get("alignment_score")),
+        "pivot_verdict": _coerce_pivot_verdict(payload.get("pivot_verdict")),
         "meta": {
             "backend": str(meta.get("backend", base_meta["backend"])),
             "judge_version": str(meta.get("judge_version", base_meta["judge_version"])),
         },
     }
+    return verdict
 
 
 def _strip_json_wrappers(text: str) -> str:
@@ -292,7 +520,15 @@ def _parse_judge_payload(text: str, model: str) -> dict | None:
     score = float(verdict.get("score", 0.5))
     reason = str(verdict.get("reason", ""))
     score = max(0.0, min(1.0, score))
-    return {"score": score, "reason": reason, "model": model}
+    result: dict[str, Any] = {"score": score, "reason": reason, "model": model}
+    # Phase 3: pass through intent-contract fields when the judge returns them
+    alignment_score = _coerce_alignment_score(verdict.get("alignment_score"))
+    if alignment_score is not None:
+        result["alignment_score"] = alignment_score
+    pivot_verdict = _coerce_pivot_verdict(verdict.get("pivot_verdict"))
+    if pivot_verdict is not None:
+        result["pivot_verdict"] = pivot_verdict
+    return result
 
 
 def _prepare_messages_for_model(messages: list[Any], model: str) -> list[Any]:
@@ -395,6 +631,8 @@ def judge_session(
     goals: str = DEFAULT_GOALS,
     model: str = DEFAULT_JUDGE_MODEL,
     api_key: str | None = None,
+    cascade_context: dict | None = None,
+    intent: dict | None = None,
 ) -> dict | None:
     """Score a session's strategic value using an LLM judge.
 
@@ -410,11 +648,27 @@ def judge_session(
             installed.
         api_key: Anthropic API key (Anthropic-direct path only). Falls
             back to env/config if not provided.
+        cascade_context: Optional CASCADE selector payload describing
+            which tier the session legitimately routed to. When the
+            payload signals a Tier 3 fallback (higher-tier work was
+            blocked), the prompt instructs the judge to score primarily
+            on execution quality rather than penalize for not advancing
+            top-priority goals. See :func:`format_routing_context` for
+            the recognised keys. Pass ``None`` (default) to keep prompt
+            behaviour unchanged.
+        intent: Optional pre-session intent dict (Phase 3: intent contract).
+            When provided, an ``## Session Intent`` block is injected into
+            the prompt and the judge is asked to return ``alignment_score``
+            and ``pivot_verdict`` fields alongside ``score`` and ``reason``.
+            Expected keys: ``session_id``, ``lane``, ``objective``,
+            ``expected_artifact``, and optionally ``outcome_alignment``
+            (self-assigned pre-closeout verdict).
 
     Returns:
         Dict with keys ``score`` (float), ``reason`` (str), ``model`` (str),
-        or ``None`` if the evaluation fails (missing API key, import error,
-        non-JSON response, etc.).
+        and when ``intent`` is provided also ``alignment_score`` (float | None)
+        and ``pivot_verdict`` (str | None). Returns ``None`` if the evaluation
+        fails (missing API key, import error, non-JSON response, etc.).
     """
     # Truncate journal to ~4000 chars to keep costs low
     truncated = journal_text[:4000] if journal_text else "(empty session)"
@@ -425,6 +679,8 @@ def judge_session(
     prompt = JUDGE_PROMPT_TEMPLATE.format(
         goals=goals,
         category=category or "unknown",
+        routing_context=format_routing_context(cascade_context),
+        intent_context=format_intent_context(intent),
         journal=truncated,
     )
 
@@ -441,6 +697,8 @@ def judge_session_with_fallback(
     default_model: str = DEFAULT_JUDGE_MODEL,
     fallback_models: tuple[str, ...] = (),
     api_key: str | None = None,
+    cascade_context: dict | None = None,
+    intent: dict | None = None,
 ) -> dict | None:
     """Score a session, trying fallback models if the primary is unavailable.
 
@@ -451,6 +709,8 @@ def judge_session_with_fallback(
         default_model: Primary judge model. Tried first.
         fallback_models: Additional models to try in order when the primary fails.
         api_key: Anthropic API key (Anthropic-direct path only).
+        cascade_context: Optional CASCADE selector payload. See :func:`judge_session`.
+        intent: Optional pre-session intent dict. See :func:`judge_session`.
 
     Returns:
         Dict with keys ``score``, ``reason``, ``model`` or ``None`` if all models fail.
@@ -469,6 +729,8 @@ def judge_session_with_fallback(
             goals=goals,
             model=model,
             api_key=api_key,
+            cascade_context=cascade_context,
+            intent=intent,
         )
         if result is not None:
             return result
@@ -562,6 +824,13 @@ def write_alignment_grade(
             reason=normalized["reason"],
             model=normalized["model"],
         )
+        # Phase 3: persist intent-contract alignment fields via legacy bridge
+        legacy_fields = getattr(record, "_legacy_fields", None)
+        if isinstance(legacy_fields, dict):
+            if normalized.get("alignment_score") is not None:
+                legacy_fields["alignment_score"] = normalized["alignment_score"]
+            if normalized.get("pivot_verdict") is not None:
+                legacy_fields["pivot_verdict"] = normalized["pivot_verdict"]
         _store_judge_meta(record, normalized.get("meta"))
         # Safe to run unconditionally: returns False when trajectory_path is
         # missing / unreadable or harness is unknown, and is idempotent when
@@ -589,10 +858,13 @@ def judge_and_writeback(
     model: str = DEFAULT_JUDGE_MODEL,
     fallback_models: tuple[str, ...] = (),
     api_key: str | None = None,
+    cascade_context: dict | None = None,
+    intent: dict | None = None,
 ) -> dict[str, Any]:
     """Judge a session and persist the verdict via SessionStore.
 
     If ``fallback_models`` is provided, tries them in order when ``model`` fails.
+    See :func:`judge_session` for ``cascade_context`` semantics.
     """
     if fallback_models:
         verdict = judge_session_with_fallback(
@@ -602,6 +874,8 @@ def judge_and_writeback(
             default_model=model,
             fallback_models=fallback_models,
             api_key=api_key,
+            cascade_context=cascade_context,
+            intent=intent,
         )
     else:
         verdict = judge_session(
@@ -610,6 +884,8 @@ def judge_and_writeback(
             goals=goals,
             model=model,
             api_key=api_key,
+            cascade_context=cascade_context,
+            intent=intent,
         )
     if verdict is None:
         return {"status": "failed"}

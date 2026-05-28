@@ -1,10 +1,9 @@
 ---
+description: "When significant upcoming events could change strategy, watch for them proactively rather than missing them"
 status: active
 match:
   keywords:
-    - event watch
     - watch task
-    - settlement watch
     - upcoming event
 ---
 

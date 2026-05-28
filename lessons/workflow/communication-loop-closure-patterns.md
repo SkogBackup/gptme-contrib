@@ -1,13 +1,20 @@
 ---
+description: "Close communication loops explicitly — every mention/ping deserves a reply that resolves or routes the request"
 match:
   keywords:
-  - close the loop
-  - update the issue
+  - close the communication loop
+  - respond in the original thread
+  - confirm the fix in the issue
+  - completed the work but did not
+  - marked as done without commenting
+  - silent completion
+  - link back to the original issue
+  - end the session without responding
+  - finished but never replied
   - reply to the issue
-  - comment on the issue
-  - follow up on the request
-  session_categories: [triage, cross-repo]
+  - update the issue
 status: active
+target_grade: alignment
 ---
 
 # Communication Loop Closure Patterns

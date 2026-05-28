@@ -66,10 +66,16 @@ from trusted_users import is_trusted_user  # type: ignore
 from twitter.llm import (
     EvaluationResponse,
     TweetResponse,
+    _unescape_literal_newlines,
     process_tweet,
     verify_draft,
 )
-from twitter.twitter import cached_get_me, load_twitter_client
+from twitter.twitter import (
+    _find_placeholder_in_text,
+    cached_get_me,
+    load_twitter_client,
+)
+from url_utils import validate_urls_in_text  # type: ignore[import-not-found]
 
 logger = get_logger(__name__, "twitter")
 metrics = MetricsCollector()
@@ -273,8 +279,25 @@ class TweetDraft:
         - ``created`` as fallback for ``created_at``
         - ``context`` is optional (defaults to empty dict)
         """
+
+        # Unescape literal \\n sequences that some LLMs emit in JSON/YAML.
+        # This fixes tweets that leak escape sequences like "line1\\nline2".
+        # Uses the shared _unescape_literal_newlines helper from twitter.llm.
+        raw_text = data.get("text", data.get("content", ""))
+        fixed_text: str = (
+            _unescape_literal_newlines(raw_text) if isinstance(raw_text, str) else ""
+        )
+
+        raw_thread = data.get("thread")
+        fixed_thread: list[str] | None = None
+        if isinstance(raw_thread, list):
+            fixed_thread = [
+                _unescape_literal_newlines(t) if isinstance(t, str) else ""
+                for t in raw_thread
+            ]
+
         draft = cls(
-            text=data.get("text", data.get("content", "")),
+            text=fixed_text,
             type=data.get("type", "tweet"),
             in_reply_to=data.get("in_reply_to"),
             scheduled_time=(
@@ -289,7 +312,7 @@ class TweetDraft:
             context=data.get("context", {}),
             reject_reason=data.get("reject_reason"),  # Optional, backward compatible
             quality_score=data.get("quality_score"),  # Optional, backward compatible
-            thread=data.get("thread"),  # Optional, backward compatible
+            thread=fixed_thread,
         )
         created_at = data.get("created_at", data.get("created"))
         if created_at is None:
@@ -745,31 +768,38 @@ def cli(model: str | None = None) -> None:
     )
 
 
-def _validate_urls_in_text(text: str) -> list[tuple[str, int]]:
-    """HEAD-check any http(s) URLs in tweet text. Return [(url, status)] for unreachable ones (4xx/5xx).
-
-    Network errors are treated as non-fatal (returns nothing for those URLs) — the goal is to
-    catch deterministic 404s like the recurring `/YYYY/MM/DD/title/` vs `/blog/title/` permalink
-    bug, not to require connectivity. Mirrors the check in scripts/twitter/post-blog-tweet.py.
-    """
-    import re
-    import urllib.error
-    import urllib.request
-
-    url_pattern = re.compile(r"https?://[^\s\"'<>)]+")
+def _validate_draft_urls(draft: TweetDraft) -> list[tuple[str, int]]:
+    """Validate URLs across both the main tweet text and any thread follow-ups."""
     bad: list[tuple[str, int]] = []
-    for url in url_pattern.findall(text):
-        url = url.rstrip(".,;:!?")
-        try:
-            req = urllib.request.Request(url, method="HEAD")
-            req.add_header("User-Agent", "Mozilla/5.0 (URL checker)")
-            with urllib.request.urlopen(req, timeout=5):
-                pass  # 4xx/5xx raise HTTPError before reaching here
-        except urllib.error.HTTPError as e:
-            bad.append((url, e.code))
-        except Exception:
-            pass
+    seen: set[tuple[str, int]] = set()
+
+    for text in [draft.text, *draft.thread]:
+        if not text:
+            continue
+        for issue in validate_urls_in_text(text):
+            if issue in seen:
+                continue
+            seen.add(issue)
+            bad.append(issue)
+
     return bad
+
+
+def _validate_draft_placeholders(draft: TweetDraft) -> list[str]:
+    """Reject drafts containing unresolved LLM placeholders like '[link would go here]'.
+
+    These are emitted by the LLM when it composes a reply that references a URL
+    but doesn't yet know the resolved value. They must never reach the posting
+    stage — the draft should either be rewritten with a real URL or dropped.
+    """
+    hits: list[str] = []
+    for text in [draft.text, *draft.thread]:
+        if not text:
+            continue
+        hit = _find_placeholder_in_text(text)
+        if hit:
+            hits.append(hit)
+    return list(dict.fromkeys(hits))  # deduplicate, preserve order
 
 
 @cli.command()
@@ -795,8 +825,20 @@ def draft(
     op = metrics.start_operation("draft_creation", "twitter")
 
     try:
+        # Guard: reject drafts with unresolved LLM placeholders
+        text_hit = _find_placeholder_in_text(text)
+        if text_hit:
+            console.print(
+                f"[red]✗ Text contains unresolved placeholder: '{text_hit}'[/red]",
+            )
+            console.print(
+                "[red]Aborting draft — rewrite without unresolved placeholders.[/red]"
+            )
+            op.complete(success=False, error="placeholder")
+            sys.exit(1)
+
         if not skip_url_check:
-            bad_urls = _validate_urls_in_text(text)
+            bad_urls = validate_urls_in_text(text)
             if bad_urls:
                 for url, status in bad_urls:
                     console.print(
@@ -840,7 +882,11 @@ def draft(
 def _check_for_duplicate_replies_internal(draft: TweetDraft) -> dict[str, list[Path]]:
     """Internal utility to check if we already have replies to the same tweet.
 
-    Returns dict with keys: 'posted', 'approved', 'new' containing paths to duplicates.
+    Returns dict with keys 'posted', 'approved', 'new', 'review', 'rejected'
+    containing paths to duplicates. ``rejected`` and ``review`` are included so
+    repeated dispatch cycles don't keep re-evaluating tweets we already drafted
+    a reply to — even if that draft was rejected (e.g. by the live-duplicate
+    guard when our prior reply is already on Twitter).
     """
     if not draft.in_reply_to:
         return {}
@@ -849,7 +895,7 @@ def _check_for_duplicate_replies_internal(draft: TweetDraft) -> dict[str, list[P
     tweet_id = draft.in_reply_to
 
     # Check each directory
-    for status in ["posted", "approved", "new"]:
+    for status in ["posted", "approved", "new", "review", "rejected"]:
         status_dir = TWEETS_DIR / status
         if not status_dir.exists():
             continue
@@ -1207,8 +1253,17 @@ def _git_commit_posted(path: Path) -> None:
     type=int,
     help=f"Max tweets to post in one run (default: {MAX_POSTS_PER_CYCLE} when --yes is used, unlimited otherwise)",
 )
+@click.option(
+    "--skip-url-check",
+    is_flag=True,
+    help="Skip HEAD-check of URLs in tweet text (use when URLs are intentionally pre-publish)",
+)
 def post(
-    dry_run: bool, yes: bool, draft_id: str | None = None, max_posts: int | None = None
+    dry_run: bool,
+    yes: bool,
+    draft_id: str | None = None,
+    max_posts: int | None = None,
+    skip_url_check: bool = False,
 ) -> None:
     """Post approved tweets"""
     # Apply rate limit: default to MAX_POSTS_PER_CYCLE when running non-interactively (--yes)
@@ -1286,6 +1341,30 @@ def post(
             console.print("[yellow]Dry run - tweet would be posted")
             console.print(f"[blue]Draft ID: {path.stem}[/blue]")
             continue
+
+        # Placeholder validation: catch unresolved LLM placeholders before posting
+        placeholder_hits = _validate_draft_placeholders(draft)
+        if placeholder_hits:
+            console.print(
+                f"[red]✗ Draft contains unresolved placeholders: {', '.join(placeholder_hits)}[/red]"
+            )
+            console.print(
+                "[red]Skipping draft — fix or rewrite the draft to remove unresolved placeholders.[/red]"
+            )
+            move_draft(path, "rejected")
+            continue
+
+        # URL validation: catch 404s before asking for confirmation
+        if not skip_url_check:
+            bad_urls = _validate_draft_urls(draft)
+            if bad_urls:
+                for url, status in bad_urls:
+                    console.print(f"[red]✗ URL returns {status}: {url}[/red]")
+                console.print(
+                    "[red]Skipping draft — fix dead URLs in the tweet or thread, or pass --skip-url-check.[/red]"
+                )
+                move_draft(path, "rejected")
+                continue
 
         if yes or Confirm.ask("Post this tweet?", default=True):
             try:
@@ -1404,8 +1483,11 @@ def process_timeline_tweets(
     # Build a set of tweet IDs we already have replies for (across all directories)
     # This is more robust than filename substring matching
     # Use strings for consistent comparison (in_reply_to can be int or str)
+    # ``review`` and ``rejected`` are included so a rejected draft (e.g. moved
+    # there because our prior reply is already live on Twitter) suppresses
+    # re-drafting on subsequent dispatch cycles.
     _replied_tweet_ids: set[str] = set()
-    for status_dir_name in ["posted", "approved", "new"]:
+    for status_dir_name in ["posted", "approved", "new", "review", "rejected"]:
         status_dir = TWEETS_DIR / status_dir_name
         if not status_dir.exists():
             continue
@@ -1431,7 +1513,7 @@ def process_timeline_tweets(
             if tweet.author_id == cached_get_me(client, user_auth=False).data.id:
                 continue
 
-            # Check if tweet already has a reply in any directory (posted, approved, new)
+            # Check if tweet already has a reply in any directory (posted, approved, new, review, rejected)
             tweet_id_str = str(tweet.id)
             if tweet_id_str in _replied_tweet_ids:
                 console.print(
@@ -1617,6 +1699,41 @@ def process_timeline_tweets(
                             f"[green]Auto-posting reply to trusted user @{author_username}"
                         )
                         try:
+                            placeholder_hits = _validate_draft_placeholders(draft)
+                            if placeholder_hits:
+                                console.print(
+                                    f"[red]✗ Auto-post blocked: unresolved placeholders: {', '.join(placeholder_hits)}[/red]"
+                                )
+                                draft.reject_reason = (
+                                    "Auto-post blocked: unresolved LLM placeholders"
+                                )
+                                path = save_draft(draft, "new")
+                                console.print(
+                                    f"[yellow]Saved as draft for manual fix: {path}"
+                                )
+                                drafts_generated += 1
+                                if draft.in_reply_to is not None:
+                                    _replied_tweet_ids.add(str(draft.in_reply_to))
+                                continue
+
+                            bad_urls = _validate_draft_urls(draft)
+                            if bad_urls:
+                                for url, status in bad_urls:
+                                    console.print(
+                                        f"[red]✗ URL returns {status}: {url}[/red]"
+                                    )
+                                draft.reject_reason = (
+                                    "Auto-post blocked: dead URL in tweet or thread"
+                                )
+                                path = save_draft(draft, "new")
+                                console.print(
+                                    f"[yellow]Saved as draft for manual URL fix: {path}"
+                                )
+                                drafts_generated += 1
+                                if draft.in_reply_to is not None:
+                                    _replied_tweet_ids.add(str(draft.in_reply_to))
+                                continue
+
                             client_for_post = load_twitter_client(
                                 require_auth=True, headless=True
                             )
@@ -2144,6 +2261,27 @@ def auto(
                     console.print(
                         f"[cyan]Thread: {len(draft.thread)} follow-up tweet(s)"
                     )
+
+                placeholder_hits = _validate_draft_placeholders(draft)
+                if placeholder_hits:
+                    console.print(
+                        f"[red]✗ Draft contains unresolved placeholders: {', '.join(placeholder_hits)}[/red]"
+                    )
+                    console.print(
+                        "[red]Skipping draft — fix or rewrite the draft to remove unresolved placeholders.[/red]"
+                    )
+                    move_draft(path, "rejected")
+                    continue
+
+                bad_urls = _validate_draft_urls(draft)
+                if bad_urls:
+                    for url, http_status in bad_urls:
+                        console.print(f"[red]✗ URL returns {http_status}: {url}[/red]")
+                    console.print(
+                        "[red]Skipping draft — fix dead URLs in the tweet or thread.[/red]"
+                    )
+                    move_draft(path, "rejected")
+                    continue
 
                 try:
                     response = client.create_tweet(

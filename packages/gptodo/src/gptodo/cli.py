@@ -162,7 +162,40 @@ console = Console()
     help="Path to tasks directory (overrides auto-detection). Can also be set via GPTODO_TASKS_DIR env var.",
 )
 def cli(verbose, tasks_dir):
-    """Task verification and status CLI."""
+    """gptodo — task management CLI for gptme agent workspaces.
+
+    Features:
+    - Status views (list, show, status, next, ready)
+    - Task metadata editing (edit): state, priority, tags, dependencies, and more
+    - Recurring tasks (recur: 7d, weekly, monthly, or cron expressions)
+    - Dependency validation and blocking analysis (effective, check-waiting, dep)
+    - Sub-agent spawning and management (spawn, sessions, run)
+    - GitHub/Linear issue import and syncing (import, fetch, sync)
+    - Task locking, claims, and stale detection
+    - Link checking and task integrity verification
+
+    Frontmatter fields (set via `gptodo edit TASK --set field value`):
+        state: backlog|todo|active|waiting|ready_for_review|done|cancelled|someday
+        priority: high|medium|low
+        task_type: project|action
+        assigned_to: bob|erik|alice|gordon (or any string)
+        created: ISO 8601 date/datetime
+        recur: 7d|14d|24h|weekly|monthly|cron-expression (recurring tasks)
+        wait: ISO 8601 date/datetime (hide from queue until this date)
+        next_action: string (GTD)
+        waiting_for: string (GTD)
+        waiting_since: date (GTD)
+        parent: string (parent task ID)
+        success_criterion: string (verifiable "done" gate)
+        depends: list (deprecated, use requires)
+        requires: list (dependency references)
+        tags: list
+        tracking: list (external issue/PR URLs)
+        related: list
+        output_types: list
+
+    See https://github.com/gptme/gptme-contrib for full documentation.
+    """
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=log_level)
 
@@ -239,6 +272,8 @@ def show(task_id):
         table.add_row("Subtasks", f"{task.subtasks.completed}/{task.subtasks.total} completed")
     if task.issues:
         table.add_row("Issues", ", ".join(task.issues))
+    if task.success_criterion:
+        table.add_row("Success Criterion", task.success_criterion)
 
     # Print metadata table
     console.print("\n[bold]Task Metadata:[/]")
@@ -1368,24 +1403,43 @@ def watch(interval: int, fix: bool, once: bool, verbose: bool):
 def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
     """Edit task metadata.
 
+    Recurring tasks:
+        Set `recur` on any task to make it repeating. When you mark a recurring
+        task as `done`, it auto-resets to `todo` with an updated `wait` date
+        computed from the current time + the recur interval. The task stays
+        hidden from `ready`/`next` until `wait` expires.
+
+        Supported recur values:
+            Nd      N days (e.g. 7d, 14d, 1d)
+            Nh      N hours (e.g. 24h, 6h)
+            weekly  7 days
+            monthly 30 days (calendar-approximate)
+            cron    Any 5/6-field cron expression (parsed but not evaluated
+                    by gptodo — accepted for compatibility with external tools)
+
+        Examples:
+            gptodo edit weekly-review --set recur 7d
+            gptodo edit daily-standup --set recur 24h
+            gptodo edit monthly-report --set recur monthly
+
     Examples:
-        tasks edit task-123 --set state active
-        tasks edit task-123 --set priority high
-        tasks edit task-123 --set created 2025-05-05T10:00:00+02:00
-        tasks edit task-123 --add depends other-task
-        tasks edit task-123 --add tag feature
-        tasks edit task-123 --remove tag wip
-        tasks edit task-123 --set state active --add tag feature --add depends other-task
-        tasks edit task-123 --set-subtask "Handle simple responses" done
+        gptodo edit task-123 --set state active
+        gptodo edit task-123 --set priority high
+        gptodo edit task-123 --set created 2025-05-05T10:00:00+02:00
+        gptodo edit task-123 --add requires other-task
+        gptodo edit task-123 --add tag feature
+        gptodo edit task-123 --remove tag wip
+        gptodo edit task-123 --set state active --add tag feature --add requires other-task
+        gptodo edit task-123 --set-subtask "Handle simple responses" done
 
     Clearing optional fields:
         Pass 'none' as the value to clear (unset) an optional field.
         Useful when transitioning a task to a terminal state (done/cancelled)
         and removing now-stale waiting metadata:
 
-        tasks edit task-123 --set waiting_for none --set waiting_since none
-        tasks edit task-123 --set priority none
-        tasks edit task-123 --set next_action none
+        gptodo edit task-123 --set waiting_for none --set waiting_since none
+        gptodo edit task-123 --set priority none
+        gptodo edit task-123 --set next_action none
 
     Date formats:
         The created field accepts ISO format dates:
@@ -1425,10 +1479,13 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
         # Keep "none" as the explicit clear value; otherwise accept any string.
         "assigned_to": {"type": "string"},
         "waiting_since": {"type": "date"},
+        "wait": {"type": "date"},  # Hide from queue until this date
         # Optional fields with arbitrary string values
         "next_action": {"type": "string"},
         "waiting_for": {"type": "string"},
+        "recur": {"type": "string"},  # Recurrence interval (7d, 24h, weekly, monthly)
         "parent": {"type": "string"},  # Parent task ID (for subtasks)
+        "success_criterion": {"type": "string"},  # Verifiable "done" gate
         # List fields handled separately via --add/--remove
         "tags": {"type": "list"},
         "depends": {"type": "list"},  # Deprecated, use requires instead
@@ -1478,19 +1535,40 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
                 console.print(f"[red]Invalid {field}: {value}. Valid values: {valid}[/]")
                 return
         elif field_spec["type"] == "date":
-            try:
-                # Parse and validate the date format
-                created_dt = datetime.fromisoformat(value)
-                # Convert to string format for storage
-                value = created_dt.isoformat()
-            except ValueError:
-                console.print(
-                    f"[red]Invalid {field} date format. Use ISO format (YYYY-MM-DD[THH:MM:SS+HH:MM])[/]"
-                )
-                return
+            # wait: accepts YYYY-MM-DD or YYYY-MM-DDTHH:MM; other date fields store full ISO datetime
+            if field == "wait":
+                from gptodo.utils import parse_wait
+
+                parsed = parse_wait(value)
+                if parsed is None:
+                    console.print(
+                        f"[red]Invalid {field} format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM[/]"
+                    )
+                    return
+                if isinstance(parsed, datetime):
+                    value = parsed.isoformat()
+                else:
+                    value = parsed.isoformat()
+            else:
+                try:
+                    created_dt = datetime.fromisoformat(value)
+                    value = created_dt.isoformat()
+                except ValueError:
+                    console.print(
+                        f"[red]Invalid {field} date format. Use ISO format (YYYY-MM-DD[THH:MM:SS+HH:MM])[/]"
+                    )
+                    return
         elif field_spec["type"] == "string":
+            if field == "recur":
+                from gptodo.utils import is_valid_recur_value
+
+                if not is_valid_recur_value(value):
+                    console.print(
+                        "[red]Invalid recur format. Use 7d, 24h, weekly, monthly, "
+                        "or a cron expression like '0 9 * * 1'[/]"
+                    )
+                    return
             # Arbitrary string value - no validation needed
-            pass
 
         changes.append(("set", field, value))
 
@@ -1639,8 +1717,8 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
                     # Normalize deprecated states at write time (defense in depth)
                     if field == "state":
                         value = normalize_state(value, warn=False)
-                    post.metadata[field] = value
 
+                    post.metadata[field] = value
         # Save changes
         with open(task.path, "w") as f:
             f.write(frontmatter.dumps(post))
@@ -1653,6 +1731,27 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
             # Re-load task to get updated metadata
             post = frontmatter.load(task.path)
             if post.metadata.get("state") == "done":
+                # Handle recur: reset task to todo and advance wait: date
+                recur = post.metadata.get("recur")
+                if recur:
+                    from gptodo.utils import parse_recur_interval
+
+                    if parse_recur_interval(str(recur)) is None:
+                        completed_task_ids.append(task.id)
+                        continue
+                    from gptodo.utils import advance_wait, parse_wait
+
+                    current_wait = parse_wait(post.metadata.get("wait"))
+                    next_wait = advance_wait(current_wait, recur)
+                    post.metadata["state"] = "todo"
+                    post.metadata["wait"] = next_wait.isoformat()
+                    with open(task.path, "w") as f:
+                        f.write(frontmatter.dumps(post))
+                    console.print(
+                        f"[cyan]↩ {task.name} recurring — reset to todo, next wait: {next_wait}[/]"
+                    )
+                    continue  # skip done-completion logic for recurring tasks
+
                 completed_task_ids.append(task.id)
 
                 # Run task completion hook if configured via env var

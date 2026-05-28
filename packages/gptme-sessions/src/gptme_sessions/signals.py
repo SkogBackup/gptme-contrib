@@ -23,6 +23,8 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from .deliverables import build_deliverable_detail, project_deliverable_details
+
 # Regex for git commit lines in shell output (works for both harnesses)
 _COMMIT_RE = re.compile(r"\[(?:master|main|[a-zA-Z0-9_/-]+)\s+([0-9a-f]{7,12})\]\s+(.+?)(?:\n|$)")
 
@@ -69,6 +71,49 @@ _ISSUE_CLOSE_CMD_RE = re.compile(r"\bgh\s+issue\s+close\b")
 # Must be command-gated (not just output-gated) because _PR_MERGE_RE patterns
 # can appear in test files, file-read results, and other non-merge contexts.
 _GH_PR_MERGE_CMD_RE = re.compile(r"\bgh\s+pr\s+merge\b")
+
+
+def _record_deliverable_detail(
+    detail_by_value: dict[str, dict[str, object]],
+    *,
+    value: str,
+    kind: str,
+    provenance_class: str,
+    evidence: dict[str, object],
+) -> None:
+    """Record first-seen structured detail for a deliverable value."""
+    if not value or value in detail_by_value:
+        return
+    detail_by_value[value] = build_deliverable_detail(
+        value,
+        kind=kind,
+        provenance_class=provenance_class,
+        evidence=evidence,
+    )
+
+
+def _ordered_deliverable_details(
+    deliverables: list[str],
+    detail_by_value: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """Project structured details into legacy order and fill any missing entries."""
+    return project_deliverable_details(
+        deliverables,
+        detail_by_value,
+        fallback_evidence={"source": "projection_fallback"},
+    )
+
+
+def _as_int(value: object) -> int | None:
+    """Return integer token counters without accepting bools or lossy floats."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
 
 # Regex to extract `--repo OWNER/REPO` from a `gh` command string.
 # Used to learn the target repo for `gh pr merge`/`gh pr view` so we can
@@ -258,6 +303,7 @@ def extract_signals(msgs: list[dict]) -> dict:
     retry_candidates: list[str] = []
     timestamps: list[datetime] = []
     steps = 0  # number of assistant turns that yielded to await tool results
+    detail_by_value: dict[str, dict[str, object]] = {}
 
     # Track recent (tool, path) pairs for retry detection
     recent_sigs: list[str] = []
@@ -290,6 +336,13 @@ def extract_signals(msgs: list[dict]) -> dict:
                     if path:
                         if "/journal/" not in path:
                             file_writes.append(path)
+                            _record_deliverable_detail(
+                                detail_by_value,
+                                value=path,
+                                kind="file",
+                                provenance_class="tool_authored",
+                                evidence={"source": "trajectory", "tool_name": tool},
+                            )
                             sig = f"{tool}:{path}"
                             if sig in recent_sigs:
                                 retry_candidates.append(tool)
@@ -322,7 +375,15 @@ def extract_signals(msgs: list[dict]) -> dict:
             for commit_match in _COMMIT_RE.finditer(content[:500]):
                 commit_hash = commit_match.group(1)
                 commit_msg = commit_match.group(2).strip()
-                git_commits.append(f"{commit_msg} ({commit_hash})")
+                commit_value = f"{commit_msg} ({commit_hash})"
+                git_commits.append(commit_value)
+                _record_deliverable_detail(
+                    detail_by_value,
+                    value=commit_value,
+                    kind="commit",
+                    provenance_class="session_committed",
+                    evidence={"source": "trajectory", "tool_name": "shell"},
+                )
 
     # Session duration
     duration_s = 0
@@ -331,6 +392,7 @@ def extract_signals(msgs: list[dict]) -> dict:
 
     # Combine deliverables: git commits + distinct file writes
     deliverables = list(dict.fromkeys(git_commits + file_writes))
+    deliverable_details = _ordered_deliverable_details(deliverables, detail_by_value)
     retry_count = len(retry_candidates)
 
     return {
@@ -343,6 +405,7 @@ def extract_signals(msgs: list[dict]) -> dict:
         "session_duration_s": duration_s,
         "retry_count": retry_count,
         "deliverables": deliverables,
+        "deliverable_details": deliverable_details,
     }
 
 
@@ -368,9 +431,14 @@ def grade_signals(signals: dict, *, category: str | None = None) -> float:
         signals: Raw signal dict from extract_signals* functions.
         category: Optional session category hint. When the category is one
             where commits are not the primary output (monitoring, research,
-            triage, social, self-review), the threshold for the 0.55 reward
-            tier is lowered from 3 effective writes to 1, preventing
-            productive review/triage sessions from being floor-graded.
+            triage, social, self-review), two adjustments apply:
+            1. The threshold for the 0.55 reward tier is lowered from 3
+               effective writes to 1, preventing productive review/triage
+               sessions from being floor-graded.
+            2. Tool-active sessions with no writes or interactions get a
+               neutral 0.35 floor instead of 0.25, treating "correctly found
+               no work" scans as non-failures even when errors > 0 (e.g. gh
+               CLI returning non-zero for "no results found").
     """
     commits = len(signals["git_commits"])
     # Use unique writes for tier placement — repeated edits to the same file
@@ -406,12 +474,23 @@ def grade_signals(signals: dict, *, category: str | None = None) -> float:
     # Categories where gh_interactions and file_writes are the PRIMARY output,
     # not commits. For these, a single useful interaction is sufficient for the
     # 0.55 "active" tier — don't floor-grade productive review/triage sessions.
-    _NON_COMMIT_CATS = {"monitoring", "research", "triage", "social", "self-review"}
+    _NON_COMMIT_CATS = {"pm-react", "research", "triage", "social", "self-review"}
     is_non_commit_category = category in _NON_COMMIT_CATS
 
     if effective_units == 0 and writes == 0 and gh_interactions == 0:
         # Distinguish dead sessions (zero tool calls) from active-but-unproductive ones
-        reward = 0.10 if total_tools == 0 else 0.25
+        if total_tools == 0:
+            reward = 0.10
+        elif is_non_commit_category:
+            # Non-commit categories (monitoring, triage, social, self-review, research)
+            # that ran tools but produced no writes/interactions are likely "correctly
+            # found no work" sessions, not failures. Give a neutral grade instead of
+            # the 0.25 floor — even when errors > 0. Errors in these categories often
+            # come from gh CLI commands returning non-zero for "no results found" or
+            # transient API issues, not actual session failures.
+            reward = 0.35
+        else:
+            reward = 0.25
     elif effective_units == 0:
         effective_writes = writes + gh_interactions
         # Non-commit categories: any interaction clears the 0.55 tier floor.
@@ -519,6 +598,7 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
     # PR number extracted from `gh pr merge <N>` command (may be absent if the
     # command used `gh pr merge` without an explicit number). Keyed by tool_use_id.
     _pr_merge_num_by_tool_id: dict[str, int] = {}
+    detail_by_value: dict[str, dict[str, object]] = {}
 
     for record in msgs:
         rec_type = record.get("type", "")
@@ -563,6 +643,13 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
                     if path:
                         if "/journal/" not in path:
                             file_writes.append(path)
+                            _record_deliverable_detail(
+                                detail_by_value,
+                                value=path,
+                                kind="file",
+                                provenance_class="tool_authored",
+                                evidence={"source": "trajectory", "tool_name": tool},
+                            )
                             sig = f"{tool}:{path}"
                             if sig in recent_sigs:
                                 retry_candidates.append(tool)
@@ -739,8 +826,16 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
                         if commit_hash in _all_direct_commit_hashes:
                             continue  # already seen in an earlier tool result
                         commit_msg = commit_match.group(2).strip()
-                        git_commits.append(f"{commit_msg} ({commit_hash})")
+                        commit_value = f"{commit_msg} ({commit_hash})"
+                        git_commits.append(commit_value)
                         _all_direct_commit_hashes.add(commit_hash)
+                        _record_deliverable_detail(
+                            detail_by_value,
+                            value=commit_value,
+                            kind="commit",
+                            provenance_class="session_committed",
+                            evidence={"source": "trajectory", "tool_name": "Bash"},
+                        )
 
                     # Background bash tasks: when CC runs a command in background mode,
                     # the tool result only contains a pointer to an output file like:
@@ -756,8 +851,20 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
                                 if commit_hash in _all_direct_commit_hashes:
                                     continue  # already captured from a direct result
                                 commit_msg = commit_match.group(2).strip()
-                                git_commits.append(f"{commit_msg} ({commit_hash})")
+                                commit_value = f"{commit_msg} ({commit_hash})"
+                                git_commits.append(commit_value)
                                 _all_direct_commit_hashes.add(commit_hash)
+                                _record_deliverable_detail(
+                                    detail_by_value,
+                                    value=commit_value,
+                                    kind="commit",
+                                    provenance_class="session_committed",
+                                    evidence={
+                                        "source": "trajectory",
+                                        "tool_name": "Bash",
+                                        "background": True,
+                                    },
+                                )
                         except OSError:
                             pass  # File may not exist if session ran on a different host
 
@@ -777,6 +884,17 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
                         for merge_match in _PR_MERGE_RE.finditer(result_str):
                             pr_num = merge_match.group(1)
                             pr_merges.append(f"PR #{pr_num}")
+                            _record_deliverable_detail(
+                                detail_by_value,
+                                value=f"merge PR #{pr_num}",
+                                kind="pull_request",
+                                provenance_class="session_committed",
+                                evidence={
+                                    "source": "trajectory",
+                                    "tool_name": "Bash",
+                                    "action": "gh_pr_merge",
+                                },
+                            )
                             # Prefer repo extracted from the command itself;
                             # do NOT overwrite context captured earlier from
                             # the gh pr create URL output.
@@ -857,6 +975,13 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
         commit_entry = f"merge-commit ({sha})"
         if commit_entry not in git_commits:
             git_commits.append(commit_entry)
+        _record_deliverable_detail(
+            detail_by_value,
+            value=commit_entry,
+            kind="merge_commit",
+            provenance_class="server_generated",
+            evidence={"source": "gh_api", "action": "gh_pr_merge"},
+        )
 
     # pr_merges entries in deliverables: "merge PR #N" format for readability.
     # git_commits now includes any resolved merge SHAs from the loop above, so
@@ -864,6 +989,7 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
     deliverables = list(
         dict.fromkeys(git_commits + [f"merge {m}" for m in pr_merges] + file_writes)
     )
+    deliverable_details = _ordered_deliverable_details(deliverables, detail_by_value)
 
     # Summarize per-tool-call timing: total and max per tool name.
     # Enables detection of slow tests, long pre-commit hooks, and stalled tools.
@@ -896,7 +1022,80 @@ def extract_signals_cc(msgs: list[dict]) -> dict:
         "issues_created": issues_created,
         "ci_fixed": ci_fixed,
         "deliverables": deliverables,
+        "deliverable_details": deliverable_details,
     }
+
+
+def _message_content_bytes(msg: dict) -> int:
+    """Count UTF-8 bytes of message content (model-independent)."""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        return sum(len(json.dumps(block, ensure_ascii=False).encode("utf-8")) for block in content)
+    if isinstance(content, str):
+        return len(content.encode("utf-8"))
+    return len(str(content).encode("utf-8"))
+
+
+def _content_bytes(value: object) -> int:
+    """Count UTF-8 bytes for arbitrary event payload content."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, list):
+        return sum(_content_bytes(item) for item in value)
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _summarize_message_bytes(
+    messages: list[dict[str, object]],
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Summarize byte-level context growth from normalized message entries."""
+    if not messages:
+        return None, None, None, None
+
+    sys_prompt_bytes = 0
+    for msg in messages:
+        role = msg.get("role")
+        msg_bytes = msg.get("bytes")
+        if not isinstance(msg_bytes, int):
+            continue
+        if role == "user":
+            break
+        if role == "system":
+            sys_prompt_bytes += msg_bytes
+
+    first_turn_bytes = 0
+    for msg in messages:
+        msg_bytes = msg.get("bytes")
+        if not isinstance(msg_bytes, int):
+            continue
+        if msg.get("role") == "assistant":
+            break
+        first_turn_bytes += msg_bytes
+
+    context_peak_bytes = 0
+    cumulative = 0
+    for msg in messages:
+        msg_bytes = msg.get("bytes")
+        if not isinstance(msg_bytes, int):
+            continue
+        cumulative += msg_bytes
+        if msg.get("role") == "assistant":
+            context_before = cumulative - msg_bytes
+            if context_before > context_peak_bytes:
+                context_peak_bytes = context_before
+
+    session_total_bytes = sum(
+        msg_bytes for msg in messages if isinstance((msg_bytes := msg.get("bytes")), int)
+    )
+
+    return (
+        sys_prompt_bytes if sys_prompt_bytes > 0 else None,
+        first_turn_bytes if first_turn_bytes > 0 else None,
+        context_peak_bytes if context_peak_bytes > 0 else None,
+        session_total_bytes if session_total_bytes > 0 else None,
+    )
 
 
 def extract_usage_gptme(msgs: list[dict]) -> dict:
@@ -916,6 +1115,52 @@ def extract_usage_gptme(msgs: list[dict]) -> dict:
     cache_creation_tokens = 0
     cost = 0.0
     model: str | None = None
+    sys_prompt_tokens: int | None = None
+    context_peak_tokens: int | None = None
+
+    # --- Byte-level metrics (model-independent; ErikBjare/bob#738) ---
+    sys_prompt_bytes: int | None = None
+    first_turn_bytes: int | None = None
+    context_peak_bytes: int | None = None
+    session_total_bytes: int | None = None
+
+    _sys_b = 0
+    _first_turn_b = 0
+    _peak_b = 0
+    _cumulative_b = 0
+    _total_b = 0
+    _first_assistant_seen = False
+    _first_user_seen = False
+    for msg in msgs:
+        role = msg.get("role")
+        if role is None:
+            continue
+        _cb = _message_content_bytes(msg)
+        _total_b += _cb
+        _cumulative_b += _cb
+        if not _first_user_seen:
+            if role == "user":
+                _first_user_seen = True
+            elif role == "system":
+                _sys_b += _cb
+        if not _first_assistant_seen:
+            if role == "assistant":
+                _first_assistant_seen = True
+            else:
+                _first_turn_b += _cb
+        if role == "assistant":
+            context_before = _cumulative_b - _cb
+            if context_before > _peak_b:
+                _peak_b = context_before
+
+    if _sys_b > 0:
+        sys_prompt_bytes = _sys_b
+    if _first_turn_b > 0:
+        first_turn_bytes = _first_turn_b
+    if _peak_b > 0:
+        context_peak_bytes = _peak_b
+    if _total_b > 0:
+        session_total_bytes = _total_b
 
     for msg in msgs:
         if msg.get("role") != "assistant":
@@ -933,14 +1178,29 @@ def extract_usage_gptme(msgs: list[dict]) -> dict:
         # Support both nested format (usage sub-dict) and legacy flat format
         # Select source dict once per message to avoid per-field falsy fallback issues
         usage = metadata.get("usage") or metadata
-        input_tokens += usage.get("input_tokens", 0)
-        output_tokens += usage.get("output_tokens", 0)
-        cache_read_tokens += usage.get("cache_read_tokens", 0)
-        cache_creation_tokens += usage.get("cache_creation_tokens", 0)
+        turn_input = _as_int(usage.get("input_tokens")) or 0
+        turn_output = _as_int(usage.get("output_tokens")) or 0
+        turn_cache_read = _as_int(usage.get("cache_read_tokens")) or 0
+        turn_cache_create = _as_int(usage.get("cache_creation_tokens")) or 0
+        turn_context = turn_input + turn_cache_read + turn_cache_create
+
+        input_tokens += turn_input
+        output_tokens += turn_output
+        cache_read_tokens += turn_cache_read
+        cache_creation_tokens += turn_cache_create
+        if sys_prompt_tokens is None and turn_context > 0:
+            sys_prompt_tokens = turn_context
+        context_peak_tokens = (
+            turn_context if context_peak_tokens is None else max(context_peak_tokens, turn_context)
+        )
         cost += metadata.get("cost", 0.0)
 
     total_tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
-    if total_tokens == 0 and cost == 0.0:
+    has_byte_metrics = any(
+        v is not None
+        for v in (sys_prompt_bytes, first_turn_bytes, context_peak_bytes, session_total_bytes)
+    )
+    if total_tokens == 0 and cost == 0.0 and not has_byte_metrics:
         return {}
     return {
         "model": model,
@@ -950,6 +1210,12 @@ def extract_usage_gptme(msgs: list[dict]) -> dict:
         "cache_creation_tokens": cache_creation_tokens,
         "cost": cost,
         "total_tokens": total_tokens,
+        "sys_prompt_tokens": sys_prompt_tokens,
+        "context_peak_tokens": context_peak_tokens,
+        "sys_prompt_bytes": sys_prompt_bytes,
+        "first_turn_bytes": first_turn_bytes,
+        "context_peak_bytes": context_peak_bytes,
+        "session_total_bytes": session_total_bytes,
     }
 
 
@@ -975,16 +1241,32 @@ def extract_usage_cc(msgs: list[dict]) -> dict:
     cache_creation_tokens = 0
     cache_read_tokens = 0
     model: str | None = None
+    sys_prompt_tokens: int | None = None
+    context_peak_tokens: int | None = None
 
     for record in msgs:
         if record.get("type") != "assistant":
             continue
         msg = record.get("message", {})
         usage = msg.get("usage") or {}
-        input_tokens += usage.get("input_tokens", 0)
-        output_tokens += usage.get("output_tokens", 0)
-        cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
-        cache_read_tokens += usage.get("cache_read_input_tokens", 0)
+        turn_input = _as_int(usage.get("input_tokens")) or 0
+        turn_output = _as_int(usage.get("output_tokens")) or 0
+        turn_cache_create = _as_int(usage.get("cache_creation_input_tokens")) or 0
+        turn_cache_read = _as_int(usage.get("cache_read_input_tokens")) or 0
+        turn_context = turn_input + turn_cache_create + turn_cache_read
+
+        input_tokens += turn_input
+        output_tokens += turn_output
+        cache_creation_tokens += turn_cache_create
+        cache_read_tokens += turn_cache_read
+        if usage and sys_prompt_tokens is None:
+            sys_prompt_tokens = turn_context
+        if usage:
+            context_peak_tokens = (
+                turn_context
+                if context_peak_tokens is None
+                else max(context_peak_tokens, turn_context)
+            )
         if msg.get("model"):
             model = msg["model"]
 
@@ -999,6 +1281,8 @@ def extract_usage_cc(msgs: list[dict]) -> dict:
         "cache_creation_tokens": cache_creation_tokens,
         "cache_read_tokens": cache_read_tokens,
         "total_tokens": total_tokens,
+        "sys_prompt_tokens": sys_prompt_tokens,
+        "context_peak_tokens": context_peak_tokens,
     }
 
 
@@ -1026,6 +1310,7 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
     timestamps: list[datetime] = []
     steps = 0
     recent_sigs: list[str] = []
+    detail_by_value: dict[str, dict[str, object]] = {}
 
     # Track function_call ids for matching with their outputs
     call_id_to_name: dict[str, str] = {}
@@ -1069,6 +1354,13 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
                             journal_paths.append(path)
                         else:
                             file_writes.append(path)
+                            _record_deliverable_detail(
+                                detail_by_value,
+                                value=path,
+                                kind="file",
+                                provenance_class="tool_authored",
+                                evidence={"source": "trajectory", "tool_name": "apply_patch"},
+                            )
                             sig = f"apply_patch:{path}"
                             if sig in recent_sigs:
                                 retry_candidates.append("apply_patch")
@@ -1108,6 +1400,16 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
                                     journal_paths.append(path)
                                 else:
                                     file_writes.append(path)
+                                    _record_deliverable_detail(
+                                        detail_by_value,
+                                        value=path,
+                                        kind="file",
+                                        provenance_class="tool_authored",
+                                        evidence={
+                                            "source": "trajectory",
+                                            "tool_name": "exec_command",
+                                        },
+                                    )
                                     sig = f"exec_command:{path}"
                                     if sig in recent_sigs:
                                         retry_candidates.append("exec_command")
@@ -1137,7 +1439,15 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
                     for commit_match in _COMMIT_RE.finditer(output[:8000]):
                         commit_hash = commit_match.group(1)
                         commit_msg = commit_match.group(2).strip()
-                        git_commits.append(f"{commit_msg} ({commit_hash})")
+                        commit_value = f"{commit_msg} ({commit_hash})"
+                        git_commits.append(commit_value)
+                        _record_deliverable_detail(
+                            detail_by_value,
+                            value=commit_value,
+                            kind="commit",
+                            provenance_class="session_committed",
+                            evidence={"source": "trajectory", "tool_name": tool_name},
+                        )
 
     # Finalize the last turn (not followed by another turn_context)
     if current_turn_has_tool:
@@ -1148,6 +1458,7 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
         duration_s = int((max(timestamps) - min(timestamps)).total_seconds())
 
     deliverables = list(dict.fromkeys(git_commits + file_writes))
+    deliverable_details = _ordered_deliverable_details(deliverables, detail_by_value)
     return {
         "tool_calls": tool_calls,
         "steps": steps,
@@ -1158,6 +1469,7 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
         "session_duration_s": duration_s,
         "retry_count": len(retry_candidates),
         "deliverables": deliverables,
+        "deliverable_details": deliverable_details,
     }
 
 
@@ -1185,6 +1497,7 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
     timestamps: list[datetime] = []
     steps = 0
     recent_sigs: list[str] = []
+    detail_by_value: dict[str, dict[str, object]] = {}
 
     # Map toolCallId → tool name for filtering commit detection to bash only
     call_id_to_name: dict[str, str] = {}
@@ -1227,6 +1540,13 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
                     if path:
                         if "/journal/" not in path:
                             file_writes.append(path)
+                            _record_deliverable_detail(
+                                detail_by_value,
+                                value=path,
+                                kind="file",
+                                provenance_class="tool_authored",
+                                evidence={"source": "trajectory", "tool_name": tool},
+                            )
                             sig = f"{tool}:{path}"
                             if sig in recent_sigs:
                                 retry_candidates.append(tool)
@@ -1256,7 +1576,15 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
                     for commit_match in _COMMIT_RE.finditer(content[:500]):
                         commit_hash = commit_match.group(1)
                         commit_msg = commit_match.group(2).strip()
-                        git_commits.append(f"{commit_msg} ({commit_hash})")
+                        commit_value = f"{commit_msg} ({commit_hash})"
+                        git_commits.append(commit_value)
+                        _record_deliverable_detail(
+                            detail_by_value,
+                            value=commit_value,
+                            kind="commit",
+                            provenance_class="session_committed",
+                            evidence={"source": "trajectory", "tool_name": "bash"},
+                        )
 
         elif rec_type == "session.error":
             error_count += 1
@@ -1266,6 +1594,7 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
         duration_s = int((max(timestamps) - min(timestamps)).total_seconds())
 
     deliverables = list(dict.fromkeys(git_commits + file_writes))
+    deliverable_details = _ordered_deliverable_details(deliverables, detail_by_value)
     return {
         "tool_calls": tool_calls,
         "steps": steps,
@@ -1276,20 +1605,24 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
         "session_duration_s": duration_s,
         "retry_count": len(retry_candidates),
         "deliverables": deliverables,
+        "deliverable_details": deliverable_details,
     }
 
 
 def extract_usage_codex(msgs: list[dict]) -> dict:
-    """Extract model and rate-limit info from Codex CLI trajectories.
-
-    Codex only provides rate-limit percentages (not absolute token counts).
-    We extract the model name and last-seen rate limit usage for reference.
+    """Extract model, token, and rate-limit info from Codex CLI trajectories.
 
     Returns an empty dict if no model/usage data is found.
+    Omits the ``model`` key when usage data exists but the model was never
+    surfaced in a ``turn_context`` record.
     """
     model: str | None = None
     rate_limit_primary: float | None = None
     rate_limit_secondary: float | None = None
+    sys_prompt_tokens: int | None = None
+    context_peak_tokens: int | None = None
+    context_window: int | None = None
+    final_total: dict | None = None
 
     for record in msgs:
         rec_type = record.get("type", "")
@@ -1302,6 +1635,24 @@ def extract_usage_codex(msgs: list[dict]) -> dict:
         elif rec_type == "event_msg":
             payload = record.get("payload") or {}
             if payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                if isinstance(info, dict):
+                    last = info.get("last_token_usage")
+                    if isinstance(last, dict):
+                        turn_input = _as_int(last.get("input_tokens"))
+                        if turn_input is not None:
+                            if sys_prompt_tokens is None:
+                                sys_prompt_tokens = turn_input
+                            context_peak_tokens = (
+                                turn_input
+                                if context_peak_tokens is None
+                                else max(context_peak_tokens, turn_input)
+                            )
+                    total = info.get("total_token_usage")
+                    if isinstance(total, dict):
+                        final_total = total
+                    context_window = _as_int(info.get("model_context_window")) or context_window
+
                 rl = payload.get("rate_limits") or {}
                 primary = rl.get("primary") or {}
                 secondary = rl.get("secondary") or {}
@@ -1310,13 +1661,40 @@ def extract_usage_codex(msgs: list[dict]) -> dict:
                 if secondary.get("used_percent") is not None:
                     rate_limit_secondary = secondary["used_percent"]
 
-    if model is None:
+    if (
+        model is None
+        and rate_limit_primary is None
+        and rate_limit_secondary is None
+        and final_total is None
+        and context_peak_tokens is None
+    ):
         return {}
-    result: dict = {"model": model}
+    result: dict = {}
+    if model is not None:
+        result["model"] = model
     if rate_limit_primary is not None:
         result["rate_limit_primary_pct"] = rate_limit_primary
     if rate_limit_secondary is not None:
         result["rate_limit_secondary_pct"] = rate_limit_secondary
+    if final_total is not None:
+        input_tokens = _as_int(final_total.get("input_tokens"))
+        output_tokens = _as_int(final_total.get("output_tokens"))
+        cached_input_tokens = _as_int(final_total.get("cached_input_tokens"))
+        total_tokens = _as_int(final_total.get("total_tokens"))
+        if input_tokens is not None:
+            result["input_tokens"] = input_tokens
+        if output_tokens is not None:
+            result["output_tokens"] = output_tokens
+        if cached_input_tokens is not None:
+            result["cached_input_tokens"] = cached_input_tokens
+        if total_tokens is not None:
+            result["total_tokens"] = total_tokens
+    if sys_prompt_tokens is not None:
+        result["sys_prompt_tokens"] = sys_prompt_tokens
+    if context_peak_tokens is not None:
+        result["context_peak_tokens"] = context_peak_tokens
+    if context_window is not None:
+        result["context_window"] = context_window
     return result
 
 
@@ -1495,6 +1873,28 @@ def infer_category(signals: dict) -> str | None:
     }
 
     # Scope overrides: certain scopes imply category regardless of prefix
+    # Canonical CASCADE categories — used for scope→self fallback below
+    CASCADE_CATEGORIES = frozenset(
+        {
+            "code",
+            "infrastructure",
+            "content",
+            "triage",
+            "cross-repo",
+            "self-review",
+            "strategic",
+            "research",
+            "monitoring",
+            "social",
+            "news",
+            "cleanup",
+            "pm-react",
+            "knowledge",
+            "coordination",
+            "novelty",
+        }
+    )
+
     scope_to_category = {
         "lessons": "knowledge",
         "lesson": "knowledge",
@@ -1517,6 +1917,11 @@ def infer_category(signals: dict) -> str | None:
         if cat:
             # Scope signals are stronger than prefix alone
             votes[cat] = votes.get(cat, 0) + count * 2
+        elif scope in CASCADE_CATEGORIES:
+            # Unknown scopes that match a valid CASCADE category → self-map
+            # This catches strategic/research/monitoring/social/news/self-review
+            # scopes that would otherwise fall through to the prefix vote only.
+            votes[scope] = votes.get(scope, 0) + count * 2
     for cat, count in path_signals.items():
         votes[cat] = votes.get(cat, 0) + count
 
@@ -1526,7 +1931,7 @@ def infer_category(signals: dict) -> str | None:
     # that post one incidental comment while doing something else.
     # Checked before vote count so commit-free review sessions aren't left uncategorised.
     if signals.get("gh_interactions", 0) >= 2 and not commits and not file_writes:
-        return "monitoring"
+        return "pm-react"
 
     if not votes:
         return None
@@ -1539,33 +1944,92 @@ def infer_category(signals: dict) -> str | None:
 
 
 def extract_usage_copilot(msgs: list[dict]) -> dict:
-    """Extract model info from Copilot CLI events.jsonl trajectories.
+    """Extract model info, byte-level context metrics, and output tokens from Copilot trajectories.
 
-    Copilot events do not include per-turn token counts or cost data.
-    We extract the model name from ``session.model_change`` events (or
-    from ``session.start`` context if available) so callers always get a
-    consistent ``{"model": ...}`` dict across all harnesses.
+    Copilot events expose ``outputTokens`` per assistant turn but not input tokens,
+    so ``sys_prompt_tokens`` / ``context_peak_tokens`` remain unavailable; callers
+    should fall back to byte-level estimates for those.  We sum ``outputTokens``
+    across all assistant messages to populate ``output_tokens``.
 
-    Returns an empty dict if no model information is found.
+    Model is extracted from ``session.model_change`` events (or ``session.start``).
+    Tool requests live on assistant messages and tool outputs live on
+    ``tool.execution_complete`` events, so both are counted in the byte-level
+    message flow to avoid underestimating context growth.
+
+    Returns an empty dict only when neither model info nor byte metrics are found.
     """
     model: str | None = None
+    messages: list[dict[str, object]] = []
+    total_output_tokens = 0
 
     for record in msgs:
         rec_type = record.get("type", "")
+        data = record.get("data") or {}
+        if not isinstance(data, dict):
+            continue
         if rec_type == "session.model_change":
-            m = (record.get("data") or {}).get("newModel")
+            m = data.get("newModel")
             if m:
                 model = m
         elif rec_type == "session.start" and model is None:
             # Some versions may include model in start context
-            data = record.get("data") or {}
             m = data.get("selectedModel")
             if m:
                 model = m
 
-    if model is None:
+        if rec_type == "system.message":
+            messages.append({"role": "system", "bytes": _content_bytes(data.get("content"))})
+        elif rec_type == "user.message":
+            content = data.get("content")
+            if content is None:
+                content = data.get("text")
+            messages.append({"role": "user", "bytes": _content_bytes(content)})
+        elif rec_type == "assistant.message":
+            content = data.get("content")
+            if content is None:
+                content = data.get("text")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "bytes": _content_bytes(content) + _content_bytes(data.get("toolRequests")),
+                }
+            )
+            tok = data.get("outputTokens")
+            if isinstance(tok, int) and tok > 0:
+                total_output_tokens += tok
+        elif rec_type == "tool.execution_complete":
+            payload = data.get("result")
+            if payload is None:
+                payload = data.get("error")
+            messages.append({"role": "tool", "bytes": _content_bytes(payload)})
+
+    sys_prompt_bytes, first_turn_bytes, context_peak_bytes, session_total_bytes = (
+        _summarize_message_bytes(messages)
+    )
+    if (
+        model is None
+        and sys_prompt_bytes is None
+        and first_turn_bytes is None
+        and context_peak_bytes is None
+        and session_total_bytes is None
+        and total_output_tokens == 0
+    ):
         return {}
-    return {"model": model}
+
+    usage: dict[str, object] = {}
+    if model is not None:
+        usage["model"] = model
+    if sys_prompt_bytes is not None:
+        usage["sys_prompt_bytes"] = sys_prompt_bytes
+    if first_turn_bytes is not None:
+        usage["first_turn_bytes"] = first_turn_bytes
+    if context_peak_bytes is not None:
+        usage["context_peak_bytes"] = context_peak_bytes
+    if session_total_bytes is not None:
+        usage["session_total_bytes"] = session_total_bytes
+    if total_output_tokens > 0:
+        usage["output_tokens"] = total_output_tokens
+    return usage
 
 
 def extract_from_path(jsonl_path: Path) -> dict:

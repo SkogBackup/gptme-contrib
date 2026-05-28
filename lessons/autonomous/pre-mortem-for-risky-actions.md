@@ -1,20 +1,19 @@
 ---
+description: "Before taking irreversible or high-blast-radius actions, name what could go wrong and verify safeguards are in place"
 match:
   keywords:
   - pre-mortem for risky actions
-  - "about to delete or remove files"
   - "force push or destructive git operation"
   - "modifying production infrastructure"
   - "risk assessment before action"
   - "what could go wrong with this change"
-  - "destructive operation"
   - "irreversible change"
   - "force push"
   - "rm -rf"
   - "DROP TABLE"
   - "production change"
   session_categories: [code, infrastructure, cleanup]
-target_grade: harm
+target_grade: alignment
 status: active
 ---
 
@@ -31,7 +30,6 @@ Actions that warrant a pre-mortem:
 - `git push --force`, `git reset --hard`, `rm -rf`
 - Modifying systemd services or cron jobs
 - Changing environment variables or secrets
-- Bulk operations (deleting multiple files, tasks, branches)
 - Database migrations or schema changes
 - Modifying pre-commit hooks or CI config
 
@@ -51,6 +49,15 @@ Actions that warrant a pre-mortem:
 # 4. Backup: N/A (reflog is backup) → ok
 # 5. Target: only task/job-* pattern → verify pattern
 ```
+
+## Procedure
+The Pattern above is a mental checklist — these steps are how you execute it:
+
+1. **Name the target and blast radius** — state exactly what will change and what the failure would break.
+2. **Choose a verification surface before acting** — identify a dry-run, target listing, or equivalent read-only command that shows whether you are aimed at the right thing.
+3. **Choose a rollback path before acting** — name the concrete undo path (`git reflog`, backup restore, service restart, config revert) before the risky command runs.
+4. **Run the verification surface and inspect it** — if the output does not match intent, abort: document the mismatch in your journal and surface it as a task blocker rather than proceeding.
+5. **Execute only after the checks pass** — perform the risky action, then immediately verify post-action state and use the rollback path if the result is wrong.
 
 ## Outcome
 Following this pattern leads to:

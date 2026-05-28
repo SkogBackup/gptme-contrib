@@ -23,6 +23,7 @@ import contextvars
 import logging
 import os
 import re
+import shutil
 from copy import copy
 from pathlib import Path
 from typing import (
@@ -55,6 +56,7 @@ from gptme.telemetry import init_telemetry, shutdown_telemetry
 from gptme.tools import (
     ToolSpec,
     ToolUse,
+    clear_tools,
     get_tools,
     init_tools,
 )
@@ -69,7 +71,7 @@ DISCORD_MSG_LIMIT = 2000
 ChannelID: TypeAlias = int
 CommandPrefix = str | Callable[..., str]  # Type for command prefix
 Settings: TypeAlias = Dict[ChannelID, "ChannelSettings"]
-Conversations: TypeAlias = Dict[ChannelID, Log]
+Conversations: TypeAlias = Dict[ChannelID, LogManager]
 
 # Global state with type hints
 conversations: Conversations = {}  # channel_id -> conversation log
@@ -95,10 +97,16 @@ conversation_tracker = ConversationTracker(state_dir)
 metrics = MetricsCollector()
 
 # Basic tools only for testing
-tool_allowlist = frozenset(["read", "save", "append", "patch", "shell"])
-# tool_allowlist = ["read", "save", "append", "patch", "shell", "ipython", "browser"]
+DEFAULT_TOOL_ALLOWLIST: tuple[str, ...] = (
+    "read",
+    "save",
+    "append",
+    "patch",
+    "shell",
+)
+# DEFAULT_TOOL_ALLOWLIST = ("read", "save", "append", "patch", "shell", "ipython", "browser")
 
-tools: list[ToolSpec] = []
+default_tools: list[ToolSpec] = []
 
 # Load environment variables
 env_files = [".env", ".env.discord"]
@@ -230,6 +238,7 @@ async def async_step(
     log: Log,
     channel_id: int,
     channel: discord.abc.Messageable,
+    tool_allowlist: tuple[str, ...],
 ) -> AsyncGenerator[Message, None]:
     """Async wrapper around gptme.chat.step that supports multiple tool executions."""
 
@@ -264,13 +273,15 @@ async def async_step(
     # This is needed because run_in_executor doesn't propagate ContextVars to thread pool workers
     ctx = contextvars.copy_context()
 
+    # Rebuild the tool context once per request so narrower allowlists do not
+    # inherit tools from a broader startup context.
+    await loop.run_in_executor(
+        None,
+        lambda: ctx.run(load_tools_for_allowlist, tool_allowlist),
+    )
+
     while True:
         try:
-            # init tools in async thread with copied context
-            await loop.run_in_executor(
-                None, lambda: ctx.run(init_tools, list(tool_allowlist))
-            )
-
             # debug
             # print("\n---\n".join([f"{msg.role} - {msg.content[:20]}..." for msg in current_log]))
 
@@ -372,9 +383,49 @@ def get_settings(channel_id: ChannelID) -> ChannelSettings:
     return channel_settings[channel_id]
 
 
-def get_conversation(channel_id: ChannelID) -> Log:
+def load_tools_for_allowlist(tool_allowlist: tuple[str, ...]) -> list[ToolSpec]:
+    """Return the exact tool set for an allowlist in the current context."""
+    clear_tools()
+    init_tools(list(tool_allowlist))
+    loaded_tools = list(get_tools())
+    if not loaded_tools:
+        raise RuntimeError(
+            f"No tools loaded for allowlist: {', '.join(tool_allowlist) or '(empty)'}"
+        )
+    return loaded_tools
+
+
+def get_prompt_tools_for_allowlist(tool_allowlist: tuple[str, ...]) -> list[ToolSpec]:
+    """Resolve prompt tool descriptions without mutating the caller's context."""
+    if default_tools and tool_allowlist == DEFAULT_TOOL_ALLOWLIST:
+        return list(default_tools)
+
+    ctx = contextvars.copy_context()
+    return ctx.run(load_tools_for_allowlist, tool_allowlist)
+
+
+async def get_prompt_tools_for_allowlist_async(
+    tool_allowlist: tuple[str, ...],
+) -> list[ToolSpec]:
+    """Resolve prompt tool descriptions without blocking the event loop."""
+    if default_tools and tool_allowlist == DEFAULT_TOOL_ALLOWLIST:
+        return list(default_tools)
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: get_prompt_tools_for_allowlist(tool_allowlist),
+    )
+
+
+def is_trusted_user_name(user_name: str) -> bool:
+    """Return whether a Discord username currently has full bot access."""
+    return user_name.lower() in {"erikbjare"}
+
+
+def get_conversation(channel_id: ChannelID, prompt_tools: list[ToolSpec]) -> Log:
     """Get or create a conversation for a channel."""
-    initial_msgs = get_prompt(tools=tools)
+    initial_msgs = get_prompt(tools=prompt_tools)
     assert initial_msgs
 
     # Initialize a new conversation
@@ -382,20 +433,20 @@ def get_conversation(channel_id: ChannelID) -> Log:
         logpath = logsdir / str(channel_id)
         logpath.mkdir(parents=True, exist_ok=True)
         logger.info(f"Loading conversation log for channel {channel_id} ({logpath})")
-        # TODO: actually save conversations so there is something to load/resume, persisting tooluse responses across messages
         manager = LogManager.load(logpath, initial_msgs, create=True)
-        conversations[channel_id] = manager.log
+        conversations[channel_id] = manager
 
     # always keep system messages fresh
     # strip leading system messages, replace with initial_msgs
-    msgs = copy(conversations[channel_id].messages)
+    msgs = copy(conversations[channel_id].log.messages)
     while msgs and msgs[0].role == "system" and "<chat-history>" not in msgs[0].content:
         msgs.pop(0)
     for msg in reversed(initial_msgs):
         msgs.insert(0, msg)
 
     assert msgs
-    return Log(msgs)
+    conversations[channel_id].log = Log(msgs)
+    return conversations[channel_id].log
 
 
 def check_rate_limit(
@@ -442,7 +493,8 @@ async def handle_rate_limit(message: discord.Message) -> bool:
 
 
 def split_on_codeblocks(content: str, max_length: int = DISCORD_MSG_LIMIT) -> list[str]:
-    """Split content into parts, trying to keep code blocks intact."""
+    """Split content into parts, trying to keep code blocks intact and
+    respecting paragraph (double-newline) boundaries outside code blocks."""
     if len(content) <= max_length:
         return [content]
 
@@ -454,17 +506,36 @@ def split_on_codeblocks(content: str, max_length: int = DISCORD_MSG_LIMIT) -> li
     for i, block in enumerate(blocks):
         is_codeblock = i % 2 == 1
 
-        # Add code block markers
         if is_codeblock:
-            block = f"```{block}```"
-
-        # If adding this block would exceed limit, start new part
-        if len(current) + len(block) > max_length:
-            if current:
-                parts.append(current)
-            current = block
+            # Code block: keep intact with markers
+            sub_blocks = [f"```{block}```"]
         else:
-            current += block
+            # Text block: further split on paragraph boundaries (\n\n)
+            # to avoid single oversized text segments
+            tokens = re.split(r"(\n\n)", block)
+            sub_blocks = []
+            pending_sep = ""
+            for token in tokens:
+                if token == "":
+                    continue
+                if token == "\n\n":
+                    pending_sep += "\n\n"
+                else:
+                    sub_blocks.append(f"{pending_sep}{token}")
+                    pending_sep = ""
+            if pending_sep:
+                if sub_blocks:
+                    sub_blocks[-1] += pending_sep
+                else:
+                    sub_blocks.append(pending_sep)
+
+        for sub in sub_blocks:
+            if len(current) + len(sub) > max_length:
+                if current:
+                    parts.append(current)
+                current = sub
+            else:
+                current += sub
 
     if current:
         parts.append(current)
@@ -496,16 +567,22 @@ async def send_discord_message(
 
         # Handle messages that exceed Discord's limit
         if len(content) > DISCORD_MSG_LIMIT:
-            logger.warning(f"Message too long ({len(content)} chars), truncating")
-            await channel.send(
-                f"```diff\n- Message too long, truncating to {DISCORD_MSG_LIMIT} chars\n```"
-            )
-            content = content[:1997] + "..."
-
-        # Split long messages
-        if len(content) > DISCORD_MSG_LIMIT:
-            # TODO: split on codeblocks, and on \n\n outside codeblocks
+            # Try splitting first (respects codeblock/paragraph boundaries)
             parts = split_on_codeblocks(content)
+            if any(len(part) > DISCORD_MSG_LIMIT for part in parts):
+                # Oversized chunks can still happen for single huge codeblocks or paragraphs.
+                logger.warning(
+                    f"Message too long ({len(content)} chars) contains oversized chunks, truncating those chunks"
+                )
+                await channel.send(
+                    f"```diff\n- Message too long, truncating oversized chunks to {DISCORD_MSG_LIMIT} chars\n```"
+                )
+                parts = [
+                    part
+                    if len(part) <= DISCORD_MSG_LIMIT
+                    else part[: DISCORD_MSG_LIMIT - 3] + "..."
+                    for part in parts
+                ]
             for i, part in enumerate(parts):
                 logger.info(f"Sending part {i + 1}/{len(parts)} ({len(part)} chars)")
                 if current_response and i == 0:
@@ -741,8 +818,16 @@ async def checkperms(ctx: commands.Context) -> None:
 async def clear(ctx: commands.Context) -> None:
     """Clear the conversation history in this channel."""
     channel_id = ctx.channel.id
-    if channel_id in conversations:
+    logpath = logsdir / str(channel_id)
+    had_memory = channel_id in conversations
+    had_persisted = logpath.exists()
+
+    if had_memory:
         del conversations[channel_id]
+    if had_persisted:
+        shutil.rmtree(logpath)
+
+    if had_memory or had_persisted:
         await ctx.send("Conversation history cleared! Starting fresh.")
     else:
         await ctx.send("No conversation history to clear.")
@@ -753,13 +838,17 @@ async def status(ctx: commands.Context) -> None:
     """Show status of the current conversation."""
     channel_id = ctx.channel.id
     if channel_id in conversations:
-        log = conversations[channel_id]
+        log = conversations[channel_id].log
         msg_count = len(log)
         user_msgs = sum(1 for m in log if m.role == "user")
         assistant_msgs = sum(1 for m in log if m.role == "assistant")
 
         # Get current tools
-        tools_str = ", ".join(t.name for t in tools) if tools else "No tools loaded"
+        tools_str = (
+            ", ".join(t.name for t in default_tools)
+            if default_tools
+            else "No tools loaded"
+        )
 
         await ctx.send(
             f"Conversation status:\n"
@@ -890,13 +979,19 @@ async def handle_new_dm(message: discord.Message) -> None:
 async def process_conversation_step(
     message: discord.Message,
     channel_id: int,
+    tool_allowlist: tuple[str, ...],
     current_response: discord.Message | None = None,
 ) -> tuple[discord.Message | None, bool]:
     """Process a single conversation step."""
     had_error = False
     accumulated_content = ""
 
-    async for msg in async_step(conversations[channel_id], channel_id, message.channel):
+    async for msg in async_step(
+        conversations[channel_id].log,
+        channel_id,
+        message.channel,
+        tool_allowlist,
+    ):
         logger.info(f"Processing response msg: {msg}")
         (
             current_response,
@@ -906,11 +1001,13 @@ async def process_conversation_step(
         ) = await process_message(
             msg,
             message.channel,
-            conversations[channel_id],
+            conversations[channel_id].log,
             current_response,
             accumulated_content,
         )
-        conversations[channel_id] = updated_log
+        # Sync the updated log back through the LogManager and write to disk
+        conversations[channel_id].log = updated_log
+        conversations[channel_id].write()
         had_error = had_error or msg_error
 
     return current_response, had_error
@@ -945,7 +1042,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # Only allow trusted users (temporary security measure)
-    is_trusted = message.author.name.lower() in ["erikbjare"]
+    is_trusted = is_trusted_user_name(message.author.name)
     if not is_trusted:
         if is_mentioned:
             await message.channel.send(
@@ -963,9 +1060,12 @@ async def on_message(message: discord.Message) -> None:
         content = content.replace(f"<@{bot.user.id}>", "").strip()
         content = content.replace(f"<@!{bot.user.id}>", "").strip()
 
+    message_tool_allowlist = DEFAULT_TOOL_ALLOWLIST
+    prompt_tools = await get_prompt_tools_for_allowlist_async(message_tool_allowlist)
+
     # Initialize conversation
     channel_id = message.channel.id
-    log = get_conversation(channel_id)
+    log = get_conversation(channel_id, prompt_tools)
     logger.info(f"Lenght of log: {len(log)}")
 
     # Check if this is a new DM conversation by looking at message history
@@ -978,7 +1078,7 @@ async def on_message(message: discord.Message) -> None:
             return  # Don't process the message further, let the welcome message be the only response
 
     # Add user message to conversation (only if we're not showing the welcome message)
-    conversations[channel_id] = log.append(Message("user", content))
+    conversations[channel_id].append(Message("user", content))
 
     try:
         # Setup message processing
@@ -996,7 +1096,10 @@ async def on_message(message: discord.Message) -> None:
         current_response = None
         async with message.channel.typing():
             current_response, had_error = await process_conversation_step(
-                message, channel_id, current_response
+                message,
+                channel_id,
+                message_tool_allowlist,
+                current_response,
             )
 
         # Update reaction based on result
@@ -1049,27 +1152,28 @@ def main() -> None:
 
     # Initialize gptme
     try:
-        # Restrict tools
-        # TODO: do this in a non-global way
-        global tools
+        global default_tools
 
-        # Initialize gptme and tools
+        # Bootstrap the default tool context; per-request tool policies are
+        # rebuilt in async_step() so future trust tiers can narrow tools safely.
         init(
             model=MODEL,
             interactive=False,
-            tool_allowlist=list(tool_allowlist),
+            tool_allowlist=list(DEFAULT_TOOL_ALLOWLIST),
             tool_format="markdown",
         )
-        tools = init_tools(list(tool_allowlist))
-        tools = get_tools()
-        if not tools:
+        default_tools = list(get_tools())
+        if not default_tools:
             logger.error("No tools loaded in gptme")
             return
         logger.info(
-            f"Loaded {len(tools)} gptme tools: {', '.join(t.name for t in tools)}"
+            "Loaded %d gptme tools: %s",
+            len(default_tools),
+            ", ".join(t.name for t in default_tools),
         )
         logger.info(
-            f"Successfully initialized gptme with tools ({', '.join(tool_allowlist)})"
+            "Successfully initialized gptme with tools (%s)",
+            ", ".join(DEFAULT_TOOL_ALLOWLIST),
         )
     except Exception as e:
         logger.error(f"Failed to initialize gptme tools: {e}")

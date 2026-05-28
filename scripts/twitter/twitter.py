@@ -52,6 +52,7 @@ For OAuth 2.0 setup:
 """
 
 import os
+import re
 import sys
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -63,7 +64,7 @@ import click
 # Silence SyntaxWarning spam from tweepy's invalid escape sequences
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=SyntaxWarning, module="tweepy")
-    import tweepy  # noqa: E402
+    import tweepy
 
 from dotenv import load_dotenv
 from gptmail.communication_utils.auth import (  # type: ignore[import-not-found]
@@ -81,6 +82,7 @@ from gptmail.communication_utils.messaging import (  # type: ignore[import-not-f
     split_thread,
 )
 from rich.console import Console
+from url_utils import validate_urls_in_text  # type: ignore[import-not-found]
 
 DEFAULT_SINCE = "7d"
 DEFAULT_LIMIT = 10
@@ -118,6 +120,76 @@ def _get_user_auth(client) -> bool:
     Set by load_twitter_client() as client._use_user_auth.
     """
     return getattr(client, "_use_user_auth", False)
+
+
+PLACEHOLDER_PATTERNS = [
+    r"\[link would go here\]",
+    r"\[link\s+here\]",
+    r"\[URL\s+here\]",
+    r"\[insert\s+link\]",
+    r"\[media\s+here\]",
+    r"\[image\s+here\]",
+    r"\[video\s+here\]",
+    r"\[gif\s+here\]",
+    r"\[TODO\]",
+    r"\[FIXME\]",
+    r"\[TBD\]",
+    r"\[PLACEHOLDER\]",
+]
+
+COMPILED_PLACEHOLDERS = [re.compile(p, re.IGNORECASE) for p in PLACEHOLDER_PATTERNS]
+
+
+def _find_placeholder_in_text(text: str) -> str | None:
+    """Return the first unresolved placeholder match in text, or None."""
+    for compiled in COMPILED_PLACEHOLDERS:
+        m = compiled.search(text)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _abort_on_placeholder_patterns(messages: list[str]) -> None:
+    """Abort if any message contains an unresolved placeholder pattern."""
+    for text in messages:
+        if not text:
+            continue
+        hit = _find_placeholder_in_text(text)
+        if hit:
+            console.print(f"[red]✗ Unresolved placeholder: '{hit}'[/red]")
+            console.print(
+                "[red]Aborting — the text contains an unresolved placeholder."
+                " This is a bug in the LLM drafting pipeline (the LLM emitted a"
+                " placeholder because it could not resolve the needed content at"
+                " draft time). Fix the pipeline to resolve any required URLs or"
+                " media before drafting, or write a concrete reply without the"
+                " placeholder.[/red]"
+            )
+            sys.exit(1)
+
+
+def _abort_on_bad_urls(messages: list[str]) -> None:
+    """Abort on HTTP 4xx/5xx URLs or unresolved placeholders before posting."""
+    _abort_on_placeholder_patterns(messages)
+    bad: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+
+    for text in messages:
+        if not text:
+            continue
+        for issue in validate_urls_in_text(text):
+            if issue in seen:
+                continue
+            seen.add(issue)
+            bad.append(issue)
+
+    if not bad:
+        return
+
+    for url, status in bad:
+        console.print(f"[red]✗ URL returns {status}: {url}[/red]")
+    console.print("[red]Aborting post — fix dead URLs before tweeting.[/red]")
+    sys.exit(1)
 
 
 def _verify_account_identity(username: str, console) -> None:
@@ -614,6 +686,7 @@ def post(text: str, reply_to: str | None, thread: bool) -> None:
     # Handle thread posting
     if thread:
         thread_messages = split_thread(text)
+        _abort_on_bad_urls([message.text for message in thread_messages])
         reply_to_id: str | None = None
 
         for message in thread_messages:
@@ -641,6 +714,7 @@ def post(text: str, reply_to: str | None, thread: bool) -> None:
             console.print(f"[green]Posted tweet: {message.text}")
     else:
         # Single tweet
+        _abort_on_bad_urls([text])
         response = client.create_tweet(
             text=text, in_reply_to_tweet_id=reply_to, user_auth=_get_user_auth(client)
         )

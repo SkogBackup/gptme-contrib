@@ -4,12 +4,15 @@ import json
 from pathlib import Path
 
 import pytest
+import websockets
 from gptme_voice.realtime.openai_client import (
     _MAX_PENDING_AUDIO_CHUNKS,
     OpenAIRealtimeClient,
     SessionConfig,
     _load_project_instructions,
 )
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 
 
 class _FakeWebSocket:
@@ -53,6 +56,22 @@ class _QueuedWebSocket(_FakeWebSocket):
             await self._incoming.put(None)
 
 
+def _invalid_status(
+    *,
+    status_code: int,
+    body: bytes,
+    reason_phrase: str = "Bad Request",
+) -> websockets.InvalidStatus:
+    return websockets.InvalidStatus(
+        Response(
+            status_code=status_code,
+            reason_phrase=reason_phrase,
+            headers=Headers(),
+            body=body,
+        )
+    )
+
+
 def test_connect_exposes_subagent_tool_as_focused_lookup_only() -> None:
     async def _exercise() -> None:
         fake_ws = _FakeWebSocket()
@@ -82,6 +101,165 @@ def test_connect_exposes_subagent_tool_as_focused_lookup_only() -> None:
         assert "broad investigations" in description
         assert "post-call analysis" in description
         assert "wait for the real subagent result" in description
+        assert "promise a lookup without actually emitting the tool call" in description
+        assert fake_ws.closed is True
+
+    asyncio.run(_exercise())
+
+
+def test_connect_omits_output_key_when_speed_not_configured() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(instructions="You are Bob."),
+            )
+            await client.connect()
+            await asyncio.sleep(0)
+            await client.disconnect()
+
+        session_update = fake_ws.sent[0]
+        assert session_update["type"] == "session.update"
+        assert "output" not in session_update["session"]
+        assert "reasoning" not in session_update["session"]
+
+    asyncio.run(_exercise())
+
+
+def test_connect_uses_current_openai_headers_and_reasoning_effort() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+        captured_headers: dict[str, str] = {}
+
+        async def _fake_connect(*_args, **_kwargs):
+            captured_headers.update(_kwargs["additional_headers"])
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(
+                    instructions="You are Bob.",
+                    reasoning_effort="low",
+                ),
+            )
+            await client.connect()
+            await asyncio.sleep(0)
+            await client.disconnect()
+
+        session_update = fake_ws.sent[0]
+        assert captured_headers == {"Authorization": "Bearer test-key"}
+        assert "OpenAI-Beta" not in captured_headers
+        assert session_update["session"]["reasoning"] == {"effort": "low"}
+
+    asyncio.run(_exercise())
+
+
+def test_connect_retries_with_generic_alias_when_gpt_realtime_2_is_rejected() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+        urls: list[str] = []
+
+        async def _fake_connect(url: str, *_args, **_kwargs):
+            urls.append(url)
+            if len(urls) == 1:
+                raise _invalid_status(
+                    status_code=404,
+                    reason_phrase="Not Found",
+                    body=b'{"error":{"message":"Unknown model gpt-realtime-2"}}',
+                )
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(api_key="test-key")
+            await client.connect()
+            await asyncio.sleep(0)
+            await client.disconnect()
+
+        assert urls == [
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2",
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+        ]
+        assert client.session_config.model == "gpt-realtime"
+        assert fake_ws.sent[0]["type"] == "session.update"
+
+    asyncio.run(_exercise())
+
+
+@pytest.mark.parametrize(
+    ("model", "status_code", "body", "expected"),
+    [
+        (
+            "gpt-realtime-2",
+            500,
+            b'{"error":{"message":"Unknown model gpt-realtime-2"}}',
+            None,
+        ),
+        ("gpt-realtime-2", 404, b"", None),
+        ("gpt-realtime-2", 400, b'{"error":{"message":"Bad request"}}', None),
+        (
+            "gpt-realtime",
+            404,
+            b'{"error":{"message":"Unknown model gpt-realtime"}}',
+            None,
+        ),
+    ],
+)
+def test_handshake_fallback_model_only_retries_model_related_alias_errors(
+    model: str,
+    status_code: int,
+    body: bytes,
+    expected: str | None,
+) -> None:
+    client = OpenAIRealtimeClient(
+        api_key="test-key",
+        session_config=SessionConfig(model=model),
+    )
+
+    exc = _invalid_status(status_code=status_code, body=body)
+
+    assert client._handshake_fallback_model(exc) == expected
+
+
+def test_connect_includes_output_speed_when_configured() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(
+                    instructions="You are Bob.",
+                    output_speed=1.15,
+                ),
+            )
+            await client.connect()
+            await asyncio.sleep(0)
+            await client.disconnect()
+
+        session_update = fake_ws.sent[0]
+        assert session_update["type"] == "session.update"
+        assert session_update["session"]["output"] == {"speed": 1.15}
         assert fake_ws.closed is True
 
     asyncio.run(_exercise())
@@ -112,6 +290,28 @@ def test_load_project_instructions_includes_post_call_follow_up_guard(
 
     # Acknowledging automatic post-call follow-up is still allowed.
     assert "happen automatically after" in instructions
+
+
+def test_load_project_instructions_blocks_fake_live_lookup_narration(
+    tmp_path: Path,
+) -> None:
+    """Live-call prompt must forbid fake 'I'm checking' narration without a tool call."""
+    (tmp_path / "gptme.toml").write_text(
+        '[prompt]\nfiles = ["ABOUT.md"]\n',
+    )
+    (tmp_path / "ABOUT.md").write_text("# ABOUT\nYou are Bob.\n")
+
+    instructions = _load_project_instructions(str(tmp_path))
+
+    assert "call the subagent tool in the same turn" in instructions
+    assert (
+        "Do NOT say you are checking, looking it up, or using the subagent"
+        in instructions
+    )
+    assert (
+        "answer from current context or say you cannot verify it live yet"
+        in instructions
+    )
 
 
 def test_send_audio_buffers_until_session_created() -> None:
@@ -628,3 +828,49 @@ def test_activate_session_before_session_ready_sends_greeting_on_ready() -> None
             await client.disconnect()
 
     asyncio.run(_exercise())
+
+
+def test_session_config_g711_passthrough_sets_format_and_rates() -> None:
+    cfg = SessionConfig(g711_passthrough=True)
+    assert cfg.input_format == "g711_ulaw"
+    assert cfg.output_format == "g711_ulaw"
+    assert cfg.input_sample_rate == 8000
+    assert cfg.output_sample_rate == 8000
+
+
+def test_session_config_g711_passthrough_default_off_keeps_pcm16() -> None:
+    cfg = SessionConfig()
+    assert cfg.g711_passthrough is False
+    assert cfg.input_format == "pcm16"
+    assert cfg.output_format == "pcm16"
+    assert cfg.input_sample_rate == 24000
+    assert cfg.output_sample_rate == 24000
+
+
+def test_connect_emits_g711_ulaw_audio_format_when_passthrough_enabled() -> None:
+    async def _exercise() -> None:
+        fake_ws = _FakeWebSocket()
+
+        async def _fake_connect(*_args, **_kwargs):
+            return fake_ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "gptme_voice.realtime.openai_client.websockets.connect", _fake_connect
+            )
+            client = OpenAIRealtimeClient(
+                api_key="test-key",
+                session_config=SessionConfig(
+                    instructions="You are Bob.",
+                    g711_passthrough=True,
+                ),
+            )
+            await client.connect()
+            await asyncio.sleep(0)
+            await client.disconnect()
+
+        session_update = fake_ws.sent[0]
+        assert session_update["type"] == "session.update"
+        session = session_update["session"]
+        assert session["input_audio_format"] == "g711_ulaw"
+        assert session["output_audio_format"] == "g711_ulaw"

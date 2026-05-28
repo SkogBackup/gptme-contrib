@@ -28,11 +28,115 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .deliverables import (
+    build_deliverable_detail,
+    looks_like_sha,
+    project_deliverable_details,
+)
+from .discovery import extract_project, extract_session_name
 from .record import SessionRecord
 from .signals import extract_from_path
 from .store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_traj_sha_prefixes(traj_deliverables: list[str]) -> set[str]:
+    """Extract 7-12 char lowercase SHA strings from trajectory commit entries.
+
+    Trajectory commits are formatted as ``"commit message (abc1234)"`` by
+    signals.py.  Returns a set of lowercase SHA strings for cross-validation
+    against full 40-char SHAs from git-range attribution.
+    """
+    shas: set[str] = set()
+    for entry in traj_deliverables:
+        if entry.endswith(")") and "(" in entry:
+            candidate = entry[entry.rfind("(") + 1 : -1]
+            if 7 <= len(candidate) <= 12 and all(
+                c in "0123456789abcdef" for c in candidate.lower()
+            ):
+                shas.add(candidate.lower())
+    return shas
+
+
+def _caller_sha_in_traj(sha: str, traj_sha_prefixes: set[str]) -> bool:
+    """Return True if a full 40-char SHA from the caller appears in trajectory commits."""
+    sha_lower = sha.lower().strip()
+    return any(sha_lower.startswith(prefix) for prefix in traj_sha_prefixes)
+
+
+def _build_caller_deliverable_details(
+    values: list[str],
+    *,
+    provenance_class: str,
+    evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build caller-side deliverable details in stable first-seen order."""
+    details: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        details.append(
+            build_deliverable_detail(
+                value,
+                provenance_class=provenance_class,
+                evidence=evidence,
+            )
+        )
+    return details
+
+
+def _merge_deliverable_details(
+    *,
+    deliverables: list[str],
+    trajectory_details: list[dict[str, Any]],
+    extra_details: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project trajectory + caller details into the final deliverable order."""
+    detail_by_value: dict[str, dict[str, Any]] = {}
+    for raw in trajectory_details + extra_details:
+        if not isinstance(raw, dict):
+            continue
+        value = raw.get("value")
+        if not isinstance(value, str) or not value or value in detail_by_value:
+            continue
+        detail_by_value[value] = raw
+
+    return project_deliverable_details(
+        deliverables,
+        detail_by_value,
+        fallback_evidence={"source": "projection_fallback"},
+    )
+
+
+def _trajectory_duration_reliable(
+    signals: dict[str, Any] | None,
+    duration_seconds: int,
+    *,
+    min_coverage: float = 0.5,
+) -> bool:
+    """Whether the assigned trajectory plausibly covers the whole session.
+
+    Two concurrent same-backend sessions can resolve to the same gptme log
+    directory, so a session's assigned trajectory may actually belong to a
+    different (shorter) run. When the trajectory's message timestamps span far
+    less wall-clock than the caller-reported duration, the trajectory is not a
+    trustworthy productivity oracle: trusting it drops real
+    ``start_commit..HEAD`` deliverables and records a false noop (see
+    ErikBjare/bob "gptme false noop detection").
+
+    Returns ``True`` when there is no basis to doubt coverage (no signals, no
+    caller duration, or a missing/invalid trajectory span).
+    """
+    if not signals or duration_seconds <= 0:
+        return True
+    traj_span = signals.get("session_duration_s")
+    if not isinstance(traj_span, (int, float)) or traj_span <= 0:
+        return True
+    return traj_span >= min_coverage * duration_seconds
+
 
 #: Default path for grading weights config (Phase 3 multivariate grading).
 _GRADING_WEIGHTS_PATH = (
@@ -97,6 +201,13 @@ class PostSessionResult:
         output_tokens:         Output tokens from usage breakdown, or ``None`` if not present.
         cache_creation_tokens: Cache-write tokens, or ``None`` if not present.
         cache_read_tokens:     Cache-read tokens, or ``None`` if not present.
+        sys_prompt_tokens:     First-turn input context size, or ``None`` if not present.
+        context_peak_tokens:   Largest per-turn input context size, or ``None`` if not present.
+        context_window:        Model context window size, or ``None`` if not present.
+        sys_prompt_bytes:      System messages before first user message (UTF-8 bytes).
+        first_turn_bytes:      All messages before first assistant message (UTF-8 bytes).
+        context_peak_bytes:    Max per-turn context bytes before assistant.
+        session_total_bytes:   Total bytes of all message content.
     """
 
     record: SessionRecord
@@ -107,6 +218,13 @@ class PostSessionResult:
     output_tokens: int | None = None
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
+    sys_prompt_tokens: int | None = None
+    context_peak_tokens: int | None = None
+    context_window: int | None = None
+    sys_prompt_bytes: int | None = None
+    first_turn_bytes: int | None = None
+    context_peak_bytes: int | None = None
+    session_total_bytes: int | None = None
 
 
 def post_session(
@@ -121,6 +239,8 @@ def post_session(
     trigger: str | None = None,
     category: str | None = None,
     recommended_category: str | None = None,
+    selector_mode: str | None = None,
+    cascade_intent: dict[str, Any] | None = None,
     exit_code: int = 0,
     duration_seconds: int = 0,
     trajectory_path: Path | None = None,
@@ -163,6 +283,15 @@ def post_session(
         Category recommended by the selector before the session ran
         (e.g. Thompson sampling, CASCADE). Stored alongside the actual
         category so drift between recommendation and reality is trackable.
+    selector_mode:
+        Which selector strategy was used to pick this session's work
+        (e.g. ``"scored"``, ``"llm-context"``). Set by the CASCADE
+        selector and forwarded by the runner so post-hoc analyses can
+        compare outcomes across selector strategies.
+    cascade_intent:
+        Structured CASCADE selector metadata (for example ``{"reasons": [...],
+        "constraints": [...]}``) captured before the session ran. Stored
+        verbatim on the session record when provided.
     exit_code:
         Exit code from the agent process.  Non-zero (except 124 = timeout)
         marks the session as ``"failed"``.
@@ -181,8 +310,9 @@ def post_session(
     deliverables:
         Explicit list of deliverables (commit SHAs, PR URLs).  If ``None``
         or empty, deliverables are extracted from the trajectory signals.
-        If non-empty, they are *merged* with trajectory-derived deliverables
-        (duplicates removed).
+        When a trajectory is available, it is authoritative: caller-supplied
+        SHAs are validated against trajectory SHAs; file-path-only trajectory
+        items cannot validate caller SHAs, so both sets are kept.
     journal_path:
         Path to the journal entry written during the session, if any.
         When ``None`` and a trajectory is available, auto-detected from
@@ -203,10 +333,19 @@ def post_session(
     4. ``exit_code == 124`` (timeout, no other evidence) → ``"unknown"``
     5. Default: ``"unknown"`` (no signal available — callers should not
        treat this as productive *or* penalize it in bandits)
-    6. Override: if step 2–5 yielded ``"noop"`` or ``"unknown"`` but
-       ``deliverables`` is
-       non-empty, upgrade to ``"productive"`` (trajectory may miss commits
-       detected by the caller via ``git diff``).
+    6. Override: if step 2–5 yielded ``"noop"`` but the caller supplied
+       explicit deliverables and the trajectory found no deliverables
+       of its own (i.e. the trajectory couldn't validate or contradict
+       the caller's evidence), upgrade to ``"productive"``.
+    7. Unreliable-trajectory guard: a trajectory whose covered wall-clock is
+       far below the caller-reported ``duration_seconds`` is likely truncated
+       or misattributed (two concurrent same-backend sessions resolving to the
+       same log dir). When such a trajectory says ``"noop"``:
+       - If the caller supplied git-range deliverables, those commits are kept
+         and the outcome is ``"productive"`` instead of a false ``"noop"``.
+       - If the caller has no deliverables either, the outcome is ``"unknown"``
+         (recording ``"noop"`` would unfairly penalize the backend's bandit
+         weight for a session whose real work can't be observed).
     """
     if context_tier is not None and context_tier not in VALID_CONTEXT_TIERS:
         raise ValueError(
@@ -224,6 +363,13 @@ def post_session(
     output_tokens: int | None = None
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
+    sys_prompt_tokens: int | None = None
+    context_peak_tokens: int | None = None
+    context_window: int | None = None
+    sys_prompt_bytes: int | None = None
+    first_turn_bytes: int | None = None
+    context_peak_bytes: int | None = None
+    session_total_bytes: int | None = None
     traj_productive: bool | None = None
 
     # --- Extract signals from trajectory ---
@@ -239,10 +385,25 @@ def post_session(
                 _out = usage.get("output_tokens")
                 _cc = usage.get("cache_creation_tokens")
                 _cr = usage.get("cache_read_tokens")
+                _sys = usage.get("sys_prompt_tokens")
+                _peak = usage.get("context_peak_tokens")
+                _window = usage.get("context_window")
                 input_tokens = int(_in) if _in is not None else None
                 output_tokens = int(_out) if _out is not None else None
                 cache_creation_tokens = int(_cc) if _cc is not None else None
                 cache_read_tokens = int(_cr) if _cr is not None else None
+                sys_prompt_tokens = int(_sys) if _sys is not None else None
+                context_peak_tokens = int(_peak) if _peak is not None else None
+                context_window = int(_window) if _window is not None else None
+                # Byte-level metrics (model-independent; ErikBjare/bob#738)
+                _sys_b = usage.get("sys_prompt_bytes")
+                _first_b = usage.get("first_turn_bytes")
+                _peak_b = usage.get("context_peak_bytes")
+                _total_b = usage.get("session_total_bytes")
+                sys_prompt_bytes = int(_sys_b) if _sys_b is not None else None
+                first_turn_bytes = int(_first_b) if _first_b is not None else None
+                context_peak_bytes = int(_peak_b) if _peak_b is not None else None
+                session_total_bytes = int(_total_b) if _total_b is not None else None
             if isinstance(usage, dict) and "total_tokens" in usage:
                 total = usage.get("total_tokens")
                 if total is not None:
@@ -263,21 +424,123 @@ def post_session(
             if traj_model:
                 model = traj_model
 
+    # Whether the assigned trajectory plausibly covers the whole session. A
+    # trajectory spanning far less wall-clock than the caller's duration is
+    # likely truncated or misattributed (two concurrent same-backend sessions
+    # resolving to the same gptme log dir), so it must not be allowed to drop
+    # real git-range deliverables and record a false noop.
+    trajectory_reliable = _trajectory_duration_reliable(signals, duration_seconds)
+
     # --- Resolve deliverables ---
-    # Merge shell-provided deliverables (bare SHAs) with trajectory-derived
-    # ones (commit messages, file write paths).  The shell always passes a
-    # list (possibly empty), so we treat empty the same as None.
-    # Capture caller-supplied deliverables *before* the merge so the noop
-    # override below can check only caller-provided items (not traj-derived
-    # ones that is_productive() may have deliberately excluded).
+    # Trajectory is the authoritative source when available.  Git-range commits
+    # (caller-supplied via start_commit..HEAD) pick up commits from concurrent
+    # sessions on the same branch — using them as-is causes cross-session
+    # attribution inflation.
+    #
+    # Capture caller-supplied deliverables *before* any merge so the outcome
+    # override below (no-trajectory fallback) sees only pre-trajectory items.
     caller_deliverables: list[str] = list(deliverables) if deliverables else []
     traj_deliverables = signals.get("deliverables", []) if signals else []
+    traj_deliverable_details = signals.get("deliverable_details", []) if signals else []
+    extra_deliverable_details: list[dict[str, Any]] = []
+
     if not deliverables:
+        # No caller deliverables: use trajectory exclusively.
         deliverables = traj_deliverables
-    elif traj_deliverables:
-        # Add trajectory items not already present (e.g. file write paths)
-        existing = set(deliverables)
-        deliverables = deliverables + [d for d in traj_deliverables if d not in existing]
+    elif signals is not None:
+        # Trajectory was available — it is authoritative, but only for
+        # deliverables it can actually validate.  File paths in trajectory
+        # deliverables have no SHA to cross-check, so caller SHAs pass through.
+        if traj_deliverables:
+            traj_sha_prefixes = _extract_traj_sha_prefixes(traj_deliverables)
+            if traj_sha_prefixes:
+                # Trajectory has commit SHAs — validate caller SHAs against them
+                # and preserve non-SHA caller deliverables like PR URLs or files.
+                validated_shas = [
+                    d
+                    for d in caller_deliverables
+                    if looks_like_sha(d) and _caller_sha_in_traj(d, traj_sha_prefixes)
+                ]
+                unvalidated_shas = [
+                    d for d in caller_deliverables if looks_like_sha(d) and d not in validated_shas
+                ]
+                passthrough_non_sha = [d for d in caller_deliverables if not looks_like_sha(d)]
+                if unvalidated_shas:
+                    logger.warning(
+                        "Dropping %d git-range commit(s) absent from trajectory "
+                        "(likely from a concurrent session): %s",
+                        len(unvalidated_shas),
+                        unvalidated_shas[:5],
+                    )
+                deliverables = list(
+                    dict.fromkeys(traj_deliverables + validated_shas + passthrough_non_sha)
+                )
+                extra_deliverable_details = _build_caller_deliverable_details(
+                    validated_shas,
+                    provenance_class="session_committed",
+                    evidence={"source": "caller", "validation": "trajectory_sha_prefix"},
+                ) + _build_caller_deliverable_details(
+                    passthrough_non_sha,
+                    provenance_class="fallback_observed",
+                    evidence={"source": "caller", "reason": "non_sha_passthrough"},
+                )
+            else:
+                # Trajectory has no SHAs (file paths only) — can't validate
+                # caller SHAs.  Keep both sets, caller items first to preserve
+                # the pre-existing deliverable ordering convention.
+                deliverables = list(dict.fromkeys(caller_deliverables + traj_deliverables))
+                extra_deliverable_details = _build_caller_deliverable_details(
+                    caller_deliverables,
+                    provenance_class="fallback_observed",
+                    evidence={"source": "caller", "reason": "trajectory_has_no_sha"},
+                )
+        else:
+            # Trajectory ran but found no deliverables.
+            if traj_productive is False and trajectory_reliable:
+                # Trajectory explicitly says this was noop — caller SHAs are
+                # from concurrent sessions.
+                if caller_deliverables:
+                    logger.warning(
+                        "Dropping %d git-range commit(s): trajectory determined "
+                        "noop with no deliverables (SHAs from concurrent session)",
+                        len(caller_deliverables),
+                    )
+                deliverables = []
+            else:
+                # Either the trajectory didn't rule out work, or it is
+                # unreliable (covers far less wall-clock than the session ran,
+                # so it is likely truncated or misattributed). Keep caller items
+                # as best evidence.
+                reason = "trajectory_unreliable" if traj_productive is False else "trajectory_empty"
+                if caller_deliverables:
+                    logger.warning(
+                        "Trajectory %s; keeping %d caller-supplied deliverable(s)",
+                        "is unreliable (duration mismatch)"
+                        if reason == "trajectory_unreliable"
+                        else "ran but found no deliverables",
+                        len(caller_deliverables),
+                    )
+                deliverables = list(dict.fromkeys(caller_deliverables))
+                extra_deliverable_details = _build_caller_deliverable_details(
+                    caller_deliverables,
+                    provenance_class="fallback_observed",
+                    evidence={"source": "caller", "reason": reason},
+                )
+    # else: no trajectory (signals is None) — keep caller git-range as fallback.
+    elif caller_deliverables:
+        extra_deliverable_details = _build_caller_deliverable_details(
+            caller_deliverables,
+            provenance_class="fallback_observed",
+            evidence={"source": "caller", "reason": "no_trajectory"},
+        )
+
+    deliverable_details = _merge_deliverable_details(
+        deliverables=deliverables,
+        trajectory_details=traj_deliverable_details
+        if isinstance(traj_deliverable_details, list)
+        else [],
+        extra_details=extra_deliverable_details,
+    )
 
     # --- Determine outcome ---
     # Priority order (highest → lowest):
@@ -292,7 +555,27 @@ def post_session(
     if exit_code not in (0, 124):
         outcome = "failed"
     elif traj_productive is not None:
-        outcome = "productive" if traj_productive else "noop"
+        if traj_productive:
+            outcome = "productive"
+        elif not trajectory_reliable and caller_deliverables:
+            # Trajectory says noop but is unreliable (covers far less wall-clock
+            # than the session ran — likely truncated or misattributed) and the
+            # caller observed real git-range commits. Trust the commits.
+            outcome = "productive"
+        elif not trajectory_reliable and not caller_deliverables:
+            # Trajectory is unreliable (truncated/misattributed) and no caller
+            # deliverables exist — outcome is genuinely unknown.  Recording noop
+            # here would penalize the backend in bandit scoring for a session
+            # whose real work we can't observe.
+            assert signals is not None  # implied by traj_productive is not None
+            logger.warning(
+                "Trajectory says noop but is unreliable (%d%% coverage); "
+                "no caller deliverables — recording unknown",
+                int(100 * (signals.get("session_duration_s", 0) / max(duration_seconds, 1))),
+            )
+            outcome = "unknown"
+        else:
+            outcome = "noop"
     elif start_commit is not None and end_commit is not None:
         outcome = "productive" if start_commit != end_commit else "noop"
     elif (start_commit is None) != (end_commit is None):
@@ -307,18 +590,32 @@ def post_session(
     else:
         outcome = "unknown"
 
-    # Override noop/unknown → productive if *caller-supplied* deliverables exist.
-    # Trajectory signals may miss commits detected by the caller via git diff.
-    # Use caller_deliverables (pre-merge) so trajectory-derived items (e.g. a
-    # single file write that is_productive() deliberately classifies as noop)
-    # do not trigger this override.
-    if outcome in ("noop", "unknown") and caller_deliverables:
+    # Override noop → productive when caller-supplied deliverables exist AND
+    # no trajectory was available.  When a trajectory IS available it is
+    # authoritative: git-range commits may be from concurrent sessions, so we
+    # must not let them upgrade a trajectory-determined "noop" to "productive".
+    if outcome in ("noop", "unknown") and caller_deliverables and signals is None:
         logger.info(
-            "Overriding outcome %s→productive: %d caller-supplied deliverable(s)",
+            "Overriding outcome %s→productive (no trajectory deliverables): "
+            "%d caller-supplied deliverable(s)",
             outcome,
             len(caller_deliverables),
         )
         outcome = "productive"
+
+    # --- Compute start_time / end_time from duration ---
+    # The timestamp field is set by SessionRecord.__post_init__() at creation time.
+    # We derive start/end from duration_seconds so time-based filtering works.
+    if duration_seconds > 0:
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        start_dt = now - timedelta(seconds=duration_seconds)
+        start_time_str = start_dt.isoformat()
+        end_time_str = now.isoformat()
+    else:
+        start_time_str = None
+        end_time_str = None
 
     # --- Category: inferred (actual) vs recommended (intended) ---
     inferred_category = signals.get("inferred_category") if signals else None
@@ -333,7 +630,10 @@ def post_session(
         "outcome": outcome,
         "exit_code": exit_code,
         "duration_seconds": duration_seconds,
+        "start_time": start_time_str,
+        "end_time": end_time_str,
         "deliverables": deliverables,
+        "deliverable_details": deliverable_details,
     }
     if context_tier is not None:
         record_kwargs["context_tier"] = context_tier
@@ -347,8 +647,18 @@ def post_session(
         record_kwargs["category"] = actual_category
     if recommended_category is not None:
         record_kwargs["recommended_category"] = recommended_category
+    if selector_mode is not None:
+        record_kwargs["selector_mode"] = selector_mode
+    if cascade_intent is not None:
+        record_kwargs["cascade_intent"] = cascade_intent
     if trajectory_path is not None:
         record_kwargs["trajectory_path"] = str(trajectory_path)
+        session_name = extract_session_name(harness, trajectory_path)
+        if session_name:
+            record_kwargs["session_name"] = session_name
+        project = extract_project(harness, trajectory_path)
+        if project:
+            record_kwargs["project"] = project
     # Fallback: if caller didn't provide journal_path, use the first
     # journal path extracted from the trajectory signals.
     if journal_path is None and signals:
@@ -371,6 +681,20 @@ def post_session(
         record_kwargs["cache_creation_tokens"] = cache_creation_tokens
     if cache_read_tokens is not None:
         record_kwargs["cache_read_tokens"] = cache_read_tokens
+    if sys_prompt_tokens is not None:
+        record_kwargs["sys_prompt_tokens"] = sys_prompt_tokens
+    if context_peak_tokens is not None:
+        record_kwargs["context_peak_tokens"] = context_peak_tokens
+    if context_window is not None:
+        record_kwargs["context_window"] = context_window
+    if sys_prompt_bytes is not None:
+        record_kwargs["sys_prompt_bytes"] = sys_prompt_bytes
+    if first_turn_bytes is not None:
+        record_kwargs["first_turn_bytes"] = first_turn_bytes
+    if context_peak_bytes is not None:
+        record_kwargs["context_peak_bytes"] = context_peak_bytes
+    if session_total_bytes is not None:
+        record_kwargs["session_total_bytes"] = session_total_bytes
     record = SessionRecord(**record_kwargs)
     if grade is not None:
         record.set_productivity_grade(grade)
@@ -411,4 +735,11 @@ def post_session(
         output_tokens=output_tokens,
         cache_creation_tokens=cache_creation_tokens,
         cache_read_tokens=cache_read_tokens,
+        sys_prompt_tokens=sys_prompt_tokens,
+        context_peak_tokens=context_peak_tokens,
+        context_window=context_window,
+        sys_prompt_bytes=sys_prompt_bytes,
+        first_turn_bytes=first_turn_bytes,
+        context_peak_bytes=context_peak_bytes,
+        session_total_bytes=session_total_bytes,
     )

@@ -1,4 +1,5 @@
 ---
+description: "When a message contains a factual error or misunderstanding, correct it immediately rather than letting it propagate"
 status: active
 tags: [inter-agent, correction, orchestration, epistemic-integrity, communication]
 match:
@@ -11,11 +12,6 @@ match:
     - "correction to my earlier"
     - "correct my previous message"
     - "correct earlier advice"
-    - "ignore my last message"
-    - "wrong recommendation to"
-    - "follow-up correction"
-    - "before they act on it"
-    - "I gave the wrong advice"
 ---
 
 # Proactive Correction in Agent Messages

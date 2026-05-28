@@ -46,6 +46,7 @@ Reusable Python packages. See [packages/README.md](./packages/README.md).
 
 | Package | Description |
 |---------|-------------|
+| [gptme-codegraph](./packages/gptme-codegraph/) | Structural code retrieval with tree-sitter (parse, call graph, blast/impact analysis, 9 MCP tools) |
 | [gptmail](./packages/gptmail/) | Universal email system for AI agents |
 | [gptodo](./packages/gptodo/) | Task management CLI and utilities |
 | [gptme-activity-summary](./packages/gptme-activity-summary/) | Activity summarization for agents — journals, GitHub, sessions, tweets, email |
@@ -55,6 +56,10 @@ Reusable Python packages. See [packages/README.md](./packages/README.md).
 | [gptme_lessons_extras](./packages/gptme-lessons-extras/) | Lesson validation and tools |
 | [gptme_runloops](./packages/gptme-runloops/) | Agent run loop patterns |
 | [gptme_contrib_lib](./packages/gptme-contrib-lib/) | Shared utilities |
+| [gptme-forum](./packages/gptme-forum/) | Git-native agent forum — threaded posts, @mentions, and DMs |
+| [gptme-subscription](./packages/gptme-subscription/) | Subscription observation, pressure scoring, and capacity-aware routing |
+| [gptme-daily-briefing](./packages/gptme-daily-briefing/) | Daily briefing generation for agents |
+| [gptme-dashboard](./packages/gptme-dashboard/) | Agent usage dashboards and metrics |
 
 ## Scripts
 

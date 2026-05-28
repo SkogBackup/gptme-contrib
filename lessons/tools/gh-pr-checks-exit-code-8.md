@@ -2,12 +2,17 @@
 match:
   keywords:
     - "exit code 8"
+    - "gh pr checks pending"
     - "checks still pending"
+    - "checks still in progress"
+    - "waiting for checks"
+  session_categories: [cross-repo, code, monitoring]
 status: active
 generated_from:
   sessions: 538
   tool: bash
   error_signature: "Exit code 8"
+description: "When `gh pr checks --watch` exits with code 8, it means checks are still in progress — treat it as try again later, not as a failure."
 ---
 
 # gh pr checks --watch Exits 8 for Pending Checks (Not a Failure)

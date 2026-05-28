@@ -25,6 +25,8 @@ from gptme_sessions.judge import (
     _resolve_openrouter_api_key,
     _is_anthropic_direct_model,
     _strip_anthropic_prefix,
+    format_intent_context,
+    format_routing_context,
     judge_and_writeback,
     judge_from_signals,
     judge_session,
@@ -80,6 +82,8 @@ class TestJudgeSession:
         prompt = JUDGE_PROMPT_TEMPLATE.format(
             goals="Test goals",
             category="code",
+            routing_context="",
+            intent_context="",
             journal="Did some work",
         )
         assert "Test goals" in prompt
@@ -87,6 +91,51 @@ class TestJudgeSession:
         assert "Did some work" in prompt
         assert "0.0-1.0" in prompt
         assert "JSON" in JUDGE_SYSTEM
+
+    def test_prompt_template_includes_category_interpretation(self) -> None:
+        """The prompt must instruct the judge to score within-category, not penalize support categories.
+
+        Regression guard: when the judge does not see a category-interpretation block,
+        it applies revenue/goal-#1 alignment as a fixed ceiling on
+        infrastructure/monitoring/knowledge work, producing systematic harness
+        bias documented in
+        knowledge/strategic/2026-05-10-gptme-harness-verification-gap.md.
+        """
+        prompt = JUDGE_PROMPT_TEMPLATE.format(
+            goals="Test goals",
+            category="infrastructure",
+            routing_context="",
+            intent_context="",
+            journal="Reduced future friction",
+        )
+        assert "Category Interpretation" in prompt
+        assert "within-category value" in prompt
+        # The block must explicitly name representative support categories so
+        # the judge does not collapse them into "non-revenue, low-score".
+        for support_cat in ("infrastructure", "monitoring", "knowledge", "research"):
+            assert support_cat in prompt
+
+    def test_prompt_includes_worked_examples(self) -> None:
+        """The judge prompt must include worked reasoning examples showing how to grade
+        support-category sessions.
+
+        Regression guard: if the worked examples are removed or become unreachable,
+        the judge loses the "teaching why" layer that counteracts the remaining bias
+        documented in knowledge/research/2026-05-09-teaching-claude-why-lesson-validation.md.
+        """
+        prompt = JUDGE_PROMPT_TEMPLATE.format(
+            goals="Test goals",
+            category="cleanup",
+            routing_context="",
+            intent_context="",
+            journal="Cleaned up stale references",
+        )
+        assert "## Worked Examples" in prompt
+        assert "infrastructure, ~0.78" in prompt
+        assert "cleanup, ~0.75" in prompt
+        assert "research, ~0.72" in prompt
+        assert "within-category" in prompt
+        assert "compounding" in prompt
 
     def test_score_clamping(self) -> None:
         """Out-of-range scores from the LLM are clamped to [0.0, 1.0]."""
@@ -146,6 +195,224 @@ class TestJudgeSession:
         """Default goals should work for any agent, not just Bob."""
         assert "Bob" not in DEFAULT_GOALS
         assert "agent" in DEFAULT_GOALS.lower()
+
+    def test_format_routing_context_returns_empty_when_unset(self) -> None:
+        """No cascade_context => no Routing Context block (back-compat)."""
+        assert format_routing_context(None) == ""
+        assert format_routing_context({}) == ""
+
+    def test_format_routing_context_ignores_tier1_and_tier2(self) -> None:
+        """Tier 1/2 routing is itself top-priority work; no adjustment block."""
+        assert format_routing_context({"tier": 1, "blocked_tier1_2_count": 0}) == ""
+        assert format_routing_context({"tier": 2, "blocked_tier1_2_count": 0}) == ""
+        # Junk types should also degrade safely.
+        assert format_routing_context({"tier": "tier3"}) == ""
+
+    def test_format_routing_context_renders_for_tier3(self) -> None:
+        """Tier 3 with cascade evidence => routing block with summary lines."""
+        block = format_routing_context(
+            {
+                "tier": 3,
+                "blocked_tier1_2_count": 47,
+                "selector_reason": "Cleanup neglected boost suppressed",
+            }
+        )
+        assert "## Routing Context" in block
+        assert "Tier 3" in block
+        assert "47" in block
+        assert "Cleanup neglected boost suppressed" in block
+
+    def test_format_routing_context_truncates_long_reason(self) -> None:
+        """Selector reason is bounded so it can't dominate the prompt."""
+        block = format_routing_context({"tier": 3, "selector_reason": "x" * 500})
+        # Cap at 200 chars; the raw 500-char string must not appear verbatim.
+        assert "x" * 500 not in block
+        assert "x" * 200 in block
+
+    def test_format_routing_context_rejects_bool_as_blocked_count(self) -> None:
+        """bool is a subclass of int; True should NOT render as blocked count."""
+        block = format_routing_context({"tier": 3, "blocked_tier1_2_count": True})
+        # The bool guard must stop 'True' from appearing in the prompt.
+        assert "True" not in block
+        assert "1" not in block
+
+    def test_format_routing_context_rejects_non_string_selector_reason(self) -> None:
+        """Non-string selector_reason (e.g. int) must not raise TypeError."""
+        # int: would crash reason[:200] without the isinstance guard
+        block = format_routing_context({"tier": 3, "selector_reason": 42})
+        assert "42" not in block
+        assert "Selector reason" not in block
+        # list: another non-string truthy type
+        block = format_routing_context({"tier": 3, "selector_reason": ["a", "b"]})
+        assert "Selector reason" not in block
+        # None degrades gracefully (existing behaviour)
+        block = format_routing_context({"tier": 3, "selector_reason": None})
+        assert "Selector reason" not in block
+
+    def test_format_intent_context_returns_empty_for_none(self) -> None:
+        """None intent returns empty string."""
+        assert format_intent_context(None) == ""
+
+    def test_format_intent_context_requires_required_fields(self) -> None:
+        """Missing required fields returns empty string."""
+        assert format_intent_context({"lane": "Tier1:code"}) == ""
+        assert format_intent_context({"objective": "do work"}) == ""
+        assert format_intent_context({"expected_artifact": "a PR"}) == ""
+
+    def test_format_intent_context_renders_full_block(self) -> None:
+        """All required fields produce a well-formed intent block."""
+        block = format_intent_context(
+            {
+                "session_id": "d255",
+                "lane": "Tier3:internal-code",
+                "objective": "Design session intent contract",
+                "expected_artifact": "scripts/session-intent.py + design doc",
+            }
+        )
+        assert "## Session Intent" in block
+        assert "Design session intent contract" in block
+        assert "scripts/session-intent.py" in block
+        assert "Tier3:internal-code" in block
+        assert "Self-assigned alignment" not in block
+
+    def test_format_intent_context_includes_self_alignment(self) -> None:
+        """When outcome_alignment is set, the block shows the self-assigned verdict."""
+        block = format_intent_context(
+            {
+                "session_id": "d255",
+                "lane": "Tier1:strategic",
+                "objective": "Wire intent contract into run wrapper",
+                "expected_artifact": "autonomous-run.sh patches",
+                "outcome_alignment": "on_track",
+            }
+        )
+        assert "## Session Intent" in block
+        assert "**Self-assigned alignment**: on_track" in block
+
+    def test_prompt_template_uses_canonical_alignment_verdict_vocabulary(self) -> None:
+        """The prompt vocabulary must match the values accepted by the parser."""
+        prompt = JUDGE_PROMPT_TEMPLATE.format(
+            goals=DEFAULT_GOALS,
+            category="code",
+            routing_context="",
+            intent_context=format_intent_context(
+                {
+                    "session_id": "abc123",
+                    "lane": "Tier1:code",
+                    "objective": "Fix a bug",
+                    "expected_artifact": "a PR",
+                }
+            ),
+            journal="Fixed the bug",
+        )
+
+        assert '"on_track"' in prompt
+        assert '"partial"' in prompt
+        assert '"pivot"' in prompt
+        assert '"off_target"' in prompt
+        assert '"well_justified"' not in prompt
+        assert '"poorly_justified"' not in prompt
+
+    def test_judge_session_passes_intent_into_prompt(self) -> None:
+        """When intent is provided, the prompt carries the block."""
+        mock_anthropic = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = [
+            MagicMock(
+                text=json.dumps(
+                    {
+                        "score": 0.80,
+                        "reason": "Aligned with intent",
+                        "alignment_score": 0.90,
+                        "pivot_verdict": "on_track",
+                    }
+                )
+            )
+        ]
+        mock_anthropic.Anthropic.return_value.messages.create.return_value = mock_response
+
+        intent = {
+            "session_id": "abc123",
+            "lane": "Tier1:code",
+            "objective": "Fix a bug",
+            "expected_artifact": "a PR",
+        }
+
+        with (
+            patch.dict("sys.modules", {"anthropic": mock_anthropic}),
+            patch("gptme_sessions.judge._get_api_key", return_value="fake-key"),
+            patch(
+                "gptme_sessions.judge.format_intent_context",
+                wraps=format_intent_context,
+            ) as mock_format,
+        ):
+            result = judge_session(
+                "Fixed the bug", category="code", api_key="fake-key", intent=intent
+            )
+
+        assert result is not None
+        assert result["score"] == 0.80
+        assert result["alignment_score"] == 0.90
+        assert result["pivot_verdict"] == "on_track"
+        mock_format.assert_called_once_with(intent)
+
+    def test_judge_session_passes_routing_context_into_prompt(self) -> None:
+        """When cascade_context names Tier 3, the prompt carries the block."""
+        captured: dict[str, str] = {}
+
+        mock_anthropic = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"score": 0.7, "reason": "OK"}')]
+
+        def _capture_create(**kwargs):
+            # The prompt is the first user message's content
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return mock_response
+
+        mock_anthropic.Anthropic.return_value.messages.create.side_effect = _capture_create
+
+        with (
+            patch.dict("sys.modules", {"anthropic": mock_anthropic}),
+            patch("gptme_sessions.judge._get_api_key", return_value="test-key"),
+        ):
+            result = judge_session(
+                "session text",
+                category="cleanup",
+                cascade_context={"tier": 3, "blocked_tier1_2_count": 30},
+            )
+
+        assert result is not None
+        assert "\n## Routing Context\n" in captured["prompt"]
+        assert "## Routing-Aware Adjustment" in captured["prompt"]
+        # The adjustment instructs the judge to cap the priority penalty.
+        assert "−0.15" in captured["prompt"] or "-0.15" in captured["prompt"]
+
+    def test_judge_session_omits_routing_block_when_no_context(self) -> None:
+        """No cascade_context => the prompt has no Routing Context block."""
+        captured: dict[str, str] = {}
+
+        mock_anthropic = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"score": 0.5, "reason": "Mid"}')]
+
+        def _capture_create(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return mock_response
+
+        mock_anthropic.Anthropic.return_value.messages.create.side_effect = _capture_create
+
+        with (
+            patch.dict("sys.modules", {"anthropic": mock_anthropic}),
+            patch("gptme_sessions.judge._get_api_key", return_value="test-key"),
+        ):
+            result = judge_session("session text", category="code")
+
+        assert result is not None
+        # The Routing-Aware adjustment text references the block name in
+        # backticks; the actual block header is bare. Look for the header form.
+        assert "\n## Routing Context\n" not in captured["prompt"]
+        # The adjustment paragraph is always rendered (it self-skips when the
+        # block is absent), so we don't assert its presence/absence here.
 
     def test_parse_judge_payload_handles_think_tags_and_fences(self) -> None:
         parsed = _parse_judge_payload(
@@ -478,11 +745,57 @@ class TestModelRouting:
             "score": 0.74,
             "reason": "Meaningful progress",
             "model": "openai-subscription/gpt-5.4",
+            "alignment_score": None,
+            "pivot_verdict": None,
             "meta": {
                 "backend": "gptme-fallback",
                 "judge_version": JUDGE_VERSION,
             },
         }
+
+    def test_normalize_judge_verdict_preserves_alignment_fields(self) -> None:
+        """Phase 3: alignment_score and pivot_verdict survive normalization."""
+        normalized = normalize_judge_verdict(
+            {
+                "score": 0.65,
+                "reason": "Partial progress, well-pivoted",
+                "model": "claude-haiku-4-5",
+                "alignment_score": 0.40,
+                "pivot_verdict": "pivot",
+            }
+        )
+
+        assert normalized["score"] == 0.65
+        assert normalized["alignment_score"] == 0.40
+        assert normalized["pivot_verdict"] == "pivot"
+
+    def test_normalize_judge_verdict_rejects_out_of_range_alignment(self) -> None:
+        """alignment_score outside 0.0-1.0 is coerced to None."""
+        normalized = normalize_judge_verdict(
+            {
+                "score": 0.50,
+                "reason": "test",
+                "model": "test",
+                "alignment_score": 1.5,
+                "pivot_verdict": "on_track",
+            }
+        )
+        assert normalized["alignment_score"] is None
+        assert normalized["pivot_verdict"] == "on_track"
+
+    def test_normalize_judge_verdict_rejects_invalid_pivot_verdict(self) -> None:
+        """pivot_verdict outside recognised values is coerced to None."""
+        normalized = normalize_judge_verdict(
+            {
+                "score": 0.50,
+                "reason": "test",
+                "model": "test",
+                "alignment_score": 0.75,
+                "pivot_verdict": "good_pivot",
+            }
+        )
+        assert normalized["alignment_score"] == 0.75
+        assert normalized["pivot_verdict"] is None
 
 
 class TestSessionRecordJudgeFields:
@@ -644,11 +957,69 @@ class TestSessionRecordJudgeFields:
             "score": 0.5,
             "reason": "Did work",
             "model": "openai-subscription/gpt-5.4",
+            "alignment_score": None,
+            "pivot_verdict": None,
             "meta": {
                 "backend": "gptme-fallback",
                 "judge_version": JUDGE_VERSION,
             },
         }
+
+    def test_writeback_persists_alignment_fields(self, tmp_path: Path) -> None:
+        """Phase 3: alignment_score and pivot_verdict survive into legacy_fields."""
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(SessionRecord(session_id="abc123", outcome="productive"))
+
+        with patch(
+            "gptme_sessions.judge.judge_session",
+            return_value={
+                "score": 0.72,
+                "reason": "Good work with justified pivot",
+                "model": "claude-haiku-4-5",
+                "alignment_score": 0.35,
+                "pivot_verdict": "pivot",
+            },
+        ):
+            result = judge_and_writeback(
+                text="session text",
+                category="cross-repo",
+                goals="ship useful work",
+                session_id="abc123",
+                sessions_dir=tmp_path,
+            )
+
+        assert result["status"] == "ok"
+        updated = SessionStore(sessions_dir=tmp_path).load_all()[0]
+        legacy_fields = getattr(updated, "_legacy_fields", {})
+        assert legacy_fields["alignment_score"] == 0.35
+        assert legacy_fields["pivot_verdict"] == "pivot"
+
+    def test_writeback_skips_legacy_when_alignment_absent(self, tmp_path: Path) -> None:
+        """When the judge returns no alignment fields, legacy_fields stays clean."""
+        store = SessionStore(sessions_dir=tmp_path)
+        store.append(SessionRecord(session_id="abc123", outcome="productive"))
+
+        with patch(
+            "gptme_sessions.judge.judge_session",
+            return_value={
+                "score": 0.72,
+                "reason": "Good work",
+                "model": "claude-haiku-4-5",
+            },
+        ):
+            result = judge_and_writeback(
+                text="session text",
+                category="code",
+                goals="ship useful work",
+                session_id="abc123",
+                sessions_dir=tmp_path,
+            )
+
+        assert result["status"] == "ok"
+        updated = SessionStore(sessions_dir=tmp_path).load_all()[0]
+        legacy_fields = getattr(updated, "_legacy_fields", {})
+        assert "alignment_score" not in legacy_fields
+        assert "pivot_verdict" not in legacy_fields
 
 
 class TestJudgeCLI:

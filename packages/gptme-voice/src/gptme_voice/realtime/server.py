@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -26,7 +27,7 @@ import click
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import FileResponse, PlainTextResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocketDisconnect
 
@@ -100,11 +101,45 @@ def _http_post_sync(url: str, payload: bytes, api_key: str) -> None:
         logger.warning("Transcript promotion failed (network): %s", exc)
 
 
-# Delay before actually closing the WebSocket after the model requests hangup,
-# so the goodbye utterance has time to reach the caller.
-_HANGUP_FAREWELL_DELAY_SECONDS = 5.0
+# Brief pause so any queued farewell audio still reaches the caller.
+# The old 5.0s delay was a problem because it kept the call accepting audio
+# long after the model said goodbye. The real termination now happens via the
+# Twilio REST API (calls.update(status='completed')), so the WebSocket close
+# delay only needs to be long enough for buffered audio to drain.
+_HANGUP_FAREWELL_DELAY_SECONDS = 0.5
 _CALL_END_DRAIN_TIMEOUT_SECONDS = 1.5
 _CALL_END_IDLE_TIMEOUT_SECONDS = 0.25
+_USER_HANGUP_INTENT_RE = re.compile(
+    r"\b(?:bye|goodbye|hang\s*up|end(?:ing)?\s+(?:the\s+)?call|disconnect)\b",
+    re.IGNORECASE,
+)
+_ASSISTANT_HANGUP_COMMIT_RE = re.compile(
+    r"(?:"
+    r"\bi(?:'ll| will)\s+(?:hang\s*up|end(?:\s+the)?\s+call)"
+    r"(?:\s+(?:now|shortly|right now))?\b"
+    r"|"
+    r"\bi(?:'ll| will)\s+call\s+the\s+hangup\s+tool"
+    r"(?:\s+to\s+end\s+the\s+call)?(?:\s+(?:now|right now))?\b"
+    r"|"
+    r"\bcalling\s+hangup\s+tool\s+now\b"
+    r"|"
+    r"\bending\s+(?:the\s+)?call\s+now\b"
+    r")",
+    re.IGNORECASE,
+)
+_ASSISTANT_HANGUP_DISQUALIFIERS_RE = re.compile(
+    r"\b(?:"
+    r"would you like|"
+    r"if you'd like|"
+    r"if you would like|"
+    r"if you want|"
+    r"can hang up|"
+    r"could hang up|"
+    r"should i hang up|"
+    r"shall i hang up"
+    r")\b|\?",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -245,11 +280,58 @@ def _build_fresh_call_greeting_instructions(
     )
 
 
+def _build_standup_instructions_guidance() -> str:
+    """Return a guidance block prepended to the main instructions for standup calls.
+
+    Unlike ``_build_standup_call_instructions`` (which only controls the model's
+    first-turn initial response), this block lives in the permanent ``instructions``
+    field and guides the model for the ENTIRE conversation. It is the main fix for
+    two UX regressions:
+
+    1. **Subagent deference on brief-answerable questions**: The generic subagent
+       instructions say "use the subagent tool" for recent-activity queries. During
+       a standup call the brief already contains that data — the model should answer
+       from context first, not reach for a live lookup.
+
+    2. **Stale queue references**: The model's session knowledge may include tweet
+       drafts or deferred tasks that have already been resolved between brief
+       generation and the call.
+    """
+    return (
+        "STANDUP CALL GUIDANCE:\n"
+        "- A pre-generated standup brief is loaded in your instructions below. "
+        "The brief contains the latest blockers, active work, and recent highlights "
+        "as of ~30 minutes before the call.\n"
+        "- When Erik asks follow-up questions about items in the brief (including "
+        "'what else happened?', 'tell me more about X', or 'what's blocking Y'), "
+        "answer from the brief content first. Do NOT use the subagent tool for "
+        "routine recap or elaboration on items already covered by the brief.\n"
+        "- The subagent tool is for genuinely novel questions only: a specific PR "
+        "not mentioned, a task status change since the brief was prepared, or "
+        "something the brief is genuinely silent on.\n"
+        "- Queue state (pending tweets, deferred tasks) in the brief may have "
+        "changed since generation. Frame pending items as 'as of ~30 minutes ago' "
+        "rather than definitely pending. Do NOT volunteer stale queue state that "
+        "is not mentioned in the brief.\n"
+    )
+
+
 def _build_standup_call_instructions(brief_text: str) -> str:
     """Build initial response instructions for a standup call with a pre-generated brief.
 
     Guides the voice model to deliver an outbound standup call that sounds
     deliberate, prepared, and confident — not like a pre-recorded message.
+
+    Critical design constraints:
+    - The brief is pre-generated and loaded into context as part of ``instructions``.
+      After delivery, follow-up questions should be answered from the brief content
+      first, NOT by spawning a subagent. This avoids the failure mode where the
+      model says "let me check that" for a routine recap that's already in its own
+      context window.
+    - Stale queue state (pending tweets, deferred tasks) must not be volunteered
+      unless the brief explicitly mentions them. The model should supplement the
+      brief with its own session knowledge only when the brief is silent on a topic
+      AND the knowledge is clearly current.
     """
     return (
         "This is an outbound daily standup call you initiated to Erik. "
@@ -265,7 +347,25 @@ def _build_standup_call_instructions(brief_text: str) -> str:
         "You prepared this brief for a reason; deliver it like you mean it. "
         "If something is blocking progress, say so plainly. "
         "If something went well, acknowledge it.\n\n"
-        "4. **Hand off** — after the brief, say something like "
+        "4. **Handle follow-up questions from the brief** — when Erik asks a "
+        "follow-up like 'what else happened?' or asks for more detail on something "
+        "in the brief, answer from the brief content already loaded in your "
+        "instructions. The brief bullets (blockers, active_tasks, recent_highlights) "
+        "are available. DO NOT use the subagent tool for routine recap or "
+        "elaboration on items already covered by the brief.\n\n"
+        "5. **Subagent is for genuinely novel questions only** — use the subagent "
+        "tool ONLY when Erik asks about something clearly outside the brief: a "
+        "specific PR that was not mentioned, a task status change since the brief "
+        "was prepared, or a question that the brief is genuinely silent on. For "
+        "routine 'tell me more about X' where X is in the brief, answer from the "
+        "brief rather than reaching for a subagent.\n\n"
+        "6. **Stale content awareness** — the brief is generated ~30 minutes before "
+        "the call. Queue state (pending tweets, deferred tasks) may have changed. "
+        "If the brief mentions pending items, frame them as 'as of ~30 minutes "
+        "ago' rather than asserting they're still pending. Do NOT volunteer stale "
+        "queue state that is not in the brief even if your session knowledge "
+        "suggests those items once existed.\n\n"
+        "7. **Hand off** — after the brief, say something like "
         "'That's what I've got — what do you think?' or 'Over to you — any questions?' "
         "Then stop and wait for Erik to respond.\n\n"
         f"--- Standup brief ---\n\n{brief_text}"
@@ -279,6 +379,44 @@ def _append_transcript_turn(
     cleaned = text.strip()
     if cleaned:
         transcript.append(TranscriptTurn(role=role, text=cleaned))
+
+
+def _normalize_transcript_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _user_requested_hangup(text: str) -> bool:
+    return bool(_USER_HANGUP_INTENT_RE.search(_normalize_transcript_text(text)))
+
+
+def _assistant_committed_hangup(text: str) -> bool:
+    normalized = _normalize_transcript_text(text)
+    if _ASSISTANT_HANGUP_DISQUALIFIERS_RE.search(normalized):
+        return False
+    return bool(_ASSISTANT_HANGUP_COMMIT_RE.search(normalized))
+
+
+def _recent_user_requested_hangup(
+    transcript: list[TranscriptTurn], *, max_user_turns: int = 3
+) -> bool:
+    seen_user_turns = 0
+    for turn in reversed(transcript):
+        if turn.role != "user":
+            continue
+        seen_user_turns += 1
+        if _user_requested_hangup(turn.text):
+            return True
+        if seen_user_turns >= max_user_turns:
+            break
+    return False
+
+
+def _should_trigger_hangup_transcript_fallback(
+    transcript: list[TranscriptTurn], assistant_text: str
+) -> bool:
+    return _assistant_committed_hangup(
+        assistant_text
+    ) and _recent_user_requested_hangup(transcript)
 
 
 def _format_transcript(transcript: list[TranscriptTurn]) -> str:
@@ -338,6 +476,7 @@ def _build_resume_instructions(
 _PROVIDER_OPENAI = "openai"
 _PROVIDER_GROK = "grok"
 _VALID_PROVIDERS = (_PROVIDER_OPENAI, _PROVIDER_GROK)
+_VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
 def _get_twilio_field(payload: dict, camel_name: str, snake_name: str) -> str | None:
@@ -360,13 +499,25 @@ class VoiceServer:
         workspace: str | None = None,
         provider: str = _PROVIDER_OPENAI,
         model: str | None = None,
+        reasoning_effort: str | None = "low",
+        voice: str | None = None,
+        output_speed: float | None = None,
         enable_browser_transport: bool = False,
     ):
         self.host = host
         self.port = port
         self.provider = provider
         self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.voice = voice
+        self.output_speed = output_speed
         self.enable_browser_transport = enable_browser_transport
+        # G.711 μ-law passthrough on the OpenAI Twilio path. Only takes effect
+        # for provider=openai; Grok is unaffected because its API requires PCM.
+        self.openai_g711_passthrough = (
+            (_get_config_env("GPTME_VOICE_OPENAI_G711_PASSTHROUGH") or "").lower()
+            in ("1", "true", "yes")
+        ) and provider == _PROVIDER_OPENAI
         if provider == _PROVIDER_GROK:
             self._api_key = _get_xai_api_key()
         else:
@@ -441,6 +592,7 @@ class VoiceServer:
         ]
         if self.enable_browser_transport:
             routes.append(WebSocketRoute("/voice", self.handle_browser_websocket))
+            routes.append(Route("/browser", self.serve_browser_client, methods=["GET"]))
 
         self.app = Starlette(routes=routes)
 
@@ -735,7 +887,13 @@ class VoiceServer:
         # standup should always deliver the brief, not silently resume a prior session.
         if standup_brief:
             return SessionBootstrap(
-                instructions=f"{standup_brief}\n\n{instructions}",
+                instructions=(
+                    _build_standup_instructions_guidance()
+                    + "\n\n"
+                    + standup_brief
+                    + "\n\n"
+                    + instructions
+                ),
                 should_greet_first=True,
                 initial_response_instructions=_build_standup_call_instructions(
                     standup_brief
@@ -1215,6 +1373,11 @@ class VoiceServer:
         """Health check endpoint."""
         return PlainTextResponse("OK")
 
+    async def serve_browser_client(self, request: Request) -> FileResponse:
+        """Serve the browser WebSocket client HTML."""
+        static_dir = Path(__file__).parent.parent / "static"
+        return FileResponse(static_dir / "index.html", media_type="text/html")
+
     async def handle_incoming_call(self, request: Request) -> PlainTextResponse:
         """
         Handle incoming Twilio call — return TwiML to connect to Media Stream.
@@ -1303,6 +1466,7 @@ class VoiceServer:
         transcript: list[TranscriptTurn] = []
         metadata: dict[str, str] = {}
         handoff_id: str | None = None
+        g711_passthrough = self.openai_g711_passthrough
 
         try:
             async for message in websocket.iter_text():
@@ -1344,21 +1508,24 @@ class VoiceServer:
                     # is detected and awaited by _call_callback.
                     def _make_on_audio(_stream_sid: str):
                         async def _on_audio(audio: bytes) -> None:
-                            await self._send_to_twilio(
-                                websocket,
-                                _stream_sid,
-                                audio_converter.openai_to_twilio(audio),
+                            payload = (
+                                audio
+                                if g711_passthrough
+                                else audio_converter.openai_to_twilio(audio)
                             )
+                            await self._send_to_twilio(websocket, _stream_sid, payload)
 
                         return _on_audio
 
                     on_audio = _make_on_audio(stream_sid)
-
-                    def on_ai_transcript(text: str) -> None:
-                        _append_transcript_turn(transcript, "assistant", text)
-
-                    def on_user_transcript(text: str) -> None:
-                        _append_transcript_turn(transcript, "user", text)
+                    on_ai_transcript, on_user_transcript, _twilio_hangup = (
+                        self._make_transcript_callbacks(
+                            transcript=transcript,
+                            websocket=websocket,
+                            source="twilio",
+                            call_sid=call_sid,
+                        )
+                    )
 
                     # Try to claim a pre-warmed session (no handoff/standup for inbound fresh calls)
                     prewarm_eligible = (
@@ -1400,17 +1567,6 @@ class VoiceServer:
 
                     # Wire tool bridge BEFORE connect/activate so on_function_call
                     # is set when the initial greeting response fires.
-                    hangup_ws = websocket
-                    hangup_call_sid = call_sid
-
-                    async def _twilio_hangup(reason: str | None) -> None:
-                        await self._schedule_hangup(
-                            hangup_ws,
-                            source="twilio",
-                            reason=reason,
-                            call_sid=hangup_call_sid,
-                        )
-
                     tool_bridge = GptmeToolBridge(
                         workspace=self.workspace,
                         on_result=realtime_client.inject_message,
@@ -1434,10 +1590,15 @@ class VoiceServer:
                         media = data.get("media", {})
                         mulaw_b64 = media.get("payload", "")
                         if mulaw_b64:
-                            # Convert to PCM and send to realtime API
                             mulaw_data = base64.b64decode(mulaw_b64)
-                            pcm_data = audio_converter.twilio_to_openai(mulaw_data)
-                            await realtime_client.send_audio(pcm_data)
+                            if g711_passthrough:
+                                # OpenAI session is configured for g711_ulaw —
+                                # forward Twilio's μ-law payload as-is.
+                                await realtime_client.send_audio(mulaw_data)
+                            else:
+                                # Convert to PCM 24kHz and send to realtime API
+                                pcm_data = audio_converter.twilio_to_openai(mulaw_data)
+                                await realtime_client.send_audio(pcm_data)
 
                 elif event == "stop":
                     # Call ended
@@ -1483,7 +1644,7 @@ class VoiceServer:
         instructions: str,
         initial_response_instructions: str = "",
     ) -> SessionConfig:
-        """Build a SessionConfig with optional model override."""
+        """Build a SessionConfig with optional runtime overrides."""
         kwargs: dict = dict(
             instructions=instructions,
             initial_response_instructions=initial_response_instructions,
@@ -1491,6 +1652,14 @@ class VoiceServer:
         )
         if self.model:
             kwargs["model"] = self.model
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.voice:
+            kwargs["voice"] = self.voice
+        if self.output_speed is not None:
+            kwargs["output_speed"] = self.output_speed
+        if self.openai_g711_passthrough:
+            kwargs["g711_passthrough"] = True
         return SessionConfig(**kwargs)
 
     def _make_client(
@@ -1514,6 +1683,55 @@ class VoiceServer:
             **kwargs,
         )
 
+    def _make_transcript_callbacks(
+        self,
+        *,
+        transcript: list[TranscriptTurn],
+        websocket,
+        source: str,
+        call_sid: str | None,
+    ):
+        hangup_task: asyncio.Task[None] | None = None
+
+        def _request_hangup(trigger: str, reason: str | None) -> None:
+            nonlocal hangup_task
+            if hangup_task is not None and not hangup_task.done():
+                logger.info(
+                    "Ignoring duplicate hangup request: source=%s trigger=%s call_sid=%s",
+                    source,
+                    trigger,
+                    call_sid,
+                )
+                return
+            hangup_task = asyncio.create_task(
+                self._schedule_hangup(
+                    websocket,
+                    source=f"{source}:{trigger}",
+                    reason=reason,
+                    call_sid=call_sid,
+                )
+            )
+
+        async def _on_hangup(reason: str | None) -> None:
+            _request_hangup("tool", reason)
+
+        async def _on_ai_transcript(text: str) -> None:
+            _append_transcript_turn(transcript, "assistant", text)
+            if _should_trigger_hangup_transcript_fallback(transcript, text):
+                logger.warning(
+                    "Assistant committed to hanging up without tool; scheduling transcript fallback: %s",
+                    text,
+                )
+                _request_hangup(
+                    "transcript-fallback",
+                    f"assistant said: {text[:120]}",
+                )
+
+        def _on_user_transcript(text: str) -> None:
+            _append_transcript_turn(transcript, "user", text)
+
+        return _on_ai_transcript, _on_user_transcript, _on_hangup
+
     async def handle_local_websocket(self, websocket):
         """
         Handle WebSocket connection for local testing.
@@ -1535,26 +1753,21 @@ class VoiceServer:
                 handoff_id=handoff_id,
             )
             session_cfg = self._build_session_config(instructions=instructions)
+            on_ai_transcript, on_user_transcript, _local_hangup = (
+                self._make_transcript_callbacks(
+                    transcript=transcript,
+                    websocket=websocket,
+                    source="local",
+                    call_sid=None,
+                )
+            )
             realtime_client = self._make_client(
                 session_cfg,
                 on_audio=lambda audio: self._send_local_audio(websocket, audio),
                 on_audio_end=lambda: self._send_local_audio_end(websocket),
-                on_ai_transcript=lambda text: _append_transcript_turn(
-                    transcript, "assistant", text
-                ),
-                on_user_transcript=lambda text: _append_transcript_turn(
-                    transcript, "user", text
-                ),
+                on_ai_transcript=on_ai_transcript,
+                on_user_transcript=on_user_transcript,
             )
-            local_ws = websocket
-
-            async def _local_hangup(reason: str | None) -> None:
-                await self._schedule_hangup(
-                    local_ws,
-                    source="local",
-                    reason=reason,
-                    call_sid=None,
-                )
 
             tool_bridge = GptmeToolBridge(
                 workspace=self.workspace,
@@ -1628,26 +1841,21 @@ class VoiceServer:
                 handoff_id=handoff_id,
             )
             session_cfg = self._build_session_config(instructions=instructions)
+            on_ai_transcript, on_user_transcript, _browser_hangup = (
+                self._make_transcript_callbacks(
+                    transcript=transcript,
+                    websocket=websocket,
+                    source="browser",
+                    call_sid=None,
+                )
+            )
             realtime_client = self._make_client(
                 session_cfg,
                 on_audio=lambda audio: self._send_browser_audio(websocket, audio),
                 on_audio_end=lambda: self._send_browser_audio_end(websocket),
-                on_ai_transcript=lambda text: _append_transcript_turn(
-                    transcript, "assistant", text
-                ),
-                on_user_transcript=lambda text: _append_transcript_turn(
-                    transcript, "user", text
-                ),
+                on_ai_transcript=on_ai_transcript,
+                on_user_transcript=on_user_transcript,
             )
-            browser_ws = websocket
-
-            async def _browser_hangup(reason: str | None) -> None:
-                await self._schedule_hangup(
-                    browser_ws,
-                    source="browser",
-                    reason=reason,
-                    call_sid=None,
-                )
 
             tool_bridge = GptmeToolBridge(
                 workspace=self.workspace,
@@ -1735,6 +1943,11 @@ class VoiceServer:
         ``async for`` and falls through to the ``finally`` block, which runs
         the normal ``_on_call_end`` teardown (post-call hook, transcript
         persistence, resume record).
+
+        For Twilio calls, also fires the REST API ``calls.update(status='completed')``
+        as the authoritative kill — closing the WebSocket alone does NOT terminate
+        the Twilio call at the platform level, which is why calls could continue
+        long after the hangup tool was invoked.
         """
         logger.info(
             "Hangup scheduled: source=%s call_sid=%s reason=%s",
@@ -1742,10 +1955,37 @@ class VoiceServer:
             call_sid,
             reason or "<none>",
         )
+
+        # Fire-and-forget Twilio REST API call termination (authoritative kill).
+        # Do this BEFORE the farewell delay so the call stops accepting audio
+        # from the caller immediately — the farewell utterance was already sent
+        # by the model before it called the hangup tool.
+        twilio_account_sid = _get_config_env("TWILIO_ACCOUNT_SID")
+        twilio_auth_token = _get_config_env("TWILIO_AUTH_TOKEN")
+        if call_sid and twilio_account_sid and twilio_auth_token and "twilio" in source:
+            try:
+                from twilio.rest import Client as TwilioClient
+
+                client = TwilioClient(twilio_account_sid, twilio_auth_token)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, lambda: client.calls(call_sid).update(status="completed")
+                )
+                logger.info("Twilio call %s terminated via REST API", call_sid)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to terminate Twilio call %s via REST API: %s",
+                    call_sid,
+                    exc,
+                )
+
+        # Brief delay so any buffered farewell audio still plays.
         try:
             await asyncio.sleep(_HANGUP_FAREWELL_DELAY_SECONDS)
         except asyncio.CancelledError:
             raise
+
+        # Close the WebSocket to stop the media stream.
         try:
             await websocket.close()
         except Exception as exc:  # pragma: no cover - defensive
@@ -1808,6 +2048,33 @@ class VoiceServer:
     ),
 )
 @click.option(
+    "--reasoning-effort",
+    default="low",
+    type=click.Choice(_VALID_REASONING_EFFORTS),
+    show_default=True,
+    help=(
+        "OpenAI Realtime reasoning effort. Ignored for xAI. OpenAI recommends "
+        "starting gpt-realtime-2 at low for production voice agents."
+    ),
+)
+@click.option(
+    "--voice",
+    default=None,
+    help=(
+        "Override the provider voice. For OpenAI Realtime, current voices include "
+        "echo, alloy, ash, ballad, coral, sage, shimmer, verse, marin, and cedar."
+    ),
+)
+@click.option(
+    "--output-speed",
+    default=None,
+    type=click.FloatRange(0.25, 1.5),
+    help=(
+        "Override spoken output speed. Currently passed through only for OpenAI "
+        "Realtime, which supports 0.25 to 1.5."
+    ),
+)
+@click.option(
     "--enable-browser-transport",
     is_flag=True,
     help="Expose /voice WebSocket for browser PCM transport.",
@@ -1819,6 +2086,9 @@ def main(
     workspace: str | None,
     provider: str,
     model: str | None,
+    reasoning_effort: str,
+    voice: str | None,
+    output_speed: float | None,
     enable_browser_transport: bool,
     debug: bool,
 ):
@@ -1837,13 +2107,24 @@ def main(
         workspace=workspace,
         provider=provider,
         model=model,
+        reasoning_effort=reasoning_effort,
+        voice=voice,
+        output_speed=output_speed,
         enable_browser_transport=enable_browser_transport,
     )
 
-    logger.info(f"Starting voice server on {host}:{port} (provider={provider})")
+    logger.info(
+        "Starting voice server on %s:%s (provider=%s, model=%s, reasoning_effort=%s)",
+        host,
+        port,
+        provider,
+        model or "<default>",
+        reasoning_effort if provider == _PROVIDER_OPENAI else "<ignored>",
+    )
     logger.info(f"Local test endpoint: ws://{host}:{port}/local")
     if enable_browser_transport:
-        logger.info(f"Browser test endpoint: ws://{host}:{port}/voice")
+        logger.info(f"Browser WebSocket endpoint: ws://{host}:{port}/voice")
+        logger.info(f"Browser client UI: http://{host}:{port}/browser")
 
     server.run()
 

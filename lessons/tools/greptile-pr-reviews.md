@@ -1,29 +1,13 @@
 ---
 match:
   keywords:
-    - "trigger greptile re-review after improvements"
-    - "PR received low quality score from greptile"
-    - "validate quality improvements before human review"
-    - "@greptileai review comment"
-    - "post @greptileai"
-    - "request greptile re-review"
-    - "greptile found issues in PR"
     - "greptile score"
     - "trigger greptile"
-    - "retrigger a re-review"
-    - "retrigger greptile"
-    - "pushed fixes after the earlier Greptile"
-    - "after the earlier Greptile review"
-    - "retrigger automated review"
-    - "bot re-review after fixes"
-    - "new commits after bot review"
-    - "request another bot review"
-    - "make the bot take another look"
-    - "bot take another look"
-    - "addressed the automated reviewer"
-    - "automated reviewer's feedback"
-    - "how do I retrigger greptile"
+    - "fresh greptile review"
+    - "greptile after fixing"
+    - "greptile re-review"
   session_categories: [cross-repo, code]
+description: "After new commits land on a PR, retrigger the automated code-quality scoring pass by running greptile-helper.sh to get a fresh evaluation — posting raw bot-trigger comments directly causes duplicate scoring spam when concurrent sessions fire"
 status: active
 ---
 

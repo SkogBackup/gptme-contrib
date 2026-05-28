@@ -101,6 +101,36 @@ def test_confidence_field_now_warned():
         ), "confidence field should produce a warning (store scores in state files, not frontmatter)"
 
 
+def test_description_field_not_warned():
+    """description field is used by hybrid semantic matcher (gptme#2469); should not warn."""
+    content = _MINIMAL_LESSON.format(
+        extra='description: "Persist insights across sessions to prevent rediscovery"'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        desc_warnings = [w for w in validator.warnings if "description" in w]
+        assert (
+            len(desc_warnings) == 0
+        ), "description field is load-bearing for semantic matching and should not warn"
+
+
+def test_metadata_field_not_warned():
+    """metadata field (e.g. metadata.tags) is structural categorisation; should not warn."""
+    content = _MINIMAL_LESSON.format(
+        extra="metadata:\n  tags: [meta-learning, persistent-insight]"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        meta_warnings = [w for w in validator.warnings if "metadata" in w]
+        assert (
+            len(meta_warnings) == 0
+        ), "metadata field is structural categorisation and should not warn"
+
+
 # ---------------------------------------------------------------------------
 # version field tests (Issue #614)
 # ---------------------------------------------------------------------------
@@ -337,3 +367,54 @@ def test_automation_coexists_with_flat_fields_warns():
         assert (
             coexist_warnings
         ), "Coexisting 'automation' block and flat automated_by field should warn"
+
+
+# confound_note field tests
+
+
+def test_confound_note_string_accepted():
+    """A non-empty confound_note string should be accepted without errors."""
+    content = _VALID_LESSON.format(
+        extra='confound_note: "corrective lesson — fires in higher-harm contexts"'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert (
+            not confound_errors
+        ), f"Valid confound_note should not produce errors: {confound_errors}"
+
+
+def test_confound_note_empty_string_rejected():
+    """An empty confound_note string should produce an error."""
+    content = _VALID_LESSON.format(extra='confound_note: ""')
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert confound_errors, "Empty confound_note should produce an error"
+
+
+def test_confound_note_bool_rejected():
+    """A boolean confound_note should produce an error."""
+    content = _VALID_LESSON.format(extra="confound_note: true")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert confound_errors, "Boolean confound_note should produce an error"
+
+
+def test_confound_note_wrong_type_rejected():
+    """A non-string confound_note (e.g. integer) should produce an error."""
+    content = _VALID_LESSON.format(extra="confound_note: 42")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert confound_errors, "Non-string confound_note should produce an error"

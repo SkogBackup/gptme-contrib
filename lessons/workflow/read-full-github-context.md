@@ -1,25 +1,12 @@
 ---
 match:
   keywords:
-    - "truncating github comment output"
-    - "respond to stale context when conversation evolved"
-    - "read entire issue thread before responding"
-    - "missing newer comments that supersede earlier"
-    - "gh pr view --comments | head"
-    - "not reading the whole issue"
-    - "investigate the github issue"
-    - "read the github issue"
-    - "read the issue thread"
-    - "respond to a github issue"
-    - "review pr comments"
-    - "look at the pr discussion"
-    - "check the github discussion"
-    - "reading the issue"
-    - "looking at the issue"
-    - "looking at the pr"
-    - "let me check the issue"
-    - "checking the issue"
+    - "--comments | tail"
+    - "gh issue view --comments"
+    - "gh pr view --comments"
+  session_categories: [cross-repo, code]
 status: active
+description: "NEVER truncate GitHub comment output."
 ---
 
 # Read Full GitHub Context
@@ -73,4 +60,5 @@ Truncation causes responding to OLD comments while missing NEWER replies that ch
 - **No re-asks**: Maintainers don't need to repeat themselves
 
 ## Related
+- Companion doc: `knowledge/lessons/workflow/read-full-github-context.md`
 - [Read PR Reviews Comprehensively](./read-pr-reviews-comprehensively.md) - PR-specific patterns

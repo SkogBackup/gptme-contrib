@@ -1,3 +1,7 @@
+import asyncio
+import importlib
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -221,3 +225,219 @@ def test_wait_on_session_end_disabled():
 
         mock_queue.join.assert_not_called()
         assert len(result) == 0
+
+
+# --- Backend teardown contract tests ---
+
+
+def _import_tts_kokoro():
+    kokoro_stub = types.ModuleType("kokoro")
+    kokoro_stub.KPipeline = type("DummyPipeline", (), {})
+    kokoro_stub.__version__ = "test"
+
+    previous = sys.modules.get("kokoro")
+    sys.modules.pop("tts_kokoro", None)
+    sys.modules["kokoro"] = kokoro_stub
+    try:
+        return importlib.import_module("tts_kokoro")
+    finally:
+        if previous is None:
+            sys.modules.pop("kokoro", None)
+        else:
+            sys.modules["kokoro"] = previous
+
+
+def _import_tts_chatterbox():
+    gradio_client_stub = types.ModuleType("gradio_client")
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    gradio_client_stub.Client = DummyClient
+    gradio_client_stub.handle_file = lambda path: path
+
+    previous = sys.modules.get("gradio_client")
+    sys.modules.pop("tts_chatterbox", None)
+    sys.modules["gradio_client"] = gradio_client_stub
+    try:
+        return importlib.import_module("tts_chatterbox")
+    finally:
+        if previous is None:
+            sys.modules.pop("gradio_client", None)
+        else:
+            sys.modules["gradio_client"] = previous
+
+
+def _import_tts_server():
+    fastapi_stub = types.ModuleType("fastapi")
+    fastapi_responses_stub = types.ModuleType("fastapi.responses")
+
+    class DummyFastAPI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, *args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
+    class DummyHTTPException(Exception):
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    class DummyStreamingResponse:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    fastapi_stub.FastAPI = DummyFastAPI
+    fastapi_stub.HTTPException = DummyHTTPException
+    fastapi_responses_stub.StreamingResponse = DummyStreamingResponse
+
+    previous_fastapi = sys.modules.get("fastapi")
+    previous_fastapi_responses = sys.modules.get("fastapi.responses")
+    sys.modules.pop("tts_server", None)
+    sys.modules["fastapi"] = fastapi_stub
+    sys.modules["fastapi.responses"] = fastapi_responses_stub
+    try:
+        return importlib.import_module("tts_server")
+    finally:
+        if previous_fastapi is None:
+            sys.modules.pop("fastapi", None)
+        else:
+            sys.modules["fastapi"] = previous_fastapi
+        if previous_fastapi_responses is None:
+            sys.modules.pop("fastapi.responses", None)
+        else:
+            sys.modules["fastapi.responses"] = previous_fastapi_responses
+
+
+def test_kokoro_backend_close_contract():
+    """KokoroTTSBackend.close() exists, is idempotent, and does not raise."""
+    module = _import_tts_kokoro()
+
+    with patch.object(module.KokoroTTSBackend, "_check_espeak", return_value=None):
+        backend = module.KokoroTTSBackend(lang_code="a", voice="af_heart")
+
+    backend.pipeline = object()
+    backend.close()
+    assert backend.pipeline is None
+
+    backend.close()
+    assert backend.pipeline is None
+
+
+def test_chatterbox_backend_close_contract():
+    """ChatterboxTTSBackend.close() exists, is idempotent, and does not raise."""
+    module = _import_tts_chatterbox()
+
+    with patch.dict("os.environ", {"HF_TOKEN": "test-token"}):
+        backend = module.ChatterboxTTSBackend(voice_sample_dir="/tmp")
+        backend.close()
+
+    client = MagicMock()
+    backend.client = client
+    backend.close()
+    client.close.assert_called_once()
+    assert backend.client is None
+
+    backend.close()
+    client.close.assert_called_once()
+
+
+def test_lifespan_shutdown_calls_close():
+    """FastAPI lifespan shutdown path calls close() on the backend."""
+    module = _import_tts_server()
+
+    backend = MagicMock()
+
+    async def exercise_lifespan():
+        module.current_backend = None
+        module.backend_name = "kokoro"
+        async with module.lifespan(module.app):
+            assert module.current_backend is backend
+
+        backend.close.assert_called_once()
+        assert module.current_backend is None
+
+    with patch.object(
+        module.TTSBackendLoader,
+        "load_kokoro_backend",
+        return_value=backend,
+    ) as load_backend:
+        asyncio.run(exercise_lifespan())
+
+    load_backend.assert_called_once_with(lang_code="a", voice="af_heart")
+
+
+def test_list_voices_kittentts_uses_tts_model_env_var():
+    """The temporary kittentts backend should honor TTS_MODEL for --list-voices."""
+    module = _import_tts_server()
+    temp_backend = MagicMock()
+    temp_backend.list_voices.return_value = ["Jasper"]
+
+    with (
+        patch.dict("os.environ", {"TTS_MODEL": "KittenML/kitten-tts-mini-0.8"}),
+        patch.object(
+            module.TTSBackendLoader,
+            "load_kittentts_backend",
+            return_value=temp_backend,
+        ) as load_backend,
+        patch("click.echo"),
+    ):
+        module.main.callback(
+            port=8765,
+            host="127.0.0.1",
+            backend="kittentts",
+            voice=None,
+            lang="a",
+            voice_dir=None,
+            list_voices=True,
+            list_backends=False,
+            verbose=False,
+        )
+
+    load_backend.assert_called_once_with(
+        model="KittenML/kitten-tts-mini-0.8",
+        voice="Jasper",
+    )
+    temp_backend.close.assert_called_once()
+
+
+def test_unavailable_kittentts_backend_prints_install_hint():
+    """Unavailable kittentts backend should tell users how to install it."""
+    module = _import_tts_server()
+
+    with (
+        patch.object(
+            module.TTSBackendLoader, "get_available_backends", return_value=[]
+        ),
+        patch("click.echo") as echo,
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        module.main.callback(
+            port=8765,
+            host="127.0.0.1",
+            backend="kittentts",
+            voice=None,
+            lang="a",
+            voice_dir=None,
+            list_voices=False,
+            list_backends=False,
+            verbose=False,
+        )
+
+    assert excinfo.value.code == 1
+    echo.assert_any_call("Backend 'kittentts' is not available.", err=True)
+    echo.assert_any_call("Available backends: []", err=True)
+    echo.assert_any_call(
+        f"Install KittenTTS: pip install {module.KITTENTTS_WHEEL_URL}",
+        err=True,
+    )
+    echo.assert_any_call("Also install: pip install soundfile numpy scipy", err=True)

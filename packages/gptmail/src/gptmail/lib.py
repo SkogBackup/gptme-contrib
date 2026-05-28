@@ -28,11 +28,12 @@ Example:
     Check for unreplied emails::
 
         unreplied = agent.get_unreplied_emails()
-        for msg_id, subject, sender in unreplied:
-            print(f"Need to reply to: {subject} from {sender}")
+        for email in unreplied:
+            print(f"Need to reply to: {email.subject} from {email.sender}")
 """
 
 import email.charset
+import inspect
 import logging
 import os
 import re
@@ -45,9 +46,9 @@ from email.message import EmailMessage, Message
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import default
-from email.utils import format_datetime, parseaddr, parsedate_to_datetime
+from email.utils import format_datetime, getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, NamedTuple, Tuple
 
 import markdown
 
@@ -107,6 +108,25 @@ def fix_list_spacing(markdown_text: str) -> str:
     return "\n".join(result)
 
 
+class UnrepliedEmail(NamedTuple):
+    """Typed representation of an unreplied email.
+
+    Attributes:
+        message_id: The Message-ID header value (with angle brackets).
+        subject: The Subject header value.
+        sender: The sanitized sender email address.
+        date: Parsed Date header as a timezone-aware datetime, or
+            datetime.min if the header was missing or unparseable.
+        folder: The folder the email was found in (e.g. "inbox", "archive").
+    """
+
+    message_id: str
+    subject: str
+    sender: str
+    date: datetime
+    folder: str
+
+
 class AgentEmail:
     """Handles email operations for agent communication.
 
@@ -158,6 +178,12 @@ class AgentEmail:
             raise ValueError(
                 "own_email must be provided or AGENT_EMAIL environment variable must be set"
             )
+        aliases = [
+            alias.strip().lower()
+            for alias in os.getenv("AGENT_EMAIL_ALIASES", "").split(",")
+            if alias.strip()
+        ]
+        self.own_emails: tuple[str, ...] = tuple(dict.fromkeys([self.own_email.lower(), *aliases]))
         # Optional display name for the agent's email
         self.own_email_name: str | None = (
             own_email_name if own_email_name is not None else os.getenv("AGENT_EMAIL_NAME")
@@ -252,6 +278,7 @@ class AgentEmail:
             conversation_id=conversation_id,
             message_id=normalized_id,
             state=MessageState.COMPLETED,
+            metadata={"reply_id": reply_message_id},
         )
 
     def _mark_no_reply_needed(self, message_id: str, reason: str = "no reply needed") -> None:
@@ -270,6 +297,7 @@ class AgentEmail:
             conversation_id=conversation_id,
             message_id=normalized_id,
             state=MessageState.NO_REPLY_NEEDED,
+            metadata={"reason": reason},
         )
 
     def _is_completed(self, message_id: str) -> bool:
@@ -291,23 +319,21 @@ class AgentEmail:
             MessageState.NO_REPLY_NEEDED,
         )
 
-    # TODO: this should probably return some list[Message] or list[EmailMessage] type instead of a list of tuples
-    # TODO: this should probably sort the emails by timestamp in some suitable order (or make it easy for consumers to sort by using an Message type)
-    def get_unreplied_emails(self, folders: list[str] | None = None) -> list[tuple[str, str, str]]:
-        """Get list of emails that haven't been replied to.
+    def get_unreplied_emails(self, folders: list[str] | None = None) -> list[UnrepliedEmail]:
+        """Get list of emails that haven't been replied to, sorted by date (oldest first).
 
         Args:
             folders: List of folders to scan (default: ["inbox"])
                      Pass ["inbox", "archive"] to also check archived emails.
 
         Returns:
-            List of (message_id, subject, sender) tuples for unreplied emails
+            List of UnrepliedEmail named tuples, sorted by date oldest-first.
         """
         if folders is None:
             # Default to inbox only - caller can pass ["inbox", "archive"] if needed
             folders = ["inbox"]
 
-        unreplied = []
+        unreplied_with_dates: list[tuple[datetime, str, UnrepliedEmail]] = []
         seen_message_ids: set[str] = set()  # Avoid duplicates across folders
 
         for folder in folders:
@@ -336,13 +362,22 @@ class AgentEmail:
                     seen_message_ids.add(message_id)
 
                     subject = subject_match.group(1)
+                    date_match = re.search(r"Date: (.+)", content)
                     from_line = from_match.group(1)
 
                     # Skip if not addressed to the agent's email
                     # (only process emails sent TO the agent, not CC'd or other recipients)
-                    if to_match and self.own_email:
-                        to_line = to_match.group(1).lower()
-                        if self.own_email.lower() not in to_line:
+                    if to_match and self.own_emails:
+                        to_line = to_match.group(1)
+                        to_addrs = {addr.lower() for _, addr in getaddresses([to_line]) if addr}
+                        if to_addrs:
+                            is_addressed_to_agent = bool(to_addrs.intersection(self.own_emails))
+                        else:
+                            lower_to_line = to_line.lower()
+                            is_addressed_to_agent = any(
+                                own_email in lower_to_line for own_email in self.own_emails
+                            )
+                        if not is_addressed_to_agent:
                             continue
 
                     # Extract email from "Name <email>" format
@@ -380,13 +415,31 @@ class AgentEmail:
                     if already_replied:
                         continue
 
-                    unreplied.append((message_id, subject, sender))
+                    sort_date = self._parse_email_date(
+                        date_match.group(1) if date_match else "",
+                        invalid_default=datetime.min.replace(tzinfo=timezone.utc),
+                    )
+                    unreplied_with_dates.append(
+                        (
+                            sort_date,
+                            email_file.name,
+                            UnrepliedEmail(
+                                message_id=message_id,
+                                subject=subject,
+                                sender=sender,
+                                date=sort_date,
+                                folder=folder,
+                            ),
+                        )
+                    )
 
                 except Exception as e:
                     print(f"Error processing {email_file}: {e}")
                     continue
 
-        return unreplied
+        # Oldest-first keeps watcher and CLI processing deterministic.
+        unreplied_with_dates.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in unreplied_with_dates]
 
     def _is_allowlisted_sender(self, sender: str) -> bool:
         """Check if sender is allowlisted for auto-responses.
@@ -491,7 +544,8 @@ class AgentEmail:
 
         Args:
             callback_func: Function to call for each unreplied email,
-                          should accept (message_id, subject, sender)
+                          should accept (message_id, subject, sender) and may
+                          opt into date, folder, and email_item keyword args
             folders: List of folders to scan (default: ["inbox"])
 
         Returns:
@@ -500,20 +554,48 @@ class AgentEmail:
         unreplied = self.get_unreplied_emails(folders=folders)
         processed_count = 0
 
-        for message_id, subject, sender in unreplied:
+        for email_item in unreplied:
             # Try to acquire lock (non-blocking with timeout=0)
-            lock_file = self.locks_dir / f"{self._format_filename(message_id)}.lock"
+            lock_file = self.locks_dir / f"{self._format_filename(email_item.message_id)}.lock"
             try:
                 with FileLock(lock_file, timeout=0):
-                    print(f"Processing unreplied email from {sender}: {subject}")
-                    callback_func(message_id, subject, sender)
+                    print(
+                        f"Processing unreplied email from {email_item.sender}: {email_item.subject}"
+                    )
+                    self._call_unreplied_callback(callback_func, email_item)
                     processed_count += 1
             except LockError:
-                print(f"Skipping {message_id} (already being processed)")
+                print(f"Skipping {email_item.message_id} (already being processed)")
             except Exception as e:
-                print(f"Error processing {message_id}: {e}")
+                print(f"Error processing {email_item.message_id}: {e}")
 
         return processed_count
+
+    def _call_unreplied_callback(self, callback_func, email_item: UnrepliedEmail) -> None:
+        """Invoke an unreplied-email callback without breaking legacy consumers."""
+        legacy_args = (email_item.message_id, email_item.subject, email_item.sender)
+
+        try:
+            signature = inspect.signature(callback_func)
+        except (TypeError, ValueError):
+            callback_func(*legacy_args)
+            return
+
+        parameters = signature.parameters
+        accepts_varkw = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+
+        extra_kwargs = {}
+        for name, value in (
+            ("date", email_item.date),
+            ("folder", email_item.folder),
+            ("email_item", email_item),
+        ):
+            if accepts_varkw or name in parameters:
+                extra_kwargs[name] = value
+
+        callback_func(*legacy_args, **extra_kwargs)
 
     def _generate_message_id(self) -> str:
         """Generate a unique message ID.
@@ -1032,18 +1114,22 @@ class AgentEmail:
 
         return "unknown"
 
-    def _parse_email_date(self, date_str: str) -> datetime:
+    def _parse_email_date(
+        self, date_str: str, *, invalid_default: datetime | None = None
+    ) -> datetime:
         """Parse email date string to datetime object."""
         if not date_str:
             return datetime.min.replace(tzinfo=timezone.utc)
+
+        if invalid_default is None:
+            invalid_default = datetime.now(timezone.utc)
 
         try:
             # Try parsing RFC 2822 format
 
             return parsedate_to_datetime(date_str)
         except Exception:
-            # Fallback to current time if parsing fails
-            return datetime.now(timezone.utc)
+            return invalid_default
 
     def _format_thread_display(self, message_id: str) -> str:
         """Format a complete thread for display."""

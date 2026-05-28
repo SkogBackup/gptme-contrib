@@ -63,6 +63,7 @@ if [ "${GIT_SAFE_COMMIT_LOCK_HELD:-0}" != "1" ]; then
 fi
 
 if [ "${GIT_SAFE_COMMIT_EXPECT_CLEAN:-0}" = "1" ]; then
+  ALLOW_UNTRACKED="${GIT_SAFE_COMMIT_ALLOW_UNTRACKED:-0}"
   UNSTAGED_FILES="$(git diff --name-only --ignore-submodules -- 2>/dev/null)" || true
   UNTRACKED_FILES="$(git ls-files --others --exclude-standard 2>/dev/null)" || true
   DIRTY_COUNT=0
@@ -70,7 +71,7 @@ if [ "${GIT_SAFE_COMMIT_EXPECT_CLEAN:-0}" = "1" ]; then
   if [ -n "$UNSTAGED_FILES" ]; then
     DIRTY_COUNT=$((DIRTY_COUNT + $(printf '%s\n' "$UNSTAGED_FILES" | grep -c . || true)))
   fi
-  if [ -n "$UNTRACKED_FILES" ]; then
+  if [ "$ALLOW_UNTRACKED" != "1" ] && [ -n "$UNTRACKED_FILES" ]; then
     DIRTY_COUNT=$((DIRTY_COUNT + $(printf '%s\n' "$UNTRACKED_FILES" | grep -c . || true)))
   fi
 
@@ -82,7 +83,9 @@ if [ "${GIT_SAFE_COMMIT_EXPECT_CLEAN:-0}" = "1" ]; then
     echo -e "${YELLOW}Sample dirty paths:${NC}" >&2
     {
       printf '%s\n' "$UNSTAGED_FILES"
-      printf '%s\n' "$UNTRACKED_FILES"
+      if [ "$ALLOW_UNTRACKED" != "1" ]; then
+        printf '%s\n' "$UNTRACKED_FILES"
+      fi
     } | grep -v '^$' | head -10 | sed 's/^/  /' >&2
     if [ "$DIRTY_COUNT" -gt 10 ]; then
       echo "  ... and $((DIRTY_COUNT - 10)) more" >&2
@@ -112,6 +115,9 @@ run_precommit() {
   fi
 }
 
+WORKTREE_RAW_BEFORE="$(git diff --raw --no-ext-diff --ignore-submodules -- 2>/dev/null || true)"
+INDEX_TREE_BEFORE="$(git write-tree 2>/dev/null || true)"
+
 set +e
 PRECOMMIT_OUTPUT="$(run_precommit 2>&1)"
 PRECOMMIT_EXIT=$?
@@ -122,25 +128,46 @@ if [ $PRECOMMIT_EXIT -eq 0 ]; then
   exit 0
 else
   echo "$PRECOMMIT_OUTPUT"
-  echo -e "${YELLOW}Pre-commit modified files, checking for auto-staging...${NC}"
 
-  # Check if any files were actually modified
-  if git diff --quiet; then
-    echo -e "${RED}✗ Pre-commit failed but no files were modified${NC}"
-    echo -e "${RED}This indicates a real failure, not auto-fixing${NC}"
+  WORKTREE_RAW_AFTER="$(git diff --raw --no-ext-diff --ignore-submodules -- 2>/dev/null || true)"
+  INDEX_TREE_AFTER="$(git write-tree 2>/dev/null || true)"
+  WORKTREE_CHANGED=0
+  INDEX_CHANGED=0
+
+  if [ "$WORKTREE_RAW_AFTER" != "$WORKTREE_RAW_BEFORE" ]; then
+    WORKTREE_CHANGED=1
+  fi
+  if [ "$INDEX_TREE_AFTER" != "$INDEX_TREE_BEFORE" ]; then
+    INDEX_CHANGED=1
+  fi
+
+  # Distinguish real hook failures from auto-fixable changes. Some hooks leave
+  # unstaged formatter edits in the worktree; others stage their own fixes
+  # directly. Both cases should trigger a verification rerun instead of a hard
+  # failure.
+  if [ $WORKTREE_CHANGED -eq 0 ] && [ $INDEX_CHANGED -eq 0 ]; then
+    echo -e "${RED}✗ Pre-commit hook failed (no auto-fixable changes)${NC}" >&2
+    echo -e "${RED}  See the hook output above for the specific failure and fix.${NC}" >&2
+    echo -e "${RED}  To re-run a single hook directly: ${PRECOMMIT_CMD} run --files <path>${NC}" >&2
     exit 1
   fi
 
-  while IFS= read -r file; do
-    for staged_file in "${ORIGINALLY_STAGED_FILES[@]}"; do
-      if [ "$file" = "$staged_file" ]; then
-        git add "$file"
-        break
-      fi
-    done
-  done < <(git diff --name-only --diff-filter=M)
+  if [ $WORKTREE_CHANGED -eq 1 ]; then
+    echo -e "${YELLOW}Pre-commit modified files, auto-staging formatter fixes...${NC}"
 
-  echo -e "${GREEN}✓ Auto-staged formatter fixes for originally staged files${NC}"
+    while IFS= read -r file; do
+      for staged_file in "${ORIGINALLY_STAGED_FILES[@]}"; do
+        if [ "$file" = "$staged_file" ]; then
+          git add "$file"
+          break
+        fi
+      done
+    done < <(git diff --name-only --diff-filter=M)
+
+    echo -e "${GREEN}✓ Auto-staged formatter fixes for originally staged files${NC}"
+  else
+    echo -e "${YELLOW}Pre-commit updated staged files directly (staged-file updates), re-running checks...${NC}"
+  fi
 
   # Re-run pre-commit to verify all checks pass
   echo -e "${GREEN}Re-running pre-commit checks (via $PRECOMMIT_CMD)...${NC}"
@@ -151,11 +178,11 @@ else
   set -e
 
   if [ $PRECOMMIT_EXIT -eq 0 ]; then
-    echo -e "${GREEN}✓ All checks passed after auto-staging${NC}"
+    echo -e "${GREEN}✓ All checks passed after verification re-run${NC}"
     exit 0
   else
     echo "$PRECOMMIT_OUTPUT"
-    echo -e "${RED}✗ Pre-commit still failing after auto-staging${NC}"
+    echo -e "${RED}✗ Pre-commit still failing after verification re-run${NC}"
     exit 1
   fi
 fi

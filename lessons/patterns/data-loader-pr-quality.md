@@ -1,15 +1,11 @@
 ---
 match:
   keywords:
-  - data loader
-  - csv loader
   - file not found
   - assert path
-  - missing file test
-  - loader test
-  - timezone assertion
   session_categories: [code]
 status: active
+description: "When writing data loader PRs for any data pipeline, apply these six patterns to produce production-quality code that passes automated review on the first cycle."
 ---
 
 # Data Loader PR Quality Patterns

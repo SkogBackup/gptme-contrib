@@ -1,4 +1,5 @@
 ---
+description: "When a PR is accidentally closed, recover it cleanly rather than opening a duplicate with the same diff"
 match:
   keywords:
     - closed pr
@@ -6,6 +7,7 @@ match:
     - replace pr
   session_categories: [cross-repo, cleanup]
 status: active
+target_grade: productivity
 ---
 
 # PR Recovery After Accidental Closure

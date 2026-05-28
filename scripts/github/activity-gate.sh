@@ -73,10 +73,12 @@
 #   first-time discovery DOES emit immediately — merge-ready PRs are actionable.
 #   State-tracked with 12-hour cooldown; re-emits on HEAD SHA change.
 #
-#   API efficiency: PR data is fetched once per repo via fetch_pr_data() and
-#   shared across check_pr_updates, check_ci_failures, check_merge_conflicts,
-#   and check_merge_ready.
-#   This reduces gh pr list calls from 3N to N (where N = number of repos).
+#   API efficiency: cached PR data is fetched once per repo via fetch_pr_data()
+#   and shared across the state-tracked checks (PR updates, CI failures,
+#   Greptile sweep). Merge-sensitive checks (merge conflicts, merge-ready) use
+#   a live PR fetch each run so they don't inherit cache staleness.
+#   This reduces gh pr list calls from 3N to ~1.5N on average (where N = number
+#   of repos), while preserving the "nag every run" merge-conflict contract.
 #   The repo list from discover_repos() is cached for 1 hour.
 #
 #   Parallelism: Per-repo work runs concurrently (up to 8 repos at once).
@@ -177,9 +179,10 @@ emit_item() {
 }
 
 discover_repos() {
-    # Cache repo list for 1 hour — org membership rarely changes
+    # Cache repo list for 1 hour by default — org membership rarely changes.
+    # Override with GH_CACHE_TTL_REPO (seconds).
     local cache_file="$STATE_DIR/repo-list-${ORG}.cache"
-    local cache_max_age=3600  # seconds
+    local cache_max_age="${GH_CACHE_TTL_REPO:-3600}"
 
     if [ -f "$cache_file" ]; then
         local cache_age
@@ -207,15 +210,105 @@ discover_repos() {
     for r in "${EXTRA_REPOS[@]}"; do echo "$r"; done
 }
 
-# Fetch all PR data once per repo, with all fields needed by every check function.
-# This replaces 3 separate `gh pr list` calls with a single one.
-fetch_pr_data() {
+# Per-repo GraphQL response cache. Project monitoring runs every 2 minutes
+# across 50 repos, so the old defaults implied roughly 750 PR-data fetches/hr
+# plus 500/hr each for assigned-issue and master-CI fetches (~1,750/hr total).
+# Raising the defaults to 480s / 600s / 600s drops those lanes to ~375 / 300 /
+# 300 fetches/hr (~975/hr total) without changing cadence.
+#
+# Override via env: GH_CACHE_TTL_PR / GH_CACHE_TTL_ISSUE / GH_CACHE_TTL_RUN (seconds).
+# Set any to 0 to bypass the cache (useful for diagnostics).
+GH_CACHE_DIR="${GH_CACHE_DIR:-$STATE_DIR/gh-cache}"
+# Increased from 240→480 and 300→600 (2026-05-21) after GraphQL rate-limit regression.
+# At a 2-minute cadence, the PR-data lane drops from ~750 fetches/hr to ~375/hr
+# (75% cache hit instead of 50%).
+# See: tasks/github-graphql-rate-limit-regression.md
+GH_CACHE_TTL_PR="${GH_CACHE_TTL_PR:-480}"
+GH_CACHE_TTL_ISSUE="${GH_CACHE_TTL_ISSUE:-600}"
+GH_CACHE_TTL_RUN="${GH_CACHE_TTL_RUN:-600}"
+
+# Read cached value if fresh enough, else run the producer command and cache its
+# stdout. The producer is passed as a single shell-evaluated string so callers
+# can include flags and pipes.
+#
+# Args:
+#   $1 — cache key (filesystem-safe; will be normalized)
+#   $2 — TTL seconds (0 = no cache)
+#   $3 — producer command (eval'd in subshell)
+#   $4 — fallback stdout to emit on producer failure (optional; not cached)
+gh_cache_get_or_fetch() {
+    local key="$1" ttl="$2" producer="$3" fallback="${4-}"
+    if [ "$ttl" -le 0 ]; then
+        if eval "$producer"; then
+            return 0
+        fi
+        if [ $# -ge 4 ]; then
+            printf '%s' "$fallback"
+            return 0
+        fi
+        return 1
+    fi
+    mkdir -p "$GH_CACHE_DIR" 2>/dev/null || true
+    # Normalize key: replace slashes with `-`
+    local safe_key="${key//\//-}"
+    local cache_file="$GH_CACHE_DIR/${safe_key}.json"
+    if [ -f "$cache_file" ]; then
+        local mtime
+        mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo "")
+        if [ -n "$mtime" ]; then
+            local age=$(( $(date +%s) - mtime ))
+            if [ "$age" -lt "$ttl" ]; then
+                cat "$cache_file"
+                return 0
+            fi
+        fi
+    fi
+    local out tmp_file
+    if out=$(eval "$producer"); then
+        if [ -n "$out" ]; then
+            tmp_file=$(mktemp "$GH_CACHE_DIR/${safe_key}.json.tmp.XXXXXX" 2>/dev/null || printf '')
+            if [ -n "$tmp_file" ]; then
+                # Write via temp file + rename so readers never observe partial JSON.
+                if ! printf '%s' "$out" > "$tmp_file" || ! mv "$tmp_file" "$cache_file"; then
+                    rm -f "$tmp_file"
+                fi
+            fi
+        fi
+        printf '%s' "$out"
+        return 0
+    fi
+    if [ $# -ge 4 ]; then
+        printf '%s' "$fallback"
+        return 0
+    fi
+    return 1
+}
+
+# Fetch all PR data once per repo, with all fields needed by every check
+# function. Cache state-tracked checks, but let merge-sensitive callers opt out
+# so they always see live merge status.
+fetch_pr_data_with_ttl() {
     local repo=$1
+    local ttl=$2
     # Filter out draft PRs — they're intentionally deprioritized/not on merge path
-    gh pr list --repo "$repo" --author "$AUTHOR" --state open \
-        --json number,title,updatedAt,comments,latestReviews,statusCheckRollup,mergeable,mergeStateStatus,headRefOid,isDraft \
-        --jq '[.[] | select(.isDraft | not)]' \
-        2>/dev/null || echo "[]"
+    gh_cache_get_or_fetch "pr-${repo}" "$ttl" \
+        "gh pr list --repo '$repo' --author '$AUTHOR' --state open \
+            --json number,title,updatedAt,comments,latestReviews,statusCheckRollup,mergeable,mergeStateStatus,headRefOid,isDraft \
+            --jq '[.[] | select(.isDraft | not)]' \
+            2>/dev/null" \
+        "[]"
+}
+
+# Cached view for state-tracked checks; default TTL is tuned to the 2-minute gate
+# cadence to cut GraphQL load roughly in half.
+fetch_pr_data() {
+    fetch_pr_data_with_ttl "$1" "$GH_CACHE_TTL_PR"
+}
+
+# Live view for merge-sensitive checks. They intentionally bypass the cache so
+# conflict nagging and merge readiness reflect the current branch state.
+fetch_live_pr_data() {
+    fetch_pr_data_with_ttl "$1" 0
 }
 
 # Check whether the last activity on a PR was from someone worth responding to.
@@ -352,12 +445,16 @@ check_ci_failures() {
     done
 }
 
-# Check for assigned issues with new activity (state-tracked like PRs)
+# Check for assigned issues with new activity (state-tracked like PRs).
+# Cached at GH_CACHE_TTL_ISSUE (default 300s); assigned-issue updates aren't
+# 2-min-urgent — the gate's state-tracking still fires when cache refreshes.
 check_assigned_issues() {
     local repo=$1
     local issues
-    issues=$(gh issue list --repo "$repo" --assignee "$AUTHOR" --state open \
-        --json number,title,updatedAt 2>/dev/null || echo "[]")
+    issues=$(gh_cache_get_or_fetch "issue-${repo}" "$GH_CACHE_TTL_ISSUE" \
+        "gh issue list --repo '$repo' --assignee '$AUTHOR' --state open \
+            --json number,title,updatedAt 2>/dev/null" \
+        "[]")
     [ "$issues" = "[]" ] || [ -z "$issues" ] && return 0
 
     echo "$issues" | jq -c '.[]' | while read -r issue_data; do
@@ -387,12 +484,16 @@ check_assigned_issues() {
 check_master_ci() {
     local repo=$1
     local runs
-    runs=$(gh run list --repo "$repo" --branch master --limit 3 \
-        --json databaseId,name,conclusion,createdAt 2>/dev/null || echo "[]")
+    runs=$(gh_cache_get_or_fetch "run-master-${repo}" "$GH_CACHE_TTL_RUN" \
+        "gh run list --repo '$repo' --branch master --limit 3 \
+            --json databaseId,name,conclusion,createdAt 2>/dev/null" \
+        "[]")
     # Also try 'main' if master returned nothing
     if [ "$runs" = "[]" ]; then
-        runs=$(gh run list --repo "$repo" --branch main --limit 3 \
-            --json databaseId,name,conclusion,createdAt 2>/dev/null || echo "[]")
+        runs=$(gh_cache_get_or_fetch "run-main-${repo}" "$GH_CACHE_TTL_RUN" \
+            "gh run list --repo '$repo' --branch main --limit 3 \
+                --json databaseId,name,conclusion,createdAt 2>/dev/null" \
+            "[]")
     fi
     [ "$runs" = "[]" ] || [ -z "$runs" ] && return 0
 
@@ -426,7 +527,7 @@ check_master_ci() {
 
 # Check for merge conflicts on open PRs (DIRTY or CONFLICTING status).
 # Intentionally NOT state-tracked — conflicts should nag every run until resolved.
-# Accepts pre-fetched PR data from fetch_pr_data() to avoid redundant API calls.
+# Callers should pass live PR data (fetch_live_pr_data), not the cached view.
 check_merge_conflicts() {
     local repo=$1
     local prs=$2
@@ -782,8 +883,20 @@ running=0
 for repo in $all_repos; do
     repo_safe="${repo//\//-}"
     (
-        # Fetch all PR data once per repo (replaces 3 separate gh pr list calls)
+        # Cached PR data drives the state-tracked checks.
         pr_data=$(fetch_pr_data "$repo")
+        # Merge-sensitive checks need live status every run, but only for repos
+        # that actually have open author PRs. When the cached lane already shows
+        # no open PRs, a live merge-status fetch can only return the same empty
+        # set, so skip the GraphQL call. On a multi-repo org most repos have zero
+        # open author PRs at any moment, so this removes the dominant idle-time
+        # GraphQL burner without weakening live merge detection for repos that do
+        # have PRs. See tasks/github-graphql-rate-limit-regression.md.
+        if [ "$(printf '%s' "$pr_data" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]; then
+            live_pr_data=$(fetch_live_pr_data "$repo")
+        else
+            live_pr_data="[]"
+        fi
         repo_items=""
 
         items=$(check_pr_updates "$repo" "$pr_data" 2>/dev/null || true)
@@ -798,13 +911,13 @@ for repo in $all_repos; do
         items=$(check_master_ci "$repo" 2>/dev/null || true)
         [ -n "$items" ] && repo_items+="$items"$'\n'
 
-        items=$(check_merge_conflicts "$repo" "$pr_data" 2>/dev/null || true)
+        items=$(check_merge_conflicts "$repo" "$live_pr_data" 2>/dev/null || true)
         [ -n "$items" ] && repo_items+="$items"$'\n'
 
         items=$(check_greptile_scores "$repo" "$pr_data" 2>/dev/null || true)
         [ -n "$items" ] && repo_items+="$items"$'\n'
 
-        items=$(check_merge_ready "$repo" "$pr_data" 2>/dev/null || true)
+        items=$(check_merge_ready "$repo" "$live_pr_data" 2>/dev/null || true)
         [ -n "$items" ] && repo_items+="$items"$'\n'
 
         [ -n "$repo_items" ] && printf '%s' "$repo_items" > "$PARALLEL_TMPDIR/$repo_safe"

@@ -1,22 +1,20 @@
 ---
 match:
   keywords:
-  - "github issue"
-  - "open issue"
-  - "create issue"
-  - "close issue"
   - "about to create new issue"
   - "duplicate issue prevention"
   - "search existing issues first"
   - "check for similar issues"
   - "update issue after work"
-  - "gh issue"
   - "check own previous comments"
   - "agent created duplicate issues"
   - "duplicate comment prevention"
   - "triple posted"
   - "comment spam"
+  - "check if already commented"
+  - "before posting any comment"
 status: active
+description: "Always search for existing issues/PRs before creating new ones, read full context before engaging, check your own previous comments before posting, and update issues/PRs after completing work."
 ---
 
 # GitHub Issue and PR Engagement

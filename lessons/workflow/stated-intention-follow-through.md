@@ -1,14 +1,13 @@
 ---
+description: "When you state an intention (I will do X), follow through on it in the same session — unmet stated intentions erode trust"
 status: active
 match:
   keywords:
-  - i'll do
-  - i will
-  - follow through
-  - accountability
-  - intention
-  - promise
-  - stated intention
+  - "I'll submit a PR"
+  - "comment promising"
+  - "I'll fix this"
+  - "promised to"
+  - "stated intention"
 ---
 
 # Stated Intention Follow-Through

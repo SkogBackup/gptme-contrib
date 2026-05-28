@@ -1,6 +1,8 @@
 ---
+description: "When improving gptme-contrib, create a feature branch, PR, wait for merge, then advance the submodule pointer"
 match:
-  keywords: ["contribute lesson", "contrib PR", "external contribution", "submit lesson", "upstream lesson", "upstream to gptme-contrib"]
+  keywords: ["contrib PR"]
+  session_categories: [cross-repo, code]
 status: active
 ---
 

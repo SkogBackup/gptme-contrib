@@ -8,6 +8,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import click
 
@@ -32,6 +33,12 @@ from .discovery import (
     session_datetime_from_path,
 )
 from .post_session import VALID_AB_GROUPS, VALID_CONTEXT_TIERS, post_session
+from .replay import (
+    ToolResultsMode,
+    render_replay,
+    resolve_replay_target,
+    resolve_session_record_prefix,
+)
 from .record import SessionRecord, normalize_run_type
 from .signals import extract_from_path
 from .store import (
@@ -43,7 +50,87 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 
-HARNESS_CHOICES = ["gptme", "claude-code", "codex", "copilot"]
+HARNESS_CHOICES = ["gptme", "claude-code", "codex", "copilot-cli"]
+
+# Maps usage dict keys (from extract_from_path) to SessionRecord field names.
+_USAGE_FIELD_MAP: dict[str, str] = {
+    "model": "model",
+    "total_tokens": "token_count",
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_creation_tokens": "cache_creation_tokens",
+    "cache_read_tokens": "cache_read_tokens",
+    "sys_prompt_tokens": "sys_prompt_tokens",
+    "context_peak_tokens": "context_peak_tokens",
+    "context_window": "context_window",
+    "sys_prompt_bytes": "sys_prompt_bytes",
+    "first_turn_bytes": "first_turn_bytes",
+    "context_peak_bytes": "context_peak_bytes",
+    "session_total_bytes": "session_total_bytes",
+}
+
+
+def _assign_if_missing(record: SessionRecord, field: str, value: object) -> bool:
+    """Set ``record.field`` when it is empty/unknown and ``value`` is usable."""
+    if value is None:
+        return False
+    current = getattr(record, field)
+    if isinstance(current, list):
+        if current:
+            return False
+        if isinstance(value, list):
+            setattr(record, field, value)
+            return True
+        return False
+    if current not in (None, "", 0, "unknown"):
+        return False
+    if current == value:
+        return False
+    setattr(record, field, value)
+    return True
+
+
+def _apply_extract_result_to_record(record: SessionRecord, result: dict) -> bool:
+    """Backfill missing fields on an existing record from ``extract_from_path`` output."""
+    changed = False
+
+    if record.outcome == "unknown":
+        record.outcome = "productive" if result.get("productive") else "noop"
+        changed = True
+    changed |= _assign_if_missing(
+        record, "duration_seconds", int(result.get("session_duration_s") or 0)
+    )
+    changed |= _assign_if_missing(record, "deliverables", result.get("deliverables", []))
+    changed |= _assign_if_missing(
+        record, "deliverable_details", result.get("deliverable_details", [])
+    )
+    changed |= _assign_if_missing(record, "category", result.get("inferred_category"))
+
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        for usage_key, record_key in _USAGE_FIELD_MAP.items():
+            changed |= _assign_if_missing(record, record_key, usage.get(usage_key))
+
+    return changed
+
+
+def _apply_extract_result_to_kwargs(record_kwargs: dict, result: dict) -> None:
+    """Populate new-record kwargs from ``extract_from_path`` output."""
+    record_kwargs["outcome"] = "productive" if result.get("productive") else "noop"
+    record_kwargs["duration_seconds"] = int(result.get("session_duration_s") or 0)
+    record_kwargs["deliverables"] = result.get("deliverables", [])
+    record_kwargs["deliverable_details"] = result.get("deliverable_details", [])
+    if result.get("inferred_category"):
+        record_kwargs["category"] = result["inferred_category"]
+
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return
+
+    for usage_key, record_key in _USAGE_FIELD_MAP.items():
+        value = usage.get(usage_key)
+        if value is not None:
+            record_kwargs[record_key] = value
 
 
 def _judge_fields(
@@ -124,11 +211,11 @@ def _discover_all(
                     "project": extract_project("codex", p),
                 }
             )
-    if harness_filter in (None, "copilot"):
+    if harness_filter in (None, "copilot-cli"):
         for p in discover_copilot_sessions(start, today):
             discovered.append(
                 {
-                    "harness": "copilot",
+                    "harness": "copilot-cli",
                     "path": p,
                     "session_date": session_date_from_path("copilot", p),
                     "session_name": extract_session_name("copilot", p),
@@ -378,20 +465,10 @@ def show(ctx: click.Context, session_id: str, as_json: bool) -> None:
     if not session_id:
         raise click.UsageError("Session ID must not be empty.")
     store = SessionStore(sessions_dir=ctx.obj["sessions_dir"])
-    records = store.load_all()
-    matches = [r for r in records if r.session_id.startswith(session_id)]
-    if not matches:
-        raise click.ClickException(
-            f"No session found matching '{session_id}'. "
-            "Run 'gptme-sessions query' to list available session IDs."
-        )
-    if len(matches) > 1:
-        raise click.ClickException(
-            f"Ambiguous prefix '{session_id}' matches {len(matches)} sessions: "
-            + ", ".join(r.session_id for r in matches)
-            + ". Run 'gptme-sessions query' to list available session IDs."
-        )
-    record = matches[0]
+    try:
+        record = resolve_session_record_prefix(store.load_all(), session_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
 
     if as_json:
         click.echo(json.dumps(record.to_dict(), indent=2))
@@ -831,11 +908,11 @@ def discover(
                 }
             )
 
-    if harness in (None, "copilot"):
+    if harness in (None, "copilot-cli"):
         for p in discover_copilot_sessions(start, today):
             discovered.append(
                 {
-                    "harness": "copilot",
+                    "harness": "copilot-cli",
                     "path": str(p),
                     "session_date": session_date_from_path("copilot", p),
                 }
@@ -1165,6 +1242,65 @@ def transcript(path: Path, as_json: bool, messages_only: bool) -> None:
                 click.echo(f"  {ts_str}{msg.role}: {content_preview}")
 
 
+@cli.command()
+@click.argument("target")
+@click.option(
+    "--raw-system",
+    is_flag=True,
+    help="Show initial system messages instead of collapsing them",
+)
+@click.option(
+    "--tool-input",
+    is_flag=True,
+    help="Show structured tool inputs for tool calls",
+)
+@click.option(
+    "--tool-results",
+    type=click.Choice(["summary", "full", "hide"], case_sensitive=False),
+    default="summary",
+    show_default=True,
+    help="How to render tool result payloads",
+)
+@click.option(
+    "--tail",
+    type=click.IntRange(min=1),
+    help="Render only the last N normalized messages",
+)
+@click.pass_context
+def replay(
+    ctx: click.Context,
+    target: str,
+    raw_system: bool,
+    tool_input: bool,
+    tool_results: str,
+    tail: int | None,
+) -> None:
+    """Replay a completed session in the terminal.
+
+    TARGET can be either a trajectory path or a session-record ID prefix.
+    """
+    try:
+        transcript = resolve_replay_target(target, sessions_dir=ctx.obj["sessions_dir"])
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc))
+    except PermissionError:
+        raise click.ClickException(f"cannot read {target}: permission denied")
+    except UnicodeDecodeError:
+        raise click.ClickException(f"{target} contains non-UTF-8 content")
+
+    tool_results_mode = cast(ToolResultsMode, tool_results)
+    click.echo(
+        render_replay(
+            transcript,
+            raw_system=raw_system,
+            show_tool_input=tool_input,
+            tool_results=tool_results_mode,
+            tail=tail,
+        ),
+        nl=False,
+    )
+
+
 # -- sync --------------------------------------------------------------------
 
 
@@ -1319,18 +1455,45 @@ def sync(
                 existing.project = entry["project"]
                 needs_update = True
 
-            # With --signals, backfill records that have no outcome yet.
-            if with_signals and existing.outcome == "unknown" and traj_path.is_file():
+            # Copilot trajectories never contain token-count fields — only byte
+            # metrics and model name are extractable. Checking token fields for
+            # copilot-cli sessions would keep usage_backfill_needed=True forever.
+            if existing.harness == "copilot-cli":
+                _backfill_fields: tuple[str, ...] = (
+                    "model",
+                    "sys_prompt_bytes",
+                    "first_turn_bytes",
+                    "context_peak_bytes",
+                    "session_total_bytes",
+                )
+            else:
+                _backfill_fields = (
+                    "token_count",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_tokens",
+                    "cache_read_tokens",
+                    "sys_prompt_tokens",
+                    "context_peak_tokens",
+                    "context_window",
+                    "sys_prompt_bytes",
+                    "first_turn_bytes",
+                    "context_peak_bytes",
+                    "session_total_bytes",
+                )
+            usage_backfill_needed = any(
+                getattr(existing, field) is None for field in _backfill_fields
+            )
+
+            if (
+                with_signals
+                and traj_path.is_file()
+                and (existing.outcome == "unknown" or usage_backfill_needed)
+            ):
                 if not dry_run:
                     try:
                         result = extract_from_path(traj_path)
-                        existing.outcome = "productive" if result.get("productive") else "noop"
-                        existing.duration_seconds = int(result.get("session_duration_s") or 0)
-                        if not existing.deliverables:
-                            existing.deliverables = result.get("deliverables", [])
-                        if result.get("inferred_category") and not existing.category:
-                            existing.category = result["inferred_category"]
-                        needs_update = True
+                        needs_update |= _apply_extract_result_to_record(existing, result)
                     except Exception as exc:
                         click.echo(
                             f"  warning: signals extraction failed for {path_str}: {exc}",
@@ -1340,7 +1503,11 @@ def sync(
                             skipped += 1
                 else:
                     needs_update = True  # mark for dry-run reporting
-            elif with_signals and existing.outcome == "unknown" and not traj_path.is_file():
+            elif (
+                with_signals
+                and not traj_path.is_file()
+                and (existing.outcome == "unknown" or usage_backfill_needed)
+            ):
                 click.echo(
                     f"  warning: trajectory not found, cannot backfill signals for {path_str}",
                     err=True,
@@ -1396,11 +1563,7 @@ def sync(
         if with_signals and traj_path.is_file() and not dry_run:
             try:
                 result = extract_from_path(traj_path)
-                record_kwargs["outcome"] = "productive" if result.get("productive") else "noop"
-                record_kwargs["duration_seconds"] = int(result.get("session_duration_s") or 0)
-                record_kwargs["deliverables"] = result.get("deliverables", [])
-                if result.get("inferred_category"):
-                    record_kwargs["category"] = result["inferred_category"]
+                _apply_extract_result_to_kwargs(record_kwargs, result)
             except Exception as exc:
                 click.echo(
                     f"  warning: signals extraction failed for {path_str}: {exc}",
@@ -1497,6 +1660,16 @@ def repair_grades(ctx: click.Context, dry_run: bool) -> None:
 @click.option("--trigger", default=None, help="Session trigger: timer, dispatch, manual, spawn")
 @click.option("--category", default=None, help="Work category (code, triage, ...)")
 @click.option(
+    "--recommended-category",
+    default=None,
+    help="Category recommended by the selector before the session ran",
+)
+@click.option(
+    "--selector-mode",
+    default=None,
+    help="Selector strategy used (e.g. scored, llm-context)",
+)
+@click.option(
     "--exit-code",
     type=int,
     default=0,
@@ -1541,6 +1714,8 @@ def post_session_cmd(
     run_type: str,
     trigger: str | None,
     category: str | None,
+    recommended_category: str | None,
+    selector_mode: str | None,
     exit_code: int,
     duration: int,
     trajectory: Path | None,
@@ -1564,6 +1739,8 @@ def post_session_cmd(
         run_type=run_type,
         trigger=trigger,
         category=category,
+        recommended_category=recommended_category,
+        selector_mode=selector_mode,
         exit_code=exit_code,
         duration_seconds=duration,
         trajectory_path=trajectory,
@@ -2102,10 +2279,10 @@ def classify_stats(
         if len(recent_cats) >= 3 and len(set(recent_cats[-3:])) == 1:
             alerts.append(f"3+ consecutive '{recent_cats[-1]}' sessions — consider diversifying")
 
-        non_code = sum(1 for c in recent_cats if c in ("triage", "monitoring"))
+        non_code = sum(1 for c in recent_cats if c in ("triage", "pm-react"))
         if non_code >= 3:
             alerts.append(
-                f"{non_code}/{diversity_window} sessions were triage/monitoring — pivot to code or ideas"
+                f"{non_code}/{diversity_window} sessions were triage/pm-react — pivot to code or ideas"
             )
 
         code_sessions = sum(1 for c in recent_cats if c == "code")
