@@ -178,6 +178,71 @@ def parse_status(gptme_output: str) -> tuple[str, str]:
     return "no_changes", (m.group(1).strip() if m else "(no reason provided)")
 
 
+_ERROR_RE = re.compile(
+    r"Error during execution:\s*(.+)",
+    re.MULTILINE,
+)
+
+_WRITE_TOOL_ERROR_RE = re.compile(
+    r"Error during execution:\s*(?:Patch failed|save failed)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+_WRITE_TOOL_RE = re.compile(
+    r"^\s*```(?:patch|save)\s",
+    re.MULTILINE,
+)
+
+
+def extract_tool_errors(gptme_output: str) -> list[str]:
+    """Extract tool execution errors from gptme's stdout log.
+
+    gptme emits ``System: Error during execution: <description>`` when a tool
+    call raises.  The model often ignores these and hallucinates success.  This
+    helper surfaces the raw failure evidence for the orchestrator's error
+    message so a human reviewing the issue comment sees actionable diagnostics
+    without downloading the session artifact.
+    """
+    errors = _ERROR_RE.findall(gptme_output)
+    # Deduplicate while preserving order (same error repeated N times).
+    seen: set[str] = set()
+    unique: list[str] = []
+    for e in errors:
+        line = e.strip()
+        if line not in seen:
+            seen.add(line)
+            unique.append(line)
+    return unique
+
+
+def count_tool_errors(gptme_output: str) -> int:
+    """Count raw (possibly repeated) write-tool errors in gptme's stdout log.
+
+    Unlike :func:`extract_tool_errors`, this does NOT deduplicate — two identical
+    ``Error during execution: Patch failed`` lines count as two errors.  This is
+    the right operand to compare against :func:`count_write_tool_calls` to decide
+    whether ALL write calls failed, because gptme emits one error line per failing
+    tool invocation even when the error message is identical.
+
+    Only write-tool errors (Patch failed / save failed) are counted.  Unrelated
+    tool errors (e.g. a shell command that failed) are intentionally excluded so
+    that a session with one successful patch and one incidental non-write error
+    does not incorrectly trigger the reclassification guard.
+    """
+    return len(_WRITE_TOOL_ERROR_RE.findall(gptme_output))
+
+
+def count_write_tool_calls(gptme_output: str) -> int:
+    """Count patch/save tool invocations in gptme's stdout log.
+
+    Each ``\\`\\`\\`patch`` or ``\\`\\`\\`save`` block in the model output represents
+    one write tool call.  Used together with :func:`count_tool_errors` to
+    determine whether *all* writes failed — for example when a submodule bump
+    makes the worktree dirty but every actual patch errored.
+    """
+    return len(_WRITE_TOOL_RE.findall(gptme_output))
+
+
 def has_git_changes(cwd: Path) -> bool:
     out = git(["status", "--porcelain"], cwd=cwd)
     return bool(out.strip())
@@ -297,6 +362,23 @@ def github_push_url(repo: str, auth_token: str) -> str:
     return f"https://x-access-token:{quote(auth_token, safe='')}@github.com/{repo}.git"
 
 
+def remote_branch_exists(
+    cwd: Path,
+    branch: str,
+    *,
+    remote_url: str | None = None,
+) -> bool:
+    """Return True if *branch* already exists on the remote.
+
+    Uses the explicit *remote_url* when given (token-authenticated CI path),
+    otherwise queries the ``origin`` remote.  The check is done with
+    ``git ls-remote --heads`` which works without a configured remote name.
+    """
+    remote = remote_url or "origin"
+    output = git(["ls-remote", "--heads", remote, branch], cwd=cwd)
+    return bool(output.strip())
+
+
 def push_branch(
     cwd: Path,
     branch: str,
@@ -305,17 +387,32 @@ def push_branch(
     auth_token: str | None = None,
 ) -> None:
     if auth_token and repo:
+        push_url = github_push_url(repo, auth_token)
+        # ``--force-with-lease`` requires a remote tracking ref to compare
+        # against.  When pushing via an explicit URL (no named remote) the
+        # tracking ref is never updated, so a re-trigger run always sees a
+        # "stale" ref and is rejected.  Use plain ``--force`` for the URL
+        # path: the resolver branch is exclusively owned by the resolver
+        # workflow and concurrent runs are serialised by the caller's
+        # ``concurrency`` group, so ``--force`` is safe for both new
+        # branches and re-trigger pushes.
         git(
             [
                 "push",
-                "--force-with-lease",
-                github_push_url(repo, auth_token),
+                "--force",
+                push_url,
                 f"HEAD:refs/heads/{branch}",
             ],
             cwd=cwd,
         )
         return
-    git(["push", "--force-with-lease", "origin", branch], cwd=cwd)
+    # Named-remote path (local / non-CI use): --force-with-lease works
+    # correctly because git can track the remote ref via origin.
+    exists = remote_branch_exists(cwd, branch)
+    if exists:
+        git(["push", "--force-with-lease", "origin", branch], cwd=cwd)
+    else:
+        git(["push", "-u", "origin", branch], cwd=cwd)
 
 
 def commit_and_push(
@@ -360,6 +457,26 @@ def push_existing_head(
     push_branch(cwd, branch, repo=repo, auth_token=auth_token)
 
 
+def _repo_default_branch(repo: str) -> str:
+    """Return the default branch of *repo*, falling back to 'master'."""
+    try:
+        name = gh(
+            [
+                "repo",
+                "view",
+                "--repo",
+                repo,
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ]
+        ).strip()
+        return name or "master"
+    except subprocess.CalledProcessError:
+        return "master"
+
+
 def open_draft_pr(repo: str, issue_number: int, branch: str, summary: str) -> str:
     body = (
         f"{MARKER_COMMENT}\n\n"
@@ -368,6 +485,7 @@ def open_draft_pr(repo: str, issue_number: int, branch: str, summary: str) -> st
         f"Closes #{issue_number}\n\n"
         f"**Resolver summary:** {summary}\n"
     )
+    base_branch = _repo_default_branch(repo)
     try:
         raw = gh(
             [
@@ -376,6 +494,8 @@ def open_draft_pr(repo: str, issue_number: int, branch: str, summary: str) -> st
                 "--repo",
                 repo,
                 "--draft",
+                "--base",
+                base_branch,
                 "--head",
                 branch,
                 "--title",
@@ -384,10 +504,50 @@ def open_draft_pr(repo: str, issue_number: int, branch: str, summary: str) -> st
                 body,
             ]
         )
-    except subprocess.CalledProcessError:
-        # PR already exists for this branch (re-trigger). Return existing URL.
-        raw = gh(["pr", "view", "--repo", repo, "--json", "url", "-q", ".url", branch])
+    except subprocess.CalledProcessError as e:
+        # `gh pr create` fails for many reasons (auth, missing --base outside a
+        # git workdir, GraphQL errors), not only because a PR already exists.
+        # Probe explicitly for an open PR on this branch rather than
+        # pattern-matching gh's (locale-dependent) stderr.
+        existing = _existing_pr_url(repo, branch)
+        if existing:
+            return existing
+        # No existing PR: surface the real create failure so the resolver
+        # reports the actual reason instead of a confusing secondary error.
+        if e.stderr:
+            sys.stderr.write(f"gh pr create failed:\n{e.stderr}\n")
+        raise
     return raw.strip().splitlines()[-1] if raw.strip() else ""
+
+
+def _existing_pr_url(repo: str, branch: str) -> str | None:
+    """Return the URL of an open PR for *branch*, or None if there is none.
+
+    Used as an explicit probe after `gh pr create` fails, so a create failure
+    is only treated as "PR already exists" when a PR genuinely does. Fails
+    soft: any error while probing returns None so the caller can surface the
+    original create failure instead of masking it.
+    """
+    try:
+        raw = gh(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "url",
+                "-q",
+                ".[0].url // empty",
+            ]
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return raw.strip() or None
 
 
 def comment_on_issue(
@@ -482,37 +642,67 @@ def main(argv: list[str] | None = None) -> int:
         if upstream_message:
             message = f"{message} Upstream result: {upstream_message}"
 
-    # gptme said "changes" — but only trust it if git actually sees changes.
+    # gptme said "changes" — but only trust it if git actually sees changes AND
+    # at least one write tool call succeeded.  If every patch/save errored, the
+    # worktree is dirty for incidental reasons (e.g. a submodule bump) and
+    # opening a draft PR would be bogus.
     if status == "changes" and worktree_dirty:
-        if args.dry_run:
-            print(f"[dry-run] Would push {branch} and open draft PR: {message}")
+        tool_errors = extract_tool_errors(gptme_output or "")
+        write_calls = count_write_tool_calls(gptme_output or "")
+        error_count = count_tool_errors(gptme_output or "")
+        if write_calls > 0 and error_count >= write_calls:
+            # All write tool calls errored — reclassify and fall through to the
+            # partial-work / error path below so the incidental changes are
+            # pushed as a partial attempt, not as a false-positive success PR.
+            status = "error"
+            errors_block = "\n".join(f"- `{e}`" for e in tool_errors)
+            message = (
+                f"gptme reported changes but all {write_calls} write tool "
+                f"call(s) errored. Tool execution errors:\n{errors_block}\n\n"
+                f"Upstream summary: {message}"
+            )
+        else:
+            if args.dry_run:
+                print(f"[dry-run] Would push {branch} and open draft PR: {message}")
+                return 0
+            commit_and_push(
+                args.workdir,
+                branch,
+                commit_message=f"gptme-resolver attempt for #{issue.number}\n\n{message}",
+                repo=args.repo,
+                auth_token=auth_token,
+            )
+            pr_url = open_draft_pr(args.repo, issue.number, branch, message)
+            comment_on_issue(
+                args.repo,
+                issue.number,
+                status="changes",
+                message=message,
+                branch=branch,
+                pr_url=pr_url,
+            )
+            print(f"Opened draft PR for #{issue.number} at {pr_url}")
             return 0
-        commit_and_push(
-            args.workdir,
-            branch,
-            commit_message=f"gptme-resolver attempt for #{issue.number}\n\n{message}",
-            repo=args.repo,
-            auth_token=auth_token,
-        )
-        pr_url = open_draft_pr(args.repo, issue.number, branch, message)
-        comment_on_issue(
-            args.repo,
-            issue.number,
-            status="changes",
-            message=message,
-            branch=branch,
-            pr_url=pr_url,
-        )
-        print(f"Opened draft PR for #{issue.number} at {pr_url}")
-        return 0
 
     # gptme said "changes" but worktree is clean — treat as a failed attempt.
     if status == "changes" and not worktree_dirty:
         status = "error"
-        message = (
-            "gptme reported changes but no files were modified. "
-            f"Upstream message: {message}"
-        )
+        # Surface tool execution errors so the issue comment shows actionable
+        # diagnostics without downloading the session artifact.  If no tool
+        # errors are found, fall back to the generic description.
+        tool_errors = extract_tool_errors(gptme_output or "")
+        if tool_errors:
+            errors_block = "\n".join(f"- `{e}`" for e in tool_errors)
+            message = (
+                "gptme reported changes but no files were modified. "
+                f"Tool execution errors found in the session log:\n{errors_block}\n\n"
+                f"Upstream summary: {message}"
+            )
+        else:
+            message = (
+                "gptme reported changes but no files were modified. "
+                f"Upstream message: {message}"
+            )
 
     # no_changes / error: preserve partial work if present, including an
     # unsolicited direct commit that moved HEAD but left the worktree clean.

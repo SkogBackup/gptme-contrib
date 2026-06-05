@@ -5,12 +5,22 @@ Structural code retrieval for gptme via [tree-sitter](https://tree-sitter.github
 ## Features
 
 - **9 MCP tools**: `codegraph_parse`, `codegraph_index`, `codegraph_map`, `codegraph_def`, `codegraph_callers`, `codegraph_callees`, `codegraph_refs`, `codegraph_blast`, `codegraph_impact`
-- **Multi-language symbol extraction** for Python, JavaScript/TypeScript, and Rust
-- **Cross-file import resolution** for Python, plus early JS/TS import capture for named and namespace imports
+- **Multi-language symbol extraction** for Python, JavaScript/TypeScript, Rust, Go, Java, C#, Ruby, C, C++, PHP, Kotlin, and Swift
+- **Cross-file import capture** across supported languages, with strongest semantic resolution on Python
 - **Qualified symbol IDs** (`module::Class.method`) for unambiguous cross-file references
 - **SQLite index cache** — optional persistent cache for large codebases
 - **Blast/impact semantics split**: `blast` = dependency closure (what X needs), `impact` = what breaks if you change X
 - **Repo map / symbol skeletons** for token-cheap default codebase context
+
+## When to use
+
+Reach for the right retrieval tool by the *shape* of the question, not by habit:
+
+- **codegraph** — structural / symbol questions: *where is `X` defined?*, *who calls `X`?*, *what breaks if I change `X`?*, *give me a repo skeleton*. Use it when you care about definitions, call graphs, blast radius, or impact.
+- **grep / ripgrep** — exact strings and known patterns: a literal identifier, an error message, a config key. Fastest when you already know the text to match.
+- **semantic search (gptme-rag / semble)** — conceptual queries where you don't know the exact tokens: *how does auth work here?*, *where is retry logic?*. Matches by meaning over text chunks.
+
+Rule of thumb: exact text → grep; "what does this concept look like" → semantic; "how is this symbol wired" → codegraph.
 
 ## Install
 
@@ -48,6 +58,31 @@ gptme-codegraph path/to/file.py def my_function
 # Show a repo-map style symbol skeleton for a directory
 gptme-codegraph path/to/repo map
 ```
+
+### Committed repo-map artifact
+
+"Analyze once, commit the graph." Generate a `.gptme-codegraph-map.json` that
+teammates and agents can read for a repo's structural outline without re-running
+the tree-sitter pipeline:
+
+```bash
+# Generate and save the artifact at <repo>/.gptme-codegraph-map.json
+gptme-codegraph-commit-map path/to/repo
+
+# Check freshness (exit 0 = fresh, 1 = stale/missing) — for pre-commit/CI gating
+gptme-codegraph-commit-map path/to/repo --check
+
+# Regenerate only if stale (use in a pre-commit hook); --force always regenerates
+gptme-codegraph-commit-map path/to/repo --refresh
+```
+
+Freshness is keyed off a digest of supported source files (`*.py`, `*.ts`,
+`*.tsx`, `*.js`, `*.rs`, `*.go`, `*.java`, `*.cs`, `*.rb`, `*.c`, `*.cpp`,
+`*.php`, `*.kt`, `*.kts`, `*.swift`), not `HEAD` — so an artifact regenerated in a
+pre-commit hook stays fresh after the commit that contains it lands. The default
+staleness window is 1 day (`--stale-after-days N` to change it). The artifact is
+structural only (paths, class/function names, nesting) — no source, comments, or
+values — so it is safe to commit to any repo.
 
 ### MCP Server
 
@@ -91,9 +126,10 @@ print(radius)  # {"depth_0": {…}, "depth_1": {…}, …}
 
 ## Status
 
-Experimental package — Python support is the deepest path today, with Phase 1
-JavaScript/TypeScript and Rust extraction now wired into the same surface.
-Cross-file resolution remains strongest on Python; JS/TS import handling is
-currently best-effort rather than fully semantic.
+Experimental package — Python support is the deepest path today, with broad
+tree-sitter extraction now wired into the same surface for common web, systems,
+JVM, scripting, PHP/Kotlin, and Swift codebases. Cross-file resolution remains
+strongest on Python; non-Python import handling is best-effort rather than fully
+semantic.
 
 > Namespace packages (`import google.cloud.storage` without `__init__.py`) are a known v1.1 gap.

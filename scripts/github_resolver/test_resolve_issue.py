@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import resolve_issue  # type: ignore[import-not-found]  # noqa: E402,I001
@@ -141,6 +143,13 @@ def test_prompt_template_mentions_both_markers():
     assert "RESOLVER_REASON" in template
 
 
+def test_prompt_template_requires_read_before_editing_existing_files():
+    template = TEMPLATE_PATH.read_text()
+    assert "Before calling `patch` or" in template
+    assert "`save` on any file that already exists" in template
+    assert "Do NOT write patch chunks from memory" in template
+
+
 def test_status_regex_ignores_prose_mentions():
     # The model often echoes the words "RESOLVER_STATUS" in the middle of a
     # sentence while explaining what it's about to do. Only an anchored line
@@ -150,19 +159,316 @@ def test_status_regex_ignores_prose_mentions():
     assert status == "error"
 
 
-def test_open_draft_pr_retrigger_returns_existing_url(monkeypatch):
-    # On re-trigger, `gh pr create` exits 1 ("a pull request … already exists").
-    # open_draft_pr must catch CalledProcessError and return the existing PR URL
-    # via `gh pr view` so the caller can still post the issue comment.
-    import subprocess
+def test_extract_tool_errors_returns_empty_when_none():
+    out = "RESOLVER_STATUS: changes\nRESOLVER_SUMMARY: something\n"
+    assert resolve_issue.extract_tool_errors(out) == []
 
+
+def test_extract_tool_errors_finds_errors():
+    out = (
+        "some work\n"
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+        "more work\n"
+        "System: Error during execution: another failure\n"
+        "RESOLVER_STATUS: changes\n"
+    )
+    errors = resolve_issue.extract_tool_errors(out)
+    assert len(errors) == 2
+    assert "Patch failed" in errors[0]
+    assert "another failure" in errors[1]
+
+
+def test_extract_tool_errors_deduplicates_consecutive_identical_errors():
+    out = (
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+    )
+    errors = resolve_issue.extract_tool_errors(out)
+    assert len(errors) == 1
+
+
+def test_extract_tool_errors_handles_empty_string():
+    assert resolve_issue.extract_tool_errors("") == []
+
+
+def test_count_write_tool_calls_returns_zero_when_none():
+    out = "RESOLVER_STATUS: changes\nRESOLVER_SUMMARY: something\n"
+    assert resolve_issue.count_write_tool_calls(out) == 0
+
+
+def test_count_write_tool_calls_counts_patch_and_save():
+    out = (
+        "Let me patch the file:\n"
+        "```patch src/foo.py\n"
+        "<<<<<<< ORIGINAL\nold\n=======\nnew\n>>>>>>> UPDATED\n"
+        "```\n"
+        "System: Error during execution: Patch failed: original chunk not found\n"
+        "Let me try save instead:\n"
+        "```save src/bar.py\nnew content\n```\n"
+        "System: Error during execution: save failed\n"
+    )
+    assert resolve_issue.count_write_tool_calls(out) == 2
+
+
+def test_count_write_tool_calls_handles_empty_string():
+    assert resolve_issue.count_write_tool_calls("") == 0
+
+
+def test_count_tool_errors_counts_repeated_identical_errors():
+    # Two identical errors must count as 2, not 1 after deduplication.
+    out = (
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+    )
+    assert resolve_issue.count_tool_errors(out) == 2
+
+
+def test_count_tool_errors_handles_empty_string():
+    assert resolve_issue.count_tool_errors("") == 0
+
+
+# --- open_draft_pr / _repo_default_branch tests ---
+
+
+def _cpe(stderr: str = "") -> subprocess.CalledProcessError:
+    """Build a CalledProcessError with captured stderr for test stubs."""
+    e = subprocess.CalledProcessError(1, ["gh"])
+    e.stderr = stderr
+    return e
+
+
+def test_open_draft_pr_includes_base_and_returns_url(monkeypatch):
+    """Happy path: --base is passed and the returned URL is correct."""
     calls: list[list[str]] = []
 
-    def fake_gh(args, *, check=True):
+    def fake_gh(args: list[str], **_kw) -> str:
+        calls.append(list(args))
+        if args[:2] == ["repo", "view"]:
+            return "master\n"
+        if args[:2] == ["pr", "create"]:
+            return "https://github.com/org/repo/pull/99\n"
+        return ""
+
+    monkeypatch.setattr(resolve_issue, "gh", fake_gh)
+    url = resolve_issue.open_draft_pr("org/repo", 42, "gptme-resolver/issue-42", "s")
+    assert url == "https://github.com/org/repo/pull/99"
+    create_args = next(c for c in calls if c[:2] == ["pr", "create"])
+    assert "--base" in create_args
+
+
+def test_open_draft_pr_reraises_non_already_exists_errors(monkeypatch):
+    """Non-'already exists' CalledProcessError must propagate, not be swallowed."""
+
+    def fake_gh(args: list[str], **_kw) -> str:
+        if args[:2] == ["repo", "view"]:
+            return "master\n"
+        raise _cpe(
+            stderr="GraphQL: could not resolve to a Repository with the name 'org/repo'"
+        )
+
+    monkeypatch.setattr(resolve_issue, "gh", fake_gh)
+    with pytest.raises(subprocess.CalledProcessError):
+        resolve_issue.open_draft_pr("org/repo", 42, "gptme-resolver/issue-42", "s")
+
+
+def test_repo_default_branch_falls_back_to_master_on_error(monkeypatch):
+    """_repo_default_branch returns 'master' when the gh API call fails."""
+    monkeypatch.setattr(
+        resolve_issue, "gh", lambda *_, **__: (_ for _ in ()).throw(_cpe())
+    )
+    assert resolve_issue._repo_default_branch("org/repo") == "master"
+
+
+def test_count_tool_errors_ignores_non_write_tool_errors():
+    # A shell command error should NOT count as a write-tool error.
+    # Greptile finding: error_count >= write_calls must only fire on write-tool
+    # errors, not on incidental non-write errors.
+    out = (
+        "```patch src/foo.py\n<<<< ORIGINAL\nold\n====\nnew\n>>>> UPDATED\n```\n"
+        "System: Error during execution: shell: command not found\n"
+    )
+    # 1 write call, 0 write-tool errors — should NOT trigger reclassification
+    assert resolve_issue.count_write_tool_calls(out) == 1
+    assert resolve_issue.count_tool_errors(out) == 0
+
+
+@pytest.fixture
+def local_git_repo(tmp_path):
+    """Bare origin + clone with an initial commit, wired for resolver tests."""
+    bare = tmp_path / "origin.git"
+    repo = tmp_path / "repo"
+    out_dir = tmp_path / "out"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)], check=True, stdout=subprocess.DEVNULL
+    )
+    subprocess.run(
+        ["git", "clone", str(bare), str(repo)], check=True, stdout=subprocess.DEVNULL
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "master"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "resolver-test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "resolver-test@example.com"],
+        check=True,
+    )
+    (repo / "note.txt").write_text("old\n")
+    subprocess.run(["git", "-C", str(repo), "add", "note.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-u",
+            "origin",
+            "master",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    return repo, out_dir
+
+
+def _run_resolver(monkeypatch, repo, out_dir, gptme_stdout, *, fake_run_gptme=None):
+    """Wire monkeypatches and call main(); return (rc, comments, draft_prs)."""
+    issue = resolve_issue.Issue(
+        number=42, title="Fix note", body="Update note", author="alice", labels=["bug"]
+    )
+    comments: list[str] = []
+    draft_prs: list[str] = []
+
+    if fake_run_gptme is None:
+
+        def fake_run_gptme(prompt, *, model=None, workdir):
+            (workdir / "incidental.txt").write_text("side-effect\n")
+            return (gptme_stdout, "")
+
+    monkeypatch.setattr(resolve_issue, "fetch_issue", lambda rn, inum: issue)
+    monkeypatch.setattr(resolve_issue, "run_gptme", fake_run_gptme)
+    monkeypatch.setattr(
+        resolve_issue,
+        "post_issue_comment",
+        lambda rn, inum, body: comments.append(body),
+    )
+
+    def fake_open_draft_pr(rn, inum, br, msg):
+        draft_prs.append(msg)
+        return "https://github.com/gptme/gptme-contrib/pull/99"
+
+    monkeypatch.setattr(resolve_issue, "open_draft_pr", fake_open_draft_pr)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    rc = resolve_issue.main(
+        [
+            "--repo",
+            "local/test",
+            "--issue",
+            "42",
+            "--workdir",
+            str(repo),
+            "--output-dir",
+            str(out_dir),
+        ]
+    )
+    return rc, comments, draft_prs
+
+
+def test_main_reclassifies_status_when_all_writes_errored_despite_dirty_worktree(
+    monkeypatch, local_git_repo
+):
+    """Canary-#824 regression: submodule bump + all patches failed → no bogus draft PR."""
+    repo, out_dir = local_git_repo
+    gptme_stdout = (
+        "Let me patch the file:\n"
+        "```patch note.txt\n"
+        "<<<<<<< ORIGINAL\nold\n=======\nnew\n>>>>>>> UPDATED\n"
+        "```\n"
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+        "RESOLVER_STATUS: changes\n"
+        "RESOLVER_SUMMARY: Updated note.\n"
+    )
+    rc, comments, draft_prs = _run_resolver(monkeypatch, repo, out_dir, gptme_stdout)
+    assert rc == 0
+    assert draft_prs == [], f"Unexpected draft PR opened: {draft_prs}"
+    assert len(comments) == 1
+    assert "write tool call" in comments[0]
+    assert "Patch failed" in comments[0]
+
+
+def test_main_reclassifies_status_when_two_identical_write_errors_despite_dirty_worktree(
+    monkeypatch, local_git_repo
+):
+    """Exact canary-#824 failure mode: 2 write calls, 2 identical errors → no bogus PR.
+
+    The guard must compare raw error count (2) against write calls (2), NOT the
+    deduplicated error list length (1).  Before the fix, extract_tool_errors()
+    deduplication caused 1 >= 2 → False, so a draft PR was still opened.
+    """
+    repo, out_dir = local_git_repo
+    # Two patch calls, both with identical "Patch failed" errors — the exact
+    # canary-#824 shape where deduplication previously broke the guard.
+    gptme_stdout = (
+        "Let me patch the file:\n"
+        "```patch note.txt\n"
+        "<<<<<<< ORIGINAL\nold\n=======\nnew\n>>>>>>> UPDATED\n"
+        "```\n"
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+        "Let me retry:\n"
+        "```patch note.txt\n"
+        "<<<<<<< ORIGINAL\nold\n=======\nnewer\n>>>>>>> UPDATED\n"
+        "```\n"
+        "System: Error during execution: Patch failed: original chunk not found in file\n"
+        "RESOLVER_STATUS: changes\n"
+        "RESOLVER_SUMMARY: Updated note.\n"
+    )
+    rc, comments, draft_prs = _run_resolver(monkeypatch, repo, out_dir, gptme_stdout)
+    assert rc == 0
+    # 2 write calls, 2 identical errors → guard must fire, no bogus draft PR.
+    assert (
+        draft_prs == []
+    ), f"Unexpected draft PR opened (dedup guard bug?): {draft_prs}"
+    assert len(comments) == 1
+    assert "2 write tool call" in comments[0]
+    assert "Patch failed" in comments[0]
+
+
+def test_open_draft_pr_retrigger_returns_existing_url(monkeypatch):
+    # On re-trigger, `gh pr create` exits 1. open_draft_pr must probe for an
+    # existing open PR via `gh pr list --head` and return its URL so the caller
+    # can still post the issue comment — without relying on gh's stderr wording.
+    calls: list[list[str]] = []
+
+    def fake_gh(args, **_kw):
         calls.append(args)
         if args[0] == "pr" and args[1] == "create":
-            raise subprocess.CalledProcessError(1, "gh")
-        if args[0] == "pr" and args[1] == "view":
+            err = subprocess.CalledProcessError(1, "gh")
+            err.stderr = (
+                "a pull request for branch 'gptme-resolver/issue-42' already exists"
+            )
+            raise err
+        if args[0] == "pr" and args[1] == "list":
             return "https://github.com/gptme/gptme-contrib/pull/99\n"
         return ""
 
@@ -171,8 +477,34 @@ def test_open_draft_pr_retrigger_returns_existing_url(monkeypatch):
         "gptme/gptme-contrib", 42, "gptme-resolver/issue-42", "fixed the crash"
     )
     assert url == "https://github.com/gptme/gptme-contrib/pull/99"
-    # Verify we fell back to `gh pr view`
-    assert any(a[0] == "pr" and a[1] == "view" for a in calls)
+    # Verify we probed with `gh pr list --head` rather than assuming.
+    list_call = next(c for c in calls if c[0] == "pr" and c[1] == "list")
+    assert "--head" in list_call and "gptme-resolver/issue-42" in list_call
+
+
+def test_open_draft_pr_reraises_when_probe_finds_no_pr(monkeypatch):
+    """A create failure with no existing PR must propagate the original error.
+
+    Even when stderr happens to mention "already exists", the explicit probe is
+    authoritative: if `gh pr list` returns no PR, surface the create failure
+    instead of masking it.
+    """
+    calls: list[list[str]] = []
+
+    def fake_gh(args, **_kw):
+        calls.append(args)
+        if args[0] == "pr" and args[1] == "create":
+            raise _cpe(stderr="HTTP 422: validation failed (no commits between …)")
+        if args[0] == "pr" and args[1] == "list":
+            return ""  # no open PR for this branch
+        return ""
+
+    monkeypatch.setattr(resolve_issue, "gh", fake_gh)
+    with pytest.raises(subprocess.CalledProcessError):
+        resolve_issue.open_draft_pr(
+            "org/repo", 42, "gptme-resolver/issue-42", "summary"
+        )
+    assert any(c[0] == "pr" and c[1] == "list" for c in calls)
 
 
 def test_run_gptme_uses_restricted_tools_and_sanitized_env(monkeypatch, tmp_path):
@@ -280,6 +612,7 @@ def test_detect_repo_state_violation_on_unexpected_commit(tmp_path):
 
 
 def test_push_branch_uses_explicit_github_token(monkeypatch, tmp_path):
+    """URL-based push always uses --force (no tracking ref available via URL)."""
     calls: list[list[str]] = []
 
     def fake_git(args, *, check=True, cwd=None):
@@ -297,13 +630,40 @@ def test_push_branch_uses_explicit_github_token(monkeypatch, tmp_path):
         auth_token="token-123",
     )
 
+    push_url = "https://x-access-token:token-123@github.com/gptme/gptme-contrib.git"
     assert calls == [
-        [
-            "push",
-            "--force-with-lease",
-            "https://x-access-token:token-123@github.com/gptme/gptme-contrib.git",
-            "HEAD:refs/heads/gptme-resolver/issue-42",
-        ]
+        ["push", "--force", push_url, "HEAD:refs/heads/gptme-resolver/issue-42"],
+    ]
+
+
+def test_push_branch_uses_force_on_existing_branch(monkeypatch, tmp_path):
+    """Re-trigger push (branch already exists on remote): still uses --force.
+
+    --force-with-lease requires a local tracking ref that URL-based pushes never
+    create, so it always fails on re-trigger.  --force is safe because the
+    resolver branch is exclusively owned by the resolver workflow and concurrent
+    runs are serialised by the caller's concurrency group.
+    """
+    calls: list[list[str]] = []
+
+    def fake_git(args, *, check=True, cwd=None):
+        del check
+        assert cwd == tmp_path
+        calls.append(args)
+        return ""
+
+    monkeypatch.setattr(resolve_issue, "git", fake_git)
+
+    resolve_issue.push_branch(
+        tmp_path,
+        "gptme-resolver/issue-42",
+        repo="gptme/gptme-contrib",
+        auth_token="token-123",
+    )
+
+    push_url = "https://x-access-token:token-123@github.com/gptme/gptme-contrib.git"
+    assert calls == [
+        ["push", "--force", push_url, "HEAD:refs/heads/gptme-resolver/issue-42"],
     ]
 
 

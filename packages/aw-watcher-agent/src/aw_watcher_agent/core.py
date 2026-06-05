@@ -24,13 +24,36 @@ from typing import Any
 BUCKET_TYPE = "app.agent.session"
 CLIENT_NAME = "aw-watcher-agent"
 
+# Per-tool activity events live in their own bucket type. Phase 2 originally
+# proposed reusing the session bucket to keep "AI work" as a single Timeline
+# lane, but session events (one long block spanning the whole run) and per-tool
+# events (many short blocks) overlap in time, which ActivityWatch cannot render
+# as a single clean lane. A sibling bucket keeps both lanes honest; aw-webui can
+# still stack them. See the Phase 2 PR for the design note.
+ACTIVITY_BUCKET_TYPE = "app.agent.activity"
+
 # Stable session fields (everything except outcome, which is end-only).
 START_FIELDS = ("harness", "model", "category", "session_id", "trigger", "workspace")
+ACTIVITY_FIELDS = (
+    "harness",
+    "session_id",
+    "tool",
+    "status",
+    "model",
+    "category",
+    "trigger",
+    "workspace",
+)
 
 
 def bucket_id(hostname: str) -> str:
     """Bucket id following the ``aw-watcher-<name>_<hostname>`` convention."""
     return f"{CLIENT_NAME}_{hostname}"
+
+
+def activity_bucket_id(hostname: str) -> str:
+    """Bucket id for per-tool activity events (sibling of the session bucket)."""
+    return f"{CLIENT_NAME}-activity_{hostname}"
 
 
 def state_dir() -> Path:
@@ -76,3 +99,14 @@ def session_data(args: dict[str, Any], *, outcome: str | None = None) -> dict[st
     if outcome:
         data["outcome"] = str(outcome)
     return data
+
+
+def activity_data(args: dict[str, Any]) -> dict[str, str]:
+    """Build per-tool activity event data, dropping empty values.
+
+    Raises ValueError if 'tool' is absent or empty — it is the semantic
+    discriminator for per-tool heartbeats and cannot be safely omitted.
+    """
+    if not args.get("tool"):
+        raise ValueError("activity_data: 'tool' is required but missing or empty")
+    return {f: str(args[f]) for f in ACTIVITY_FIELDS if args.get(f)}

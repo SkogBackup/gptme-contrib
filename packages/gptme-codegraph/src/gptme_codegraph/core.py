@@ -3,7 +3,8 @@
 Complementary to gptme-rag (text chunks), this retrieves code *structure*:
 function/class definitions, call graphs, and blast radius.
 
-Supports Python, TypeScript/JavaScript, and Rust via tree-sitter grammars.
+Supports Python, TypeScript/JavaScript, Rust, Go, Java, C#, Ruby, C, C++, PHP,
+Kotlin, and Swift via tree-sitter grammars.
 To add a new language: add grammar dep to pyproject.toml, extend _LANG_MAP
 and _load_language, then add extractor functions.
 
@@ -45,6 +46,22 @@ _LANG_MAP: dict[str, str] = {
     ".mjs": "javascript",
     ".cjs": "javascript",
     ".rs": "rust",
+    ".go": "go",
+    ".java": "java",
+    ".cs": "csharp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".h": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".swift": "swift",
+    ".c": "c",
 }
 
 _GRAMMAR_MODULES: dict[str, str] = {
@@ -54,11 +71,20 @@ _GRAMMAR_MODULES: dict[str, str] = {
     "typescript": "tree_sitter_typescript",
     "tsx": "tree_sitter_typescript",
     "rust": "tree_sitter_rust",
+    "go": "tree_sitter_go",
+    "java": "tree_sitter_java",
+    "csharp": "tree_sitter_c_sharp",
+    "cpp": "tree_sitter_cpp",
+    "ruby": "tree_sitter_ruby",
+    "php": "tree_sitter_php",
+    "kotlin": "tree_sitter_kotlin",
+    "swift": "tree_sitter_swift",
+    "c": "tree_sitter_c",
 }
 
 _SOURCE_EXTENSIONS: tuple[str, ...] = tuple(_LANG_MAP.keys())
 _NOISE_PATH_PARTS: frozenset[str] = frozenset(
-    {"__pycache__", "node_modules", ".git", "target"}
+    {"__pycache__", "node_modules", ".git", "target", "vendor"}
 )
 
 
@@ -89,7 +115,7 @@ def _load_language(name: str):
 
     Returns None if the grammar is not installed.
     """
-    from tree_sitter import Language  # type: ignore[import-untyped,unused-ignore]
+    import tree_sitter as ts  # type: ignore[import-not-found,import-untyped,unused-ignore]
 
     # Lazy import each grammar; missing grammars silently return None
     grammar_map: dict[str, object] = {}
@@ -118,6 +144,60 @@ def _load_language(name: str):
         grammar_map["rust"] = tsrust.language()
     except ImportError:
         pass
+    try:
+        import tree_sitter_go as tsgo  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["go"] = tsgo.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_java as tsjava  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["java"] = tsjava.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_c_sharp as tscsharp  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["csharp"] = tscsharp.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_cpp as tscpp  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["cpp"] = tscpp.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_ruby as tsruby  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["ruby"] = tsruby.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_c as tsc  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["c"] = tsc.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_php as tsphp  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["php"] = tsphp.language_php()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_kotlin as tskotlin  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["kotlin"] = tskotlin.language()
+    except ImportError:
+        pass
+    try:
+        import tree_sitter_swift as tsswift  # type: ignore[import-not-found,unused-ignore]
+
+        grammar_map["swift"] = tsswift.language()
+    except ImportError:
+        pass
 
     lang = grammar_map.get(name)
     if lang is None:
@@ -128,7 +208,7 @@ def _load_language(name: str):
             lang = grammar_map.get("javascript")
     if lang is None:
         return None
-    return Language(lang)
+    return ts.Language(lang)
 
 
 def _module_path(filepath: str, directory: str | None = None) -> str:
@@ -622,7 +702,7 @@ def _missing_grammar_diagnostic(lang_name: str) -> dict[str, str]:
 def _tree_sitter_parse_attempt(code: bytes, lang_name: str = "python") -> _ParseAttempt:
     """Parse source code with tree-sitter and preserve missing-dependency diagnostics."""
     try:
-        from tree_sitter import Parser  # type: ignore[import-untyped,unused-ignore]
+        import tree_sitter as ts  # type: ignore[import-not-found,import-untyped,unused-ignore]
     except ImportError:
         return _ParseAttempt(
             diagnostic={
@@ -635,7 +715,7 @@ def _tree_sitter_parse_attempt(code: bytes, lang_name: str = "python") -> _Parse
             }
         )
 
-    parser = Parser()
+    parser = ts.Parser()
     language = _load_language(lang_name)
     if language is None:
         diagnostic = None
@@ -691,6 +771,26 @@ def _extract_docstring(body_node) -> str | None:
         return None
 
 
+def _last_swift_navigation_name(node) -> str | None:
+    """Return the final member name in a Swift navigation expression."""
+    suffix = node.child_by_field_name("suffix")
+    if suffix is not None:
+        suffix_name = suffix.child_by_field_name("suffix")
+        text = _text(suffix_name) if suffix_name is not None else _text(suffix)
+        return text.lstrip(".") or None
+
+    # Only recurse into navigation_expression children in the fallback
+    # path.  Unrestricted recursion across all named_children can descend
+    # into argument sub-expressions (e.g. foo.bar(baz.qux())), yielding a
+    # name from an argument call rather than from the callee itself.
+    for child in reversed(node.named_children):
+        if child.type == "navigation_expression":
+            found = _last_swift_navigation_name(child)
+            if found:
+                return found
+    return None
+
+
 def _extract_calls(node) -> list[str]:
     """Extract all called function names from a tree-sitter node subtree."""
     calls = []
@@ -698,10 +798,73 @@ def _extract_calls(node) -> list[str]:
         cursor = node.walk()
         reached_root = False
         while not reached_root:
-            if cursor.node.type in {"call", "call_expression"}:
+            if cursor.node.type in {"call", "call_expression", "invocation_expression"}:
+                # Python "call", JS/TS/Rust/Go "call_expression", C#
+                # "invocation_expression" all expose a "function" field.
                 func_node = cursor.node.child_by_field_name("function")
                 if func_node:
                     calls.append(_text(func_node))
+                elif cursor.node.type == "call_expression" and any(
+                    child.type == "value_arguments"
+                    for child in cursor.node.named_children
+                ):
+                    # Kotlin call_expression: no named "function" field; the
+                    # callee is the first named child that is not value_arguments.
+                    # Guarded by value_arguments presence (Kotlin-specific type)
+                    # so JS/TS/Go/Rust call_expression edge cases fall through
+                    # to the Ruby else branch instead of applying this path.
+                    callee = next(
+                        (
+                            child
+                            for child in cursor.node.named_children
+                            if child.type != "value_arguments"
+                        ),
+                        None,
+                    )
+                    if callee:
+                        calls.append(_text(callee))
+                elif cursor.node.type == "call_expression" and any(
+                    child.type == "call_suffix" for child in cursor.node.named_children
+                ):
+                    # Swift call_expression: first named child is the callee;
+                    # member calls wrap it in navigation_expression.
+                    callee = next(
+                        (
+                            child
+                            for child in cursor.node.named_children
+                            if child.type != "call_suffix"
+                        ),
+                        None,
+                    )
+                    if callee:
+                        calls.append(
+                            _last_swift_navigation_name(callee) or _text(callee)
+                        )
+                else:
+                    # Ruby: call nodes carry the callee in a "method" field
+                    method_node = cursor.node.child_by_field_name("method")
+                    if method_node:
+                        calls.append(_text(method_node))
+            elif cursor.node.type == "method_invocation":
+                # Java: method calls use method_invocation with a "name" field
+                name_node = cursor.node.child_by_field_name("name")
+                if name_node:
+                    calls.append(_text(name_node))
+            elif cursor.node.type == "function_call_expression":
+                # PHP: callee is the "function" field (not "name")
+                name_node = cursor.node.child_by_field_name("function")
+                if name_node:
+                    calls.append(_text(name_node))
+            elif cursor.node.type == "member_call_expression":
+                # PHP: $obj->method() — object is variable_name, method is the "name" field
+                name_node = cursor.node.child_by_field_name("name")
+                if name_node:
+                    calls.append(_text(name_node))
+            elif cursor.node.type == "scoped_call_expression":
+                # PHP: Class::method() — method name is the second "name" child
+                names = [c for c in cursor.node.named_children if c.type == "name"]
+                if names:
+                    calls.append(_text(names[-1]))
             if cursor.goto_first_child():
                 continue
             if cursor.goto_next_sibling():
@@ -718,9 +881,156 @@ def _extract_calls(node) -> list[str]:
     return calls
 
 
+def _rust_receiver_call_aliases(
+    calls: list[str], parent_class: str | None
+) -> list[str]:
+    """Return local method aliases for Rust receiver/associated self calls.
+
+    Aliases are qualified as ParentClass.method to avoid bare-name
+    collisions when multiple types in the same file define methods with
+    the same name.
+    """
+    if not parent_class:
+        return []
+    aliases: list[str] = []
+    for call in calls:
+        if call.startswith("self."):
+            method = call.removeprefix("self.")
+            if method and "." not in method:
+                aliases.append(f"{parent_class}.{method}")
+        elif call.startswith("Self::"):
+            method = call.removeprefix("Self::")
+            if method and "::" not in method:
+                aliases.append(f"{parent_class}.{method}")
+    return aliases
+
+
+def _go_node_declares_identifier(node, name: str) -> bool:
+    """Return True when a Go declaration node binds ``name`` on its left side."""
+    if node is None:
+        return False
+    if node.type == "range_clause" and ":=" not in _text(node):
+        return False
+    if node.type not in {
+        "short_var_declaration",
+        "range_clause",
+        "var_declaration",
+        "var_spec",
+        "parameter_declaration",
+    }:
+        return False
+
+    left_node = (
+        node.child_by_field_name("left")
+        or node.child_by_field_name("name")
+        or node.child_by_field_name("parameters")
+    )
+    search_node = left_node or node
+    stack = list(search_node.named_children)
+    while stack:
+        child = stack.pop()
+        if child.type == "identifier" and _text(child) == name:
+            return True
+        stack.extend(child.named_children)
+    return False
+
+
+def _go_selector_method_name(node, receiver_name: str) -> str | None:
+    """Return the method name for ``receiver.method()`` Go call expressions."""
+    if node.type != "call_expression":
+        return None
+    function_node = node.child_by_field_name("function")
+    if function_node is None or function_node.type != "selector_expression":
+        return None
+    operand_node = function_node.child_by_field_name("operand")
+    field_node = function_node.child_by_field_name("field")
+    if (
+        operand_node is None
+        or field_node is None
+        or operand_node.type != "identifier"
+        or _text(operand_node) != receiver_name
+    ):
+        return None
+    method = _text(field_node)
+    return method if method else None
+
+
+def _go_receiver_call_aliases(
+    body_node, receiver_name: str | None, parent_class: str | None
+) -> list[str]:
+    """Return local method aliases for unshadowed Go receiver calls.
+
+    Aliases are qualified as ParentClass.method to avoid bare-name
+    collisions when multiple types in the same file define methods with
+    the same name.  They are only emitted for selector calls that still
+    refer to the method receiver; local variables that shadow the receiver
+    name must not create self-call edges.
+    """
+    if not body_node or not receiver_name or not parent_class:
+        return []
+
+    aliases: list[str] = []
+
+    def visit(node, receiver_shadowed: bool = False) -> None:
+        method = _go_selector_method_name(node, receiver_name)
+        if method and not receiver_shadowed:
+            aliases.append(f"{parent_class}.{method}")
+
+        if node.type in {"block", "statement_list"}:
+            local_shadowed = receiver_shadowed
+            for child in node.named_children:
+                visit(child, local_shadowed)
+                if _go_node_declares_identifier(child, receiver_name):
+                    local_shadowed = True
+            return
+
+        if node.type == "if_statement":
+            initializer = node.child_by_field_name("initializer")
+            if initializer is not None:
+                visit(initializer, receiver_shadowed)
+            initializer_shadows = _go_node_declares_identifier(
+                initializer, receiver_name
+            )
+            scoped_shadowed = receiver_shadowed or initializer_shadows
+            for field in ("condition", "consequence", "alternative"):
+                child = node.child_by_field_name(field)
+                if child is not None:
+                    visit(child, scoped_shadowed)
+            return
+
+        if node.type == "for_statement":
+            body = node.child_by_field_name("body")
+            for_child_shadowed = receiver_shadowed
+            for child in node.named_children:
+                if child == body:
+                    continue
+                visit(child, receiver_shadowed)
+                if _go_node_declares_identifier(child, receiver_name):
+                    for_child_shadowed = True
+            if body is not None:
+                visit(body, receiver_shadowed or for_child_shadowed)
+            return
+
+        for child in node.named_children:
+            visit(child, receiver_shadowed)
+
+    visit(body_node)
+    return aliases
+
+
 def _strip_string_quotes(text: str) -> str:
     """Return a string literal without its outer quote characters."""
     if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1]
+    return text
+
+
+def _strip_include_delimiters(text: str) -> str:
+    """Return an include path without ``""`` or ``<>`` delimiters."""
+    if len(text) >= 2 and (
+        (text[0] == text[-1] and text[0] in {'"', "'"})
+        or (text[0] == "<" and text[-1] == ">")
+    ):
         return text[1:-1]
     return text
 
@@ -894,6 +1204,109 @@ def _extract_imports_javascript(root) -> list[ImportInfo]:
                             name=module.split("/")[-1] or module,
                             module=module,
                             is_from=False,
+                            alias=alias,
+                        )
+                    )
+    except Exception:
+        pass
+    return imports
+
+
+def _extract_imports_rust(root) -> list[ImportInfo]:
+    """Extract `use` statements from a Rust parse tree.
+
+    Handles:
+    - use std::collections::HashMap;
+    - use crate::utils;
+    - use super::*;
+    - use foo::bar as baz;
+    - use std::io::{self, BufRead};
+    """
+    imports: list[ImportInfo] = []
+
+    def _text_rs(node) -> str:
+        try:
+            return node.text.decode("utf-8") if node.text else ""
+        except Exception:
+            return ""
+
+    def _scoped_ident_text(node) -> str:
+        """Reconstruct the full path from a scoped_identifier node."""
+        if node.type in ("identifier", "crate", "self", "super"):
+            return _text_rs(node)
+        parts = []
+        for child in node.named_children:
+            if child.type in ("identifier", "crate", "self", "super"):
+                parts.append(_text_rs(child))
+            elif child.type == "scoped_identifier":
+                parts.append(_scoped_ident_text(child))
+            elif child.type == "scoped_type_identifier":
+                parts.append(_scoped_ident_text(child))
+        return "::".join(parts)
+
+    def _extract_from_use_decl(node):
+        """Walk a use_declaration node and yield (name, module, alias) tuples."""
+        for child in node.named_children:
+            if child.type == "scoped_identifier":
+                # use std::collections::HashMap;  → name=HashMap, module=std::collections
+                # use crate::utils;               → name=utils,   module=crate
+                full_path = _scoped_ident_text(child)
+                name = full_path.split("::")[-1]
+                module = "::".join(full_path.split("::")[:-1]) or None
+                yield name, module, None, True
+            elif child.type == "use_as_clause":
+                # use foo::bar as baz;  → name=bar, module=foo, alias=baz
+                # use serde as s;       → name=serde, module=None, alias=s
+                path_node = child.child_by_field_name("path")
+                alias_node = child.child_by_field_name("alias")
+                alias = _text_rs(alias_node) if alias_node else None
+                if path_node:
+                    full_path = _scoped_ident_text(path_node)
+                    name = full_path.split("::")[-1]
+                    module = "::".join(full_path.split("::")[:-1]) or None
+                    yield name, module, alias, True
+            elif child.type == "use_wildcard":
+                # use super::*;  → name=*, module=super
+                path_part = None
+                for sub in child.named_children:
+                    if sub.type in ("super", "crate", "self"):
+                        path_part = _text_rs(sub)
+                    elif sub.type == "scoped_identifier":
+                        path_part = _scoped_ident_text(sub)
+                    elif sub.type == "identifier":
+                        path_part = _text_rs(sub)
+                yield "*", path_part, None, True
+            elif child.type == "scoped_use_list":
+                # use std::io::{self, BufRead};  → module=std::io, names={self, BufRead}
+                # First child of scoped_use_list is the scoped_identifier for module
+                module_node = child.named_children[0] if child.named_children else None
+                module_path = _scoped_ident_text(module_node) if module_node else None
+                # Walk the use_list child
+                for sub in child.named_children:
+                    if sub.type == "use_list":
+                        for item in sub.named_children:
+                            if item.type == "identifier":
+                                # Simple name: std::io::BufRead
+                                name = _text_rs(item)
+                                yield name, module_path, None, True
+                            elif item.type == "self":
+                                # self: std::io::{self, ...} → name=self, module=std::io
+                                yield "self", module_path, None, True
+                            elif item.type == "scoped_identifier":
+                                full_path = _scoped_ident_text(item)
+                                name = full_path.split("::")[-1]
+                                yield name, module_path, None, True
+
+    try:
+        for node in root.named_children:
+            if node.type == "use_declaration":
+                for name, module, alias, is_from in _extract_from_use_decl(node):
+                    imports.append(
+                        ImportInfo(
+                            file="",
+                            name=name,
+                            module=module,
+                            is_from=is_from,
                             alias=alias,
                         )
                     )
@@ -1096,11 +1509,15 @@ def _extract_symbols_rust(root, filepath: str) -> list[Symbol]:
     def walk(node, parent_scope: str | None = None, parent_kind: str | None = None):
         if node.type == "function_item":
             name_node = node.child_by_field_name("name")
+            body_node = node.child_by_field_name("body")
             if name_node:
                 name = _text_rs(name_node)
                 # Determine kind: methods are inside impl_item
                 kind = "method" if parent_kind == "impl" else "function"
                 parent_class = parent_scope if kind == "method" else None
+                calls = _extract_calls(body_node) if body_node else []
+                if kind == "method":
+                    calls.extend(_rust_receiver_call_aliases(calls, parent_class))
                 symbols.append(
                     Symbol(
                         name=name,
@@ -1109,6 +1526,7 @@ def _extract_symbols_rust(root, filepath: str) -> list[Symbol]:
                         start_line=node.start_point[0] + 1,
                         end_line=node.end_point[0] + 1,
                         parent_class=parent_class,
+                        calls=list(set(calls)),
                     )
                 )
             return
@@ -1186,6 +1604,1495 @@ def _extract_symbols_rust(root, filepath: str) -> list[Symbol]:
 
 
 # ---------------------------------------------------------------------------
+# Go extraction
+# ---------------------------------------------------------------------------
+
+
+def _receiver_type_go(receiver_node) -> str | None:
+    """Extract the base type name from a Go receiver parameter_list.
+
+    Handles plain, pointer, and generic receivers (Go 1.18+):
+      (r Foo)       → "Foo"
+      (r *Foo)      → "Foo"
+      (r Foo[T])    → "Foo"
+      (r *Foo[T])   → "Foo"
+    """
+
+    def _base_type(type_node) -> str | None:
+        if type_node.type == "type_identifier":
+            return _text(type_node)
+        if type_node.type == "pointer_type":
+            for sub in type_node.named_children:
+                result = _base_type(sub)
+                if result:
+                    return result
+        if type_node.type == "generic_type":
+            base = type_node.child_by_field_name("type")
+            if base is not None:
+                return _base_type(base)
+        return None
+
+    for child in receiver_node.named_children:
+        if child.type == "parameter_declaration":
+            type_node = child.child_by_field_name("type")
+            if type_node is None:
+                continue
+            result = _base_type(type_node)
+            if result:
+                return result
+    return None
+
+
+def _receiver_name_go(receiver_node) -> str | None:
+    """Extract the variable name from a Go receiver parameter_list."""
+    for child in receiver_node.named_children:
+        if child.type == "parameter_declaration":
+            name_node = child.child_by_field_name("name")
+            if name_node is not None:
+                return _text(name_node)
+    return None
+
+
+def _extract_symbols_go(root, filepath: str) -> list[Symbol]:
+    """Extract functions, methods, and named types from a Go parse tree."""
+    symbols: list[Symbol] = []
+
+    for node in root.named_children:
+        if node.type == "function_declaration":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                body_node = node.child_by_field_name("body")
+                calls = _extract_calls(body_node) if body_node else []
+                symbols.append(
+                    Symbol(
+                        name=_text(name_node),
+                        kind="function",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        calls=list(set(calls)),
+                    )
+                )
+        elif node.type == "method_declaration":
+            name_node = node.child_by_field_name("name")
+            receiver_node = node.child_by_field_name("receiver")
+            if name_node:
+                parent_class = (
+                    _receiver_type_go(receiver_node) if receiver_node else None
+                )
+                receiver_name = (
+                    _receiver_name_go(receiver_node) if receiver_node else None
+                )
+                body_node = node.child_by_field_name("body")
+                calls = _extract_calls(body_node) if body_node else []
+                calls.extend(
+                    _go_receiver_call_aliases(body_node, receiver_name, parent_class)
+                )
+                symbols.append(
+                    Symbol(
+                        name=_text(name_node),
+                        kind="method",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        parent_class=parent_class,
+                        calls=list(set(calls)),
+                    )
+                )
+        elif node.type == "type_declaration":
+            for type_spec in node.named_children:
+                if type_spec.type == "type_spec":
+                    name_node = type_spec.child_by_field_name("name")
+                    type_node = type_spec.child_by_field_name("type")
+                    if (
+                        name_node
+                        and type_node
+                        and type_node.type
+                        in (
+                            "struct_type",
+                            "interface_type",
+                        )
+                    ):
+                        symbols.append(
+                            Symbol(
+                                name=_text(name_node),
+                                kind="class",
+                                file=filepath,
+                                start_line=type_spec.start_point[0] + 1,
+                                end_line=type_spec.end_point[0] + 1,
+                            )
+                        )
+
+    return symbols
+
+
+def _extract_imports_go(root) -> list[ImportInfo]:
+    """Extract import statements from a Go parse tree.
+
+    Handles:
+    - import "fmt"                  → name="fmt", module="fmt"
+    - import m "math"               → name="math", alias="m"
+    - import . "os"                 → name="os", is_from=True
+    - import _ "unused"             → name="unused", alias="_"
+    - import "github.com/foo/bar"   → name="bar", module="github.com/foo/bar"
+    """
+    imports: list[ImportInfo] = []
+
+    def _parse_import_spec(spec_node) -> None:
+        path_node = spec_node.child_by_field_name("path")
+        if path_node is None:
+            return
+        path_text = _strip_string_quotes(_text(path_node))
+        default_name = path_text.split("/")[-1]
+
+        alias = None
+        is_from = False
+        name_node = spec_node.child_by_field_name("name")
+        if name_node is not None:
+            alias_text = _text(name_node)
+            if alias_text == ".":
+                is_from = True
+            elif alias_text == "_":
+                alias = "_"
+            else:
+                alias = alias_text
+
+        imports.append(
+            ImportInfo(
+                file="",
+                name=default_name,
+                module=path_text,
+                is_from=is_from,
+                alias=alias,
+            )
+        )
+
+    try:
+        for node in root.named_children:
+            if node.type == "import_declaration":
+                for child in node.named_children:
+                    if child.type == "import_spec_list":
+                        for spec in child.named_children:
+                            if spec.type == "import_spec":
+                                _parse_import_spec(spec)
+                    elif child.type == "import_spec":
+                        _parse_import_spec(child)
+    except Exception:
+        pass
+    return imports
+
+
+# ---------------------------------------------------------------------------
+# Java extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_symbols_java(root, filepath: str) -> list[Symbol]:
+    """Extract classes, interfaces, enums, and methods from a Java parse tree."""
+    symbols: list[Symbol] = []
+
+    def _text(node) -> str:
+        try:
+            return node.text.decode("utf-8") if node.text else ""
+        except Exception:
+            return ""
+
+    def _extract_members(body_node, parent_class: str) -> None:
+        for member in body_node.named_children:
+            if member.type == "method_declaration":
+                name_node = member.child_by_field_name("name")
+                if name_node:
+                    body = member.child_by_field_name("body")
+                    calls = _extract_calls(body) if body else []
+                    symbols.append(
+                        Symbol(
+                            name=_text(name_node),
+                            kind="method",
+                            file=filepath,
+                            start_line=member.start_point[0] + 1,
+                            end_line=member.end_point[0] + 1,
+                            parent_class=parent_class,
+                            calls=list(set(calls)),
+                        )
+                    )
+            elif member.type == "constructor_declaration":
+                name_node = member.child_by_field_name("name")
+                if name_node:
+                    body = member.child_by_field_name("body")
+                    calls = _extract_calls(body) if body else []
+                    symbols.append(
+                        Symbol(
+                            name=_text(name_node),
+                            kind="method",
+                            file=filepath,
+                            start_line=member.start_point[0] + 1,
+                            end_line=member.end_point[0] + 1,
+                            parent_class=parent_class,
+                            calls=list(set(calls)),
+                        )
+                    )
+            elif member.type in (
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+            ):
+                _extract_type_decl(member)
+
+    def _extract_type_decl(node) -> None:
+        if node.type == "class_declaration":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                class_name = _text(name_node)
+                symbols.append(
+                    Symbol(
+                        name=class_name,
+                        kind="class",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    )
+                )
+                body = node.child_by_field_name("body")
+                if body:
+                    _extract_members(body, parent_class=class_name)
+        elif node.type == "interface_declaration":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                iface_name = _text(name_node)
+                symbols.append(
+                    Symbol(
+                        name=iface_name,
+                        kind="class",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    )
+                )
+                body = node.child_by_field_name("body")
+                if body:
+                    for member in body.named_children:
+                        if member.type == "method_declaration":
+                            mn = member.child_by_field_name("name")
+                            if mn:
+                                symbols.append(
+                                    Symbol(
+                                        name=_text(mn),
+                                        kind="method",
+                                        file=filepath,
+                                        start_line=member.start_point[0] + 1,
+                                        end_line=member.end_point[0] + 1,
+                                        parent_class=iface_name,
+                                    )
+                                )
+        elif node.type == "enum_declaration":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                symbols.append(
+                    Symbol(
+                        name=_text(name_node),
+                        kind="class",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    )
+                )
+
+    for child in root.named_children:
+        _extract_type_decl(child)
+
+    return symbols
+
+
+def _extract_imports_java(root) -> list[ImportInfo]:
+    """Extract import declarations from a Java parse tree."""
+    imports: list[ImportInfo] = []
+
+    def _text(node) -> str:
+        try:
+            return node.text.decode("utf-8") if node.text else ""
+        except Exception:
+            return ""
+
+    for child in root.named_children:
+        if child.type == "import_declaration":
+            is_wildcard = any(c.type == "asterisk" for c in child.children)
+            qualified = next(
+                (
+                    _text(c)
+                    for c in child.named_children
+                    if c.type == "scoped_identifier"
+                ),
+                None,
+            ) or next(
+                (_text(c) for c in child.named_children if c.type == "identifier"),
+                None,
+            )
+            if not qualified:
+                continue
+            if is_wildcard:
+                module, name = qualified, "*"
+            elif "." in qualified:
+                dot = qualified.rfind(".")
+                module, name = qualified[:dot], qualified[dot + 1 :]
+            else:
+                module, name = "", qualified
+            imports.append(
+                ImportInfo(file="", module=module, name=name, alias=None, is_from=True)
+            )
+
+    return imports
+
+
+def _extract_symbols_ruby(root, filepath: str) -> list[Symbol]:
+    """Extract modules, classes, and methods from a Ruby parse tree.
+
+    Ruby modules and classes both map to ``kind="class"`` (namespacing
+    containers); ``def`` and ``def self.`` map to ``kind="method"`` when nested
+    in a class/module and ``kind="function"`` at the top level.
+    """
+    symbols: list[Symbol] = []
+
+    def _text(node) -> str:
+        try:
+            return node.text.decode("utf-8") if node.text else ""
+        except Exception:
+            return ""
+
+    def _walk(node, parent: str | None) -> None:
+        for child in node.named_children:
+            if child.type in ("class", "module"):
+                name_node = child.child_by_field_name("name")
+                name = _text(name_node) if name_node else ""
+                if name:
+                    symbols.append(
+                        Symbol(
+                            name=name,
+                            kind="class",
+                            file=filepath,
+                            start_line=child.start_point[0] + 1,
+                            end_line=child.end_point[0] + 1,
+                            parent_class=parent,
+                        )
+                    )
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    _walk(body, parent=name or parent)
+            elif child.type in ("method", "singleton_method"):
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    body = child.child_by_field_name("body")
+                    calls = _extract_calls(body) if body is not None else []
+                    symbols.append(
+                        Symbol(
+                            name=_text(name_node),
+                            kind="method" if parent else "function",
+                            file=filepath,
+                            start_line=child.start_point[0] + 1,
+                            end_line=child.end_point[0] + 1,
+                            parent_class=parent,
+                            calls=list(set(calls)),
+                        )
+                    )
+            elif child.type == "body_statement":
+                _walk(child, parent)
+
+    _walk(root, parent=None)
+    return symbols
+
+
+def _extract_imports_ruby(root) -> list[ImportInfo]:
+    """Extract ``require`` / ``require_relative`` calls from a Ruby parse tree.
+
+    Ruby has no static import syntax; dependencies are loaded at runtime via
+    ``require``/``require_relative``/``load`` with a string path argument. The
+    loaded path is recorded as the module, with name ``*`` (whole-file load).
+    """
+    imports: list[ImportInfo] = []
+
+    def _text(node) -> str:
+        try:
+            return node.text.decode("utf-8") if node.text else ""
+        except Exception:
+            return ""
+
+    require_methods = {"require", "require_relative", "load"}
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "call":
+            method_node = node.child_by_field_name("method")
+            receiver = node.child_by_field_name("receiver")
+            if (
+                method_node is not None
+                and receiver is None
+                and _text(method_node) in require_methods
+            ):
+                args = node.child_by_field_name("arguments")
+                if args is not None:
+                    for arg in args.named_children:
+                        if arg.type == "string":
+                            path = _strip_string_quotes(_text(arg))
+                            if path:
+                                imports.append(
+                                    ImportInfo(
+                                        file="",
+                                        module=path,
+                                        name="*",
+                                        alias=None,
+                                        is_from=False,
+                                    )
+                                )
+        stack.extend(node.children)
+    return imports
+
+
+# ---------------------------------------------------------------------------
+# C# extraction
+# ---------------------------------------------------------------------------
+
+
+_CSHARP_TYPE_NODES = frozenset(
+    {
+        "class_declaration",
+        "struct_declaration",
+        "record_declaration",
+        "interface_declaration",
+        "enum_declaration",
+    }
+)
+_CSHARP_NAMESPACE_NODES = frozenset(
+    {"namespace_declaration", "file_scoped_namespace_declaration"}
+)
+
+
+def _csharp_body(node):
+    """Return a C# type's member-list node (the ``body`` field or a child
+    ``declaration_list``/``enum_member_declaration_list``)."""
+    body = node.child_by_field_name("body")
+    if body is not None:
+        return body
+    for child in node.named_children:
+        if child.type in ("declaration_list", "enum_member_declaration_list"):
+            return child
+    return None
+
+
+def _extract_symbols_csharp(root, filepath: str) -> list[Symbol]:
+    """Extract classes, structs, records, interfaces, enums, and their methods
+    from a C# parse tree.
+
+    C# declarations may be nested inside ``namespace`` blocks (block-scoped or
+    file-scoped), so containers are walked recursively.
+    """
+    symbols: list[Symbol] = []
+
+    def _members(body_node, parent_class: str) -> None:
+        for member in body_node.named_children:
+            if member.type in ("method_declaration", "constructor_declaration"):
+                name_node = member.child_by_field_name("name")
+                if name_node:
+                    body = member.child_by_field_name("body")
+                    calls = _extract_calls(body) if body else []
+                    symbols.append(
+                        Symbol(
+                            name=_text(name_node),
+                            kind="method",
+                            file=filepath,
+                            start_line=member.start_point[0] + 1,
+                            end_line=member.end_point[0] + 1,
+                            parent_class=parent_class,
+                            calls=list(set(calls)),
+                        )
+                    )
+            elif member.type in _CSHARP_TYPE_NODES:
+                _type_decl(member)
+
+    def _type_decl(node) -> None:
+        name_node = node.child_by_field_name("name")
+        if not name_node:
+            return
+        type_name = _text(name_node)
+        symbols.append(
+            Symbol(
+                name=type_name,
+                kind="class",
+                file=filepath,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+            )
+        )
+        body = _csharp_body(node)
+        if body is not None:
+            _members(body, parent_class=type_name)
+
+    def _walk_container(node) -> None:
+        for child in node.named_children:
+            if child.type in _CSHARP_NAMESPACE_NODES:
+                body = _csharp_body(child)
+                _walk_container(body if body is not None else child)
+            elif child.type in _CSHARP_TYPE_NODES:
+                _type_decl(child)
+
+    _walk_container(root)
+    return symbols
+
+
+def _extract_imports_csharp(root) -> list[ImportInfo]:
+    """Extract ``using`` directives from a C# parse tree.
+
+    Handles ``using System;``, ``using System.Collections.Generic;``,
+    ``using static System.Math;``, and ``using Foo = System.Bar;`` (alias).
+    """
+    imports: list[ImportInfo] = []
+
+    def _walk(node) -> None:
+        for child in node.named_children:
+            if child.type == "using_directive":
+                # For `using Alias = Some.Namespace;` the "name" field holds the
+                # alias identifier; plain/`static` usings have no "name" field and
+                # carry the namespace as an unnamed qualified_name/identifier child.
+                alias_node = child.child_by_field_name("name")
+                alias = _text(alias_node) if alias_node is not None else None
+                ns_node = next(
+                    (c for c in child.named_children if c.type == "qualified_name"),
+                    None,
+                )
+                if ns_node is None:
+                    ns_node = next(
+                        (
+                            c
+                            for c in child.named_children
+                            if c.type == "identifier"
+                            and (alias is None or _text(c) != alias)
+                        ),
+                        None,
+                    )
+                qualified = _text(ns_node) if ns_node is not None else ""
+                if not qualified:
+                    continue
+                if "." in qualified:
+                    dot = qualified.rfind(".")
+                    module, name = qualified[:dot], qualified[dot + 1 :]
+                else:
+                    module, name = "", qualified
+                imports.append(
+                    ImportInfo(
+                        file="",
+                        module=module,
+                        name=name,
+                        alias=alias,
+                        is_from=True,
+                    )
+                )
+            elif child.type in _CSHARP_NAMESPACE_NODES:
+                body = _csharp_body(child)
+                _walk(body if body is not None else child)
+
+    _walk(root)
+    return imports
+
+
+# ---------------------------------------------------------------------------
+# C extraction helpers
+# ---------------------------------------------------------------------------
+
+
+def _c_find_function_name(declarator) -> str | None:
+    """Walk a C declarator chain to find the function name identifier.
+
+    Handles direct ``function_declarator``, ``pointer_declarator`` wrapping
+    (e.g. ``int *foo(void)``), and ``parenthesized_declarator`` wrapping
+    (e.g. ``int (*(foo))(void)``).
+    """
+    if declarator is None:
+        return None
+    if declarator.type == "identifier":
+        return _text(declarator)
+    if declarator.type == "function_declarator":
+        # The function name is in the "declarator" child, which may be a
+        # plain identifier ("int foo(void)") or a wrapping node such as
+        # parenthesized_declarator ("int (*(foo))(void)").
+        name_node = declarator.child_by_field_name("declarator")
+        if name_node is not None:
+            if name_node.type == "identifier":
+                return _text(name_node)
+            # Recurse into wrapping node (e.g. parenthesized_declarator)
+            return _c_find_function_name(name_node)
+    elif declarator.type == "pointer_declarator":
+        inner = declarator.child_by_field_name("declarator")
+        return _c_find_function_name(inner)
+    elif declarator.type == "parenthesized_declarator":
+        # Walk through parentheses to find the inner declarator chain.
+        # The content inside the parens (e.g. identifier, pointer_declarator,
+        # or another parenthesized_declarator) is in a child node.
+        for child in declarator.children:
+            if child.type in (
+                "identifier",
+                "pointer_declarator",
+                "parenthesized_declarator",
+            ):
+                return _c_find_function_name(child)
+    return None
+
+
+def _extract_symbols_c(root, filepath: str) -> list[Symbol]:
+    """Extract function definitions and typedef'd struct types from a C parse tree.
+
+    Functions are extracted as ``kind="function"``.  Named ``struct`` definitions
+    and ``typedef struct { ... } Name`` patterns are extracted as ``kind="class"``
+    to stay consistent with how structs are represented across other languages.
+
+    Walks recursively through preprocessor conditionals (``#ifdef``, ``#ifndef``,
+    ``#if``, ``#elif``, ``#else``) so that functions and structs guarded by
+    platform-specific or feature-test macros are not silently dropped.
+    """
+    symbols: list[Symbol] = []
+
+    # Preprocessor conditional node types that may wrap symbols
+    _PREPROC_WRAPPER = frozenset(
+        {
+            "preproc_ifdef",
+            "preproc_ifndef",
+            "preproc_if",
+            "preproc_elif",
+            "preproc_else",
+        }
+    )
+
+    def _walk(node) -> None:
+        for child in node.named_children:
+            if child.type in _PREPROC_WRAPPER:
+                _walk(child)
+            elif child.type == "function_definition":
+                outer_decl = child.child_by_field_name("declarator")
+                name = _c_find_function_name(outer_decl)
+                if not name:
+                    continue
+                body = child.child_by_field_name("body")
+                calls = _extract_calls(body) if body else []
+                symbols.append(
+                    Symbol(
+                        name=name,
+                        kind="function",
+                        file=filepath,
+                        start_line=child.start_point[0] + 1,
+                        end_line=child.end_point[0] + 1,
+                        calls=list(set(calls)),
+                    )
+                )
+            elif child.type == "struct_specifier":
+                # Named struct at top level: `struct Foo { ... };`
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    symbols.append(
+                        Symbol(
+                            name=_text(name_node),
+                            kind="class",
+                            file=filepath,
+                            start_line=child.start_point[0] + 1,
+                            end_line=child.end_point[0] + 1,
+                        )
+                    )
+            elif child.type == "type_definition":
+                # typedef struct { ... } Name; or typedef struct Named Name;
+                has_struct = any(
+                    c.type == "struct_specifier" for c in child.named_children
+                )
+                if has_struct:
+                    # The typedef name is the type_identifier child at the end
+                    type_id = next(
+                        (
+                            c
+                            for c in reversed(child.named_children)
+                            if c.type == "type_identifier"
+                        ),
+                        None,
+                    )
+                    if type_id:
+                        symbols.append(
+                            Symbol(
+                                name=_text(type_id),
+                                kind="class",
+                                file=filepath,
+                                start_line=child.start_point[0] + 1,
+                                end_line=child.end_point[0] + 1,
+                            )
+                        )
+
+    _walk(root)
+    return symbols
+
+
+def _extract_imports_c(root) -> list[ImportInfo]:
+    """Extract ``#include`` directives from a C parse tree.
+
+    Handles both angle-bracket forms (``<stdio.h>``) and quoted forms
+    (``"myheader.h"``).  The include path is split on ``/`` to populate
+    ``module`` (the leading directory, e.g. ``sys``) and ``name`` (the
+    filename, e.g. ``types.h``).
+
+    Walks recursively through preprocessor conditionals (``#ifdef``, ``#ifndef``,
+    ``#if``, ``#elif``, ``#else``) so that platform-specific or feature-guarded
+    includes are not silently dropped.
+    """
+    imports: list[ImportInfo] = []
+
+    # Preprocessor conditional node types that may wrap #include directives
+    _PREPROC_WRAPPER = frozenset(
+        {
+            "preproc_ifdef",
+            "preproc_ifndef",
+            "preproc_if",
+            "preproc_elif",
+            "preproc_else",
+        }
+    )
+
+    def _walk(node) -> None:
+        for child in node.named_children:
+            if child.type in _PREPROC_WRAPPER:
+                _walk(child)
+            elif child.type == "preproc_include":
+                _extract_include(child)
+
+    def _extract_include(node) -> None:
+        path_node = node.child_by_field_name("path")
+        if path_node is None:
+            return
+        if path_node.type == "system_lib_string":
+            raw = _text(path_node)
+            include_path = raw.strip("<>")
+        elif path_node.type == "string_literal":
+            content = next(
+                (c for c in path_node.named_children if c.type == "string_content"),
+                None,
+            )
+            include_path = (
+                _text(content) if content else _strip_string_quotes(_text(path_node))
+            )
+        else:
+            include_path = _text(path_node).strip("<>\"'")
+
+        if not include_path:
+            return
+
+        if "/" in include_path:
+            slash = include_path.rfind("/")
+            module, name = include_path[:slash], include_path[slash + 1 :]
+        else:
+            module, name = "", include_path
+
+        imports.append(
+            ImportInfo(
+                file="",
+                module=module,
+                name=name,
+                is_from=False,
+            )
+        )
+
+    _walk(root)
+    return imports
+
+
+# ---------------------------------------------------------------------------
+# PHP extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_symbols_php(root, filepath: str) -> list[Symbol]:
+    """Extract classes, interfaces, traits, methods, and functions from a PHP parse tree."""
+    symbols: list[Symbol] = []
+
+    def _extract_method_body(body_node, parent_class: str) -> None:
+        for child in body_node.named_children:
+            if child.type == "method_declaration":
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    body = child.child_by_field_name("body")
+                    calls = _extract_calls(body) if body else []
+                    symbols.append(
+                        Symbol(
+                            name=_text(name_node),
+                            kind="method",
+                            file=filepath,
+                            start_line=child.start_point[0] + 1,
+                            end_line=child.end_point[0] + 1,
+                            parent_class=parent_class,
+                            calls=list(set(calls)),
+                        )
+                    )
+
+    def _walk(node) -> None:
+        if node.type == "function_definition":
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                body = node.child_by_field_name("body")
+                calls = _extract_calls(body) if body else []
+                symbols.append(
+                    Symbol(
+                        name=_text(name_node),
+                        kind="function",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        calls=list(set(calls)),
+                    )
+                )
+            return
+
+        if node.type in {
+            "class_declaration",
+            "interface_declaration",
+            "trait_declaration",
+        }:
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                class_name = _text(name_node)
+                symbols.append(
+                    Symbol(
+                        name=class_name,
+                        kind="class",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    )
+                )
+                body = node.child_by_field_name("body")
+                if body:
+                    _extract_method_body(body, parent_class=class_name)
+            return
+
+        for child in node.named_children:
+            _walk(child)
+
+    _walk(root)
+    return symbols
+
+
+def _split_php_import_name(qualified: str, prefix: str = "") -> tuple[str, str]:
+    """Split a PHP import target into ``(module, name)`` pieces."""
+    module = prefix
+    name = qualified
+    dot = qualified.rfind("\\")
+    if dot >= 0:
+        module = prefix + "\\" + qualified[:dot] if prefix else qualified[:dot]
+        name = qualified[dot + 1 :]
+    return module, name
+
+
+def _extract_imports_php(root) -> list[ImportInfo]:
+    """Extract ``use`` import declarations from a PHP parse tree.
+
+    Handles:
+    - use App\\Entity\\User;
+    - use App\\Util\\Helper as H;
+    - use function array_map;
+    - use const PHP_EOL;
+    - use App\\Entity\\{User, Group};   (group use declarations)
+    """
+    imports: list[ImportInfo] = []
+
+    def _walk(node) -> None:
+        if node.type == "namespace_use_declaration":
+            clause = next(
+                (c for c in node.named_children if c.type == "namespace_use_clause"),
+                None,
+            )
+            if clause:
+                is_fn_const = any(
+                    child.type in {"function", "const"} for child in clause.children
+                )
+                qual = next(
+                    (
+                        child
+                        for child in clause.named_children
+                        if child.type in {"qualified_name", "name"}
+                    ),
+                    None,
+                )
+                if qual is not None:
+                    qualified = _text(qual)
+                    if qualified:
+                        module, name = _split_php_import_name(qualified)
+                        alias = clause.child_by_field_name("alias")
+                        alias_text = _text(alias) if alias else None
+                        imports.append(
+                            ImportInfo(
+                                file="",
+                                module=module,
+                                name=name,
+                                alias=alias_text,
+                                is_from=True,
+                            )
+                        )
+                        if is_fn_const:
+                            return
+                if is_fn_const:
+                    return
+
+            # Group use: use App\Entity\{User, Group};
+            group = next(
+                (c for c in node.named_children if c.type == "namespace_use_group"),
+                None,
+            )
+            if group:
+                prefix_node = next(
+                    (c for c in node.named_children if c.type == "namespace_name"),
+                    None,
+                )
+                prefix = _text(prefix_node) if prefix_node else ""
+                for clause in group.named_children:
+                    if clause.type != "namespace_use_clause":
+                        continue
+                    qual = next(
+                        (
+                            child
+                            for child in clause.named_children
+                            if child.type in {"qualified_name", "name"}
+                        ),
+                        None,
+                    )
+                    if qual is None:
+                        continue
+                    qualified = _text(qual)
+                    if not qualified:
+                        continue
+                    module, name = _split_php_import_name(qualified, prefix=prefix)
+                    alias = clause.child_by_field_name("alias")
+                    alias_text = _text(alias) if alias else None
+                    imports.append(
+                        ImportInfo(
+                            file="",
+                            module=module,
+                            name=name,
+                            alias=alias_text,
+                            is_from=True,
+                        )
+                    )
+            return
+
+        for child in node.named_children:
+            _walk(child)
+
+    _walk(root)
+    return imports
+
+
+# ---------------------------------------------------------------------------
+# Kotlin extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_symbols_kotlin(root, filepath: str) -> list[Symbol]:
+    """Extract classes, objects, methods, and top-level functions from Kotlin."""
+    symbols: list[Symbol] = []
+
+    def _function_symbol(node, parent_class: str | None) -> None:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        body = next(
+            (child for child in node.named_children if child.type == "function_body"),
+            None,
+        )
+        # For expression-body functions (e.g. `fun greet() = println("hi")`)
+        # tree-sitter-kotlin emits no function_body child; fall back to walking
+        # the whole declaration so calls in the expression are still captured.
+        calls = _extract_calls(body if body is not None else node)
+        symbols.append(
+            Symbol(
+                name=_text(name_node),
+                kind="method" if parent_class else "function",
+                file=filepath,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                parent_class=parent_class,
+                calls=list(set(calls)),
+            )
+        )
+
+    def _walk(node, parent_class: str | None = None) -> None:
+        if node.type in {"class_declaration", "object_declaration"}:
+            name_node = node.child_by_field_name("name")
+            class_name = _text(name_node) if name_node else ""
+            if class_name:
+                symbols.append(
+                    Symbol(
+                        name=class_name,
+                        kind="class",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        parent_class=parent_class,
+                    )
+                )
+            body = next(
+                (child for child in node.named_children if child.type == "class_body"),
+                None,
+            )
+            if body is not None:
+                _walk(body, class_name or parent_class)
+            return
+
+        if node.type == "companion_object":
+            body = next(
+                (child for child in node.named_children if child.type == "class_body"),
+                None,
+            )
+            if body is not None:
+                _walk(body, parent_class)
+            return
+
+        if node.type == "function_declaration":
+            _function_symbol(node, parent_class)
+            return
+
+        for child in node.named_children:
+            _walk(child, parent_class)
+
+    _walk(root)
+    return symbols
+
+
+def _split_kotlin_import(qualified: str, is_wildcard: bool) -> tuple[str, str]:
+    """Split a Kotlin import into ``(module, name)`` pieces."""
+    if is_wildcard:
+        return qualified, "*"
+    if "." not in qualified:
+        return "", qualified
+    module, name = qualified.rsplit(".", 1)
+    return module, name
+
+
+def _extract_imports_kotlin(root) -> list[ImportInfo]:
+    """Extract Kotlin import declarations, including aliases and wildcards."""
+    imports: list[ImportInfo] = []
+
+    for node in root.named_children:
+        if node.type != "import":
+            continue
+        qualified_node = next(
+            (
+                child
+                for child in node.named_children
+                if child.type == "qualified_identifier"
+            ),
+            None,
+        )
+        if qualified_node is None:
+            continue
+        qualified = _text(qualified_node)
+        if not qualified:
+            continue
+        is_wildcard = any(child.type == "*" for child in node.children)
+        module, name = _split_kotlin_import(qualified, is_wildcard)
+        alias_node = next(
+            (
+                child
+                for child in node.named_children
+                if child.type == "identifier" and child is not qualified_node
+            ),
+            None,
+        )
+        imports.append(
+            ImportInfo(
+                file="",
+                module=module,
+                name=name,
+                alias=_text(alias_node) if alias_node is not None else None,
+                is_from=True,
+            )
+        )
+
+    return imports
+
+
+# ---------------------------------------------------------------------------
+# Swift extraction
+# ---------------------------------------------------------------------------
+
+
+def _swift_container_body(node):
+    """Return a Swift declaration body node when present.
+
+    alex-pinkus/tree-sitter-swift uses a unified ``class_body`` node for all
+    nominal-type bodies (class, struct, extension, actor).  Only
+    ``protocol_body`` and ``enum_class_body`` are distinct.  If a future
+    grammar version introduces ``struct_body`` or ``actor_body``, update this
+    set to include them so methods inside those types are not silently skipped.
+    """
+    for child in node.named_children:
+        if child.type in {"class_body", "protocol_body", "enum_class_body"}:
+            return child
+    return None
+
+
+def _swift_declaration_name(node) -> str | None:
+    """Return the declared Swift type/function name."""
+    name_node = node.child_by_field_name("name")
+    if name_node is not None:
+        text = _text(name_node)
+        if text:
+            return text
+
+    for child in node.named_children:
+        if child.type in {"simple_identifier", "type_identifier"}:
+            text = _text(child)
+            if text:
+                return text
+        if child.type == "user_type":
+            text = _text(child)
+            if text:
+                return text
+    return None
+
+
+def _extract_symbols_swift(root, filepath: str) -> list[Symbol]:
+    """Extract Swift types, protocols, methods, initializers, and functions."""
+    symbols: list[Symbol] = []
+
+    def _add_function(node, parent_class: str | None) -> None:
+        name: str | None
+        if node.type == "init_declaration":
+            name = "init"
+        else:
+            name = _swift_declaration_name(node)
+        if not name:
+            return
+
+        body = node.child_by_field_name("body")
+        if body is None:
+            body = next(
+                (
+                    child
+                    for child in node.named_children
+                    if child.type == "function_body"
+                ),
+                None,
+            )
+        calls = _extract_calls(body) if body is not None else []
+        symbols.append(
+            Symbol(
+                name=name,
+                kind="method" if parent_class else "function",
+                file=filepath,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                parent_class=parent_class,
+                calls=list(set(calls)),
+            )
+        )
+
+    def _walk(node, parent_class: str | None = None) -> None:
+        # alex-pinkus/tree-sitter-swift emits ``class_declaration`` for all
+        # nominal types: class, struct, extension, and actor.  Only
+        # ``protocol_declaration`` is a distinct node.  If a future grammar
+        # version introduces ``extension_declaration`` or ``actor_declaration``,
+        # add them to this set so their members are not silently dropped.
+        if node.type in {"class_declaration", "protocol_declaration"}:
+            type_name = _swift_declaration_name(node)
+            if type_name:
+                symbols.append(
+                    Symbol(
+                        name=type_name,
+                        kind="class",
+                        file=filepath,
+                        start_line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                        parent_class=parent_class,
+                    )
+                )
+            body = _swift_container_body(node)
+            if body is not None:
+                _walk(body, type_name or parent_class)
+            return
+
+        if node.type in {
+            "function_declaration",
+            "protocol_function_declaration",
+            "init_declaration",
+        }:
+            _add_function(node, parent_class)
+            return
+
+        for child in node.named_children:
+            _walk(child, parent_class)
+
+    _walk(root)
+    return symbols
+
+
+def _split_swift_import(qualified: str) -> tuple[str, str]:
+    """Split a Swift import into ``(module, name)`` pieces."""
+    if "." not in qualified:
+        return "", qualified
+    module, name = qualified.rsplit(".", 1)
+    return module, name
+
+
+def _extract_imports_swift(root) -> list[ImportInfo]:
+    """Extract Swift import declarations."""
+    imports: list[ImportInfo] = []
+
+    for node in root.named_children:
+        if node.type != "import_declaration":
+            continue
+        ident = next(
+            (child for child in node.named_children if child.type == "identifier"),
+            None,
+        )
+        if ident is None:
+            continue
+        qualified = _text(ident)
+        if not qualified:
+            continue
+        module, name = _split_swift_import(qualified)
+        imports.append(
+            ImportInfo(
+                file="",
+                module=module,
+                name=name,
+                alias=None,
+                is_from=True,
+            )
+        )
+
+    return imports
+
+
+# C++ extraction
+# ---------------------------------------------------------------------------
+
+
+_CPP_TYPE_NODES = frozenset(
+    {"class_specifier", "struct_specifier", "union_specifier", "enum_specifier"}
+)
+
+
+def _cpp_container_body(node):
+    """Return a C++ namespace/type body node when present."""
+    for child in node.named_children:
+        if child.type in (
+            "declaration_list",
+            "field_declaration_list",
+            "enumerator_list",
+        ):
+            return child
+    return None
+
+
+def _cpp_type_name(node) -> str | None:
+    """Return the declared C++ type name."""
+    for child in node.named_children:
+        if child.type in {
+            "type_identifier",
+            "identifier",
+            "namespace_identifier",
+        }:
+            name = _text(child)
+            if name:
+                return name
+    return None
+
+
+def _cpp_qualified_parts(node) -> list[str]:
+    """Return the named segments inside a C++ qualified identifier."""
+    if node.type in {
+        "identifier",
+        "field_identifier",
+        "type_identifier",
+        "namespace_identifier",
+        "destructor_name",
+        "operator_name",
+    }:
+        text = _text(node)
+        return [text] if text else []
+
+    parts: list[str] = []
+    for child in node.named_children:
+        parts.extend(_cpp_qualified_parts(child))
+    return parts
+
+
+def _cpp_function_name_and_parent(
+    declarator, known_types: set[str]
+) -> tuple[str | None, str | None]:
+    """Return ``(name, parent_class)`` for a C++ declarator subtree."""
+    if declarator.type == "qualified_identifier":
+        parts = _cpp_qualified_parts(declarator)
+        if not parts:
+            return None, None
+        parent = parts[-2] if len(parts) >= 2 and parts[-2] in known_types else None
+        return parts[-1], parent
+
+    if declarator.type in {
+        "identifier",
+        "field_identifier",
+        "destructor_name",
+        "operator_name",
+    }:
+        text = _text(declarator)
+        return (text, None) if text else (None, None)
+
+    for child in declarator.named_children:
+        if child.type == "parameter_list":
+            continue
+        name, parent = _cpp_function_name_and_parent(child, known_types)
+        if name:
+            return name, parent
+    return None, None
+
+
+def _cpp_function_body(node):
+    """Return a function's compound statement node when present."""
+    body = node.child_by_field_name("body")
+    if body is not None:
+        return body
+    for child in node.named_children:
+        if child.type == "compound_statement":
+            return child
+    return None
+
+
+def _extract_symbols_cpp(root, filepath: str) -> list[Symbol]:
+    """Extract classes, methods, and functions from a C++ parse tree.
+
+    Scope is intentionally narrow: namespaces, top-level functions, class/struct/enum
+    declarations, inline member definitions, and out-of-class member definitions that
+    use a known declared type name.
+    """
+    symbols: list[Symbol] = []
+    known_types: set[str] = set()
+
+    def _add_function(node, parent_class: str | None = None) -> None:
+        declarator = node.child_by_field_name("declarator")
+        if declarator is None:
+            declarator = next(
+                (child for child in node.named_children if "declarator" in child.type),
+                None,
+            )
+        if declarator is None:
+            return
+
+        name, inferred_parent = _cpp_function_name_and_parent(declarator, known_types)
+        if not name:
+            return
+
+        effective_parent = parent_class or inferred_parent
+        body = _cpp_function_body(node)
+        calls = _extract_calls(body) if body else []
+        symbols.append(
+            Symbol(
+                name=name,
+                kind="method" if effective_parent else "function",
+                file=filepath,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                parent_class=effective_parent,
+                calls=list(set(calls)),
+            )
+        )
+
+    def _visit_type(node) -> None:
+        type_name = _cpp_type_name(node)
+        if not type_name:
+            return
+
+        known_types.add(type_name)
+        symbols.append(
+            Symbol(
+                name=type_name,
+                kind="class",
+                file=filepath,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+            )
+        )
+
+        body = _cpp_container_body(node)
+        if body is None:
+            return
+
+        for child in body.named_children:
+            if child.type == "function_definition":
+                _add_function(child, parent_class=type_name)
+            elif child.type in _CPP_TYPE_NODES:
+                _visit_type(child)
+
+    def _walk_container(node) -> None:
+        for child in node.named_children:
+            if child.type == "namespace_definition":
+                body = _cpp_container_body(child)
+                _walk_container(body if body is not None else child)
+            elif child.type in _CPP_TYPE_NODES:
+                _visit_type(child)
+            elif child.type == "function_definition":
+                _add_function(child)
+
+    _walk_container(root)
+    return symbols
+
+
+def _extract_imports_cpp(root) -> list[ImportInfo]:
+    """Extract ``#include`` directives from a C++ parse tree.
+
+    Walks recursively through preprocessor conditionals (``#ifdef``, ``#ifndef``,
+    ``#if``, ``#elif``, ``#else``) so that platform-specific or feature-guarded
+    includes are not silently dropped.
+    """
+    imports: list[ImportInfo] = []
+
+    _PREPROC_WRAPPER = frozenset(
+        {
+            "preproc_ifdef",
+            "preproc_ifndef",
+            "preproc_if",
+            "preproc_elif",
+            "preproc_else",
+        }
+    )
+
+    def _extract_include(child) -> None:
+        path_node = child.child_by_field_name("path")
+        if path_node is None:
+            path_node = next(
+                (
+                    node
+                    for node in child.named_children
+                    if node.type in {"string_literal", "system_lib_string"}
+                ),
+                None,
+            )
+        if path_node is None:
+            return
+        include_path = _strip_include_delimiters(_text(path_node))
+        if not include_path:
+            return
+        parts = include_path.split("/")
+        imports.append(
+            ImportInfo(
+                file="",
+                module="/".join(parts[:-1]),
+                name=parts[-1],
+                alias=None,
+                is_from=True,
+            )
+        )
+
+    def _walk(node) -> None:
+        for child in node.named_children:
+            if child.type in _PREPROC_WRAPPER:
+                _walk(child)
+            elif child.type == "preproc_include":
+                _extract_include(child)
+
+    _walk(root)
+    return imports
+
+
+# ---------------------------------------------------------------------------
 # Multi-language parse_file
 # ---------------------------------------------------------------------------
 
@@ -1194,7 +3101,8 @@ def parse_file(filepath: Path) -> FileParseResult:
     """Extract all symbols and imports from a source file.
 
     Detects language from file extension and dispatches to the correct
-    tree-sitter grammar. Supports Python, TypeScript/JavaScript, and Rust.
+    tree-sitter grammar. Supports Python, TypeScript/JavaScript, Rust, Go,
+    Java, C#, Ruby, C, C++, PHP, Kotlin, and Swift.
     """
     code = filepath.read_bytes()
     lang_name = _detect_language(filepath)
@@ -1217,11 +3125,57 @@ def parse_file(filepath: Path) -> FileParseResult:
     elif lang_name == "rust":
         symbols = _extract_symbols_rust(root, filename)
 
+    elif lang_name == "go":
+        symbols = _extract_symbols_go(root, filename)
+
+    elif lang_name == "java":
+        symbols = _extract_symbols_java(root, filename)
+
+    elif lang_name == "csharp":
+        symbols = _extract_symbols_csharp(root, filename)
+    elif lang_name == "cpp":
+        symbols = _extract_symbols_cpp(root, filename)
+
+    elif lang_name == "ruby":
+        symbols = _extract_symbols_ruby(root, filename)
+
+    elif lang_name == "c":
+        symbols = _extract_symbols_c(root, filename)
+
+    elif lang_name == "php":
+        symbols = _extract_symbols_php(root, filename)
+
+    elif lang_name == "kotlin":
+        symbols = _extract_symbols_kotlin(root, filename)
+
+    elif lang_name == "swift":
+        symbols = _extract_symbols_swift(root, filename)
+
     imports: list[ImportInfo] = []
     if lang_name == "python":
         imports = _extract_imports(root)
     elif lang_name in ("typescript", "javascript", "tsx"):
         imports = _extract_imports_javascript(root)
+    elif lang_name == "rust":
+        imports = _extract_imports_rust(root)
+    elif lang_name == "go":
+        imports = _extract_imports_go(root)
+    elif lang_name == "java":
+        imports = _extract_imports_java(root)
+    elif lang_name == "csharp":
+        imports = _extract_imports_csharp(root)
+    elif lang_name == "cpp":
+        imports = _extract_imports_cpp(root)
+    elif lang_name == "ruby":
+        imports = _extract_imports_ruby(root)
+    elif lang_name == "c":
+        imports = _extract_imports_c(root)
+    elif lang_name == "php":
+        imports = _extract_imports_php(root)
+    elif lang_name == "kotlin":
+        imports = _extract_imports_kotlin(root)
+    elif lang_name == "swift":
+        imports = _extract_imports_swift(root)
 
     for imp in imports:
         imp.file = filename
@@ -1276,14 +3230,44 @@ def build_call_graph(
     """
     known_names = {s.name for s in symbols}
     # Map bare names → qualified IDs for the single-file case.
-    # Within one file, name collisions don't occur, so this is 1:1.
     name_to_qid: dict[str, str] = {}
     for s in symbols:
         qid = s.qualified_id()
         name_to_qid[s.name] = qid
+        # Add qualified-name entries for methods with a parent class.
+        # This prevents bare-name collisions when two types define a
+        # method with the same name (common with "log", "String", etc.).
+        # Receiver-call aliases are qualified, so self/receiver-local method
+        # calls can resolve without colliding with same-named methods on
+        # other types.
+        if s.parent_class and s.name:
+            qualified_key = f"{s.parent_class}.{s.name}"
+            name_to_qid[qualified_key] = qid
+            known_names.add(qualified_key)
 
     callees: dict[str, set[str]] = {}
     callers: dict[str, set[str]] = defaultdict(set)
+
+    # Detect bare-name collisions across types (e.g., two types both
+    # defining a "log" method).  When a caller with a known parent_class
+    # references a colliding bare name, prefer the qualified lookup
+    # ("ParentClass.method") to avoid wrong-type edges.
+    _collision_names = {
+        name
+        for name in known_names
+        if "." not in name and sum(1 for s in symbols if s.name == name) > 1
+    }
+
+    def _resolve_call(call: str, sym: Symbol) -> str | None:
+        qid = name_to_qid.get(call)
+        if qid is None:
+            return None
+        if call in _collision_names and sym.parent_class:
+            qualified_c = f"{sym.parent_class}.{call}"
+            qid_preferred = name_to_qid.get(qualified_c)
+            if qid_preferred is not None:
+                return qid_preferred
+        return qid
 
     for sym in symbols:
         if sym.kind == "class":
@@ -1291,7 +3275,11 @@ def build_call_graph(
         qid = name_to_qid.get(sym.name, sym.qualified_id())
         # Filter to known symbols only: excludes external builtins and dotted
         # attribute calls like 'calc.add' that can't be resolved locally.
-        filtered_calls = {name_to_qid[c] for c in sym.calls if c in known_names}
+        filtered_calls = {
+            resolved
+            for c in sym.calls
+            if c in known_names and (resolved := _resolve_call(c, sym)) is not None
+        }
         callees[qid] = filtered_calls
         for called_qid in filtered_calls:
             callers[called_qid].add(qid)
@@ -1393,6 +3381,8 @@ def build_cross_file_call_graph(
         qid = sym.qualified_id()
         if sym.name not in name_to_qid:
             name_to_qid[sym.name] = qid
+    # All qualified IDs — used for precise Rust path-qualified resolution.
+    known_qids = {sym.qualified_id() for sym in all_symbols}
 
     callees: dict[str, set[str]] = {}
     callers: dict[str, set[str]] = defaultdict(set)
@@ -1415,6 +3405,23 @@ def build_cross_file_call_graph(
                     resolved = _resolve_imported_symbol(call, imports, directory)
                     if resolved and resolved in known_names:
                         resolved_calls.add(resolved)
+                    elif "::" in call:
+                        # Rust path-qualified call: ``crate::module::fn()`` or
+                        # ``super::util::parse()`` — no explicit ``use`` import.
+                        # Use the module context (second-to-last segment) to build
+                        # a candidate qualified ID (e.g. ``utils::parse`` from
+                        # ``crate::utils::parse``) and prefer that over a bare-name
+                        # match, which silently picks the first-registered symbol
+                        # when multiple modules define the same function name.
+                        parts = call.split("::")
+                        last_segment = parts[-1]
+                        candidate_qid = (
+                            f"{parts[-2]}::{last_segment}" if len(parts) >= 2 else None
+                        )
+                        if candidate_qid and candidate_qid in known_qids:
+                            resolved_calls.add(candidate_qid)
+                        elif last_segment in known_names:
+                            resolved_calls.add(last_segment)
                     # else: external builtin/library — ignore
             qid = name_to_qid.get(sym.name, sym.qualified_id())
             qid_calls = {name_to_qid.get(c, c) for c in resolved_calls}

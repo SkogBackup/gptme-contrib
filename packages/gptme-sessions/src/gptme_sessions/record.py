@@ -238,6 +238,12 @@ class SessionRecord:
     llm_judge_reason: str | None = None  # 1-sentence explanation
     llm_judge_model: str | None = None  # model used for judging (e.g. claude-haiku-4-5)
 
+    # Regex-based LLM "smell" score (0.0-1.0, voice-quality / blandness signal).
+    # Computed from the journal text at post_session time by gptme_sessions.smell.
+    # Higher = more machine-generated tells (hedging, vocab tics, canned voice).
+    # ``None`` when no journal_path was available to scan.
+    smell_score: float | None = None
+
     # Optional harm category tag (idea #191).  Populated by the
     # --classify-harm-category classifier in compute-harm-signal.py.
     # One of HARM_CATEGORY_LABELS, or None when not classified.
@@ -389,6 +395,11 @@ class SessionRecord:
             return False
 
         harness = harness_hint or self.harness
+        # Fallback: detect harness from trajectory path when harness is
+        # "unknown" (common for codex sessions where the trajectory_ref
+        # backend field doesn't flow into SessionRecord.harness).
+        if harness in ("unknown", None) and "/.codex/" in str(traj):
+            harness = "codex"
         if harness == "claude-code":
             spans = extract_spans_from_cc_jsonl(traj, session_id=self.session_id)
         elif harness == "gptme":

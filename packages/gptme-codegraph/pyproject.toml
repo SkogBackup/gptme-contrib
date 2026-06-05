@@ -16,6 +16,15 @@ treesitter = [
     "tree-sitter-javascript>=0.21.0",
     "tree-sitter-typescript>=0.23.0",
     "tree-sitter-rust>=0.24.0",
+    "tree-sitter-go>=0.23.0",
+    "tree-sitter-java>=0.23.0",
+    "tree-sitter-c-sharp>=0.23.0",
+    "tree-sitter-cpp>=0.23.0",
+    "tree-sitter-ruby>=0.23.0",
+    "tree-sitter-c>=0.23.0",
+    "tree-sitter-php>=0.24.0",
+    "tree-sitter-kotlin>=1.1.0",
+    "tree-sitter-swift>=0.7.3",
 ]
 mcp = [
     "mcp>=1.0.0",
@@ -28,6 +37,7 @@ dev = [
 [project.scripts]
 gptme-codegraph = "gptme_codegraph.core:main"
 gptme-codegraph-mcp = "gptme_codegraph.mcp_server:main"
+gptme-codegraph-commit-map = "gptme_codegraph.commit_map:main"
 
 [build-system]
 requires = ["hatchling"]

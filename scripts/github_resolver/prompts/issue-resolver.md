@@ -34,6 +34,24 @@ Read the issue and decide:
   for that.
 - If tests exist and your change is code-touching, add or update the most
   obviously relevant test.
+
+- **Read existing files before editing them.** Before calling `patch` or
+  `save` on any file that already exists, first read the current on-disk
+  content from `$PWD` (for example with `cat path/to/file`). Build your edit
+  from that exact content. Do NOT write patch chunks from memory, issue text,
+  or assumed file contents. If the file does not exist yet, you may create it
+  directly.
+
+- **Validate your changes took effect.** After calling `save` or `patch`,
+  always check the tool result. A `System:` response that says `Error during
+  execution: Patch failed: original chunk not found in file` means the write
+  **did not happen** — the file on disk was NOT modified. If you see such an
+  error, retry up to 2 more times: read the current file content again and
+  rewrite the patch with correct line matches, or fall back to a full-file
+  `save`. If still failing after retries, do NOT claim `RESOLVER_STATUS:
+  changes` — emit `no_changes` instead with the failure reason. A patch error
+  is not a change.
+
 - If you make changes, end your run with a short summary in this exact format:
 
     ```
@@ -49,4 +67,7 @@ Read the issue and decide:
     ```
 
 The workflow parses those final markers to decide whether to open a draft PR
-or post a failure comment. Keep the markers verbatim.
+or post a failure comment. Keep the markers verbatim. Only emit
+`RESOLVER_STATUS: changes` when file content was **actually modified** on
+disk. If a tool call failed or the file was unchanged, always emit
+`no_changes`.

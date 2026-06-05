@@ -7,8 +7,9 @@ import logging
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import click
 
@@ -305,6 +306,272 @@ def _parse_since(since: str | None) -> int | None:
             f"invalid value {since!r} (expected e.g. 1h, 7d, 30d, or 'all')",
             param_hint="'--since'",
         )
+
+
+def _record_timestamp_sort_key(record: SessionRecord) -> tuple[int, float | str]:
+    """Sort records newest-first using ISO timestamps when possible."""
+    if record.timestamp:
+        try:
+            ts = datetime.fromisoformat(record.timestamp.replace("Z", "+00:00"))
+            return (1, ts.timestamp())
+        except ValueError:
+            pass
+    return (0, record.session_id)
+
+
+def _select_auto_tag_targets(
+    records: list[SessionRecord],
+    *,
+    limit: int,
+    retag_all: bool,
+) -> list[SessionRecord]:
+    """Return newest matching records for ``auto-tag`` processing."""
+    candidates = [
+        record
+        for record in records
+        if retag_all or not record.category or record.category == "unknown"
+    ]
+    candidates.sort(key=_record_timestamp_sort_key, reverse=True)
+    return candidates[:limit]
+
+
+def _load_auto_tag_mapping(mapping_file: Path) -> list[tuple[str, str]]:
+    """Load YAML mapping of ``pattern: category`` entries for ``auto-tag``."""
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on environment packaging
+        raise click.ClickException(
+            "PyYAML is required for --mapping-file support. Install the 'pyyaml' package first."
+        ) from exc
+
+    try:
+        raw = yaml.safe_load(mapping_file.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise click.ClickException(f"Failed to read mapping file {mapping_file}: {exc}") from exc
+    except Exception as exc:
+        raise click.ClickException(
+            f"Failed to parse YAML mapping file {mapping_file}: {exc}"
+        ) from exc
+
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        raise click.ClickException(
+            f"{mapping_file} must contain a YAML mapping of 'pattern: category' entries."
+        )
+
+    rules: list[tuple[str, str]] = []
+    for pattern, category in raw.items():
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise click.ClickException(f"{mapping_file} contains an empty or non-string pattern.")
+        if not isinstance(category, str) or not category.strip():
+            raise click.ClickException(
+                f"{mapping_file} maps pattern {pattern!r} to an empty or non-string category."
+            )
+        rules.append((pattern.strip(), category.strip()))
+    return rules
+
+
+def _match_auto_tag_override(
+    rules: list[tuple[str, str]],
+    candidates: list[str],
+) -> tuple[str, str] | None:
+    """Return the first matching override as ``(category, pattern)``."""
+    normalized = [candidate.lower() for candidate in candidates if candidate]
+    for pattern, category in rules:
+        pattern_norm = pattern.lower()
+        has_glob = any(ch in pattern for ch in "*?[")
+        for candidate in normalized:
+            matched = fnmatch(candidate, pattern_norm) if has_glob else pattern_norm in candidate
+            if matched:
+                return category, pattern
+    return None
+
+
+# -- dedup helpers -----------------------------------------------------------
+
+# Fields whose presence signals a "richer" (more complete) record. Used both to
+# rank duplicate records and to decide which fields to merge into the keeper.
+_RICHNESS_FIELDS: tuple[str, ...] = (
+    "start_time",
+    "end_time",
+    "session_name",
+    "project",
+    "category",
+    "recommended_category",
+    "selector_mode",
+    "trajectory_path",
+    "journal_path",
+    "trajectory_grade",
+    "llm_judge_score",
+    "token_count",
+    "context_peak_tokens",
+    "harm_category",
+    "span_aggregates",
+)
+
+# Values that count as "empty" for richness/merge purposes.
+# Do NOT include numeric 0: Python's 0 == 0.0 would treat a legitimate 0.0
+# llm_judge_score or trajectory_grade as missing and silently overwrite it.
+_EMPTY_VALUES: tuple[object, ...] = (None, "", "unknown")
+
+
+def _record_interval(record: SessionRecord) -> tuple[datetime, datetime] | None:
+    """Return ``(start, end)`` datetimes for a record, or ``None`` if unparseable.
+
+    Prefers ``start_time``/``end_time``; falls back to ``timestamp`` plus
+    ``duration_seconds`` when the explicit end is missing.
+    """
+    start_raw = record.start_time or record.timestamp
+    if not start_raw:
+        return None
+    try:
+        start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    end: datetime | None = None
+    if record.end_time:
+        try:
+            end = datetime.fromisoformat(record.end_time.replace("Z", "+00:00"))
+        except ValueError:
+            end = None
+    if end is None:
+        end = start + timedelta(seconds=max(record.duration_seconds or 0, 0))
+    if end < start:
+        end = start
+    return start, end
+
+
+def _overlap_ratio(
+    a: tuple[datetime, datetime],
+    b: tuple[datetime, datetime],
+) -> float:
+    """Jaccard overlap of two intervals: intersection / union (0.0-1.0).
+
+    Jaccard (not "fraction of the shorter interval") is the right test for
+    *duplicate* records — two recordings of the same session have near-identical
+    start AND end, so their intersection ≈ their union. A short session merely
+    nested inside a longer, genuinely different session has a small union ratio
+    and is correctly left alone.
+    """
+    earliest_start = min(a[0], b[0])
+    latest_end = max(a[1], b[1])
+    union = (latest_end - earliest_start).total_seconds()
+    if union <= 0:
+        # Both intervals are the same zero-length instant → identical.
+        return 1.0
+    latest_start = max(a[0], b[0])
+    earliest_end = min(a[1], b[1])
+    intersection = (earliest_end - latest_start).total_seconds()
+    if intersection <= 0:
+        return 0.0
+    return min(intersection / union, 1.0)
+
+
+def _record_richness(record: SessionRecord) -> int:
+    """Count populated metadata fields; higher means a more complete record."""
+    score = sum(1 for name in _RICHNESS_FIELDS if getattr(record, name, None) not in _EMPTY_VALUES)
+    score += len(record.deliverables or [])
+    score += len(record.deliverable_details or [])
+    score += len(record.grades or {})
+    return score
+
+
+def _find_duplicate_groups(
+    records: list[SessionRecord],
+    *,
+    min_overlap: float,
+) -> list[list[SessionRecord]]:
+    """Group same-harness records whose time intervals overlap by ``>= min_overlap``.
+
+    Returns groups of 2+ records, each sorted richest-first. Records without a
+    parseable interval are never grouped. Overlap is transitive (union-find), so
+    a chain of overlapping sessions collapses into a single group.
+    """
+    by_harness: dict[str, list[tuple[SessionRecord, tuple[datetime, datetime]]]] = {}
+    for record in records:
+        interval = _record_interval(record)
+        if interval is None:
+            continue
+        by_harness.setdefault(record.harness or "unknown", []).append((record, interval))
+
+    groups: list[list[SessionRecord]] = []
+    for items in by_harness.values():
+        count = len(items)
+        parent = list(range(count))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i in range(count):
+            for j in range(i + 1, count):
+                if _overlap_ratio(items[i][1], items[j][1]) >= min_overlap:
+                    parent[find(i)] = find(j)
+
+        clusters: dict[int, list[SessionRecord]] = {}
+        for idx in range(count):
+            clusters.setdefault(find(idx), []).append(items[idx][0])
+        for members in clusters.values():
+            if len(members) >= 2:
+                members.sort(key=_record_richness, reverse=True)
+                groups.append(members)
+    return groups
+
+
+def _merge_into_keeper(
+    keeper: SessionRecord,
+    duplicate: SessionRecord,
+    *,
+    apply: bool,
+) -> list[str]:
+    """Fill the keeper's empty fields from a duplicate; return the filled names.
+
+    When ``apply`` is False the field list is computed without mutating, so the
+    same call powers both ``--dry-run`` previews and real merges.
+    """
+    filled: list[str] = []
+    for name in _RICHNESS_FIELDS:
+        if getattr(keeper, name, None) not in _EMPTY_VALUES:
+            continue
+        other = getattr(duplicate, name, None)
+        if other not in _EMPTY_VALUES:
+            if apply:
+                setattr(keeper, name, other)
+            filled.append(name)
+    # Merge deliverables (list[str])
+    existing = set(keeper.deliverables or [])
+    extra = [d for d in (duplicate.deliverables or []) if d not in existing]
+    if extra:
+        if apply:
+            if keeper.deliverables is None:
+                keeper.deliverables = list(extra)
+            else:
+                keeper.deliverables.extend(extra)
+        filled.append("deliverables")
+    # Merge deliverable_details (list[dict]) — union by value equality
+    existing_details = keeper.deliverable_details or []
+    extra_details = [d for d in (duplicate.deliverable_details or []) if d not in existing_details]
+    if extra_details:
+        if apply:
+            if keeper.deliverable_details is None:
+                keeper.deliverable_details = list(extra_details)
+            else:
+                keeper.deliverable_details.extend(extra_details)
+        filled.append("deliverable_details")
+    # Merge grades (dict[str, float]) — add keys the keeper lacks
+    dup_grades = duplicate.grades or {}
+    extra_grades = {k: v for k, v in dup_grades.items() if k not in (keeper.grades or {})}
+    if extra_grades:
+        if apply:
+            if keeper.grades is None:
+                keeper.grades = dict(extra_grades)
+            else:
+                keeper.grades.update(extra_grades)
+        filled.append("grades")
+    return filled
 
 
 @click.group(invoke_without_command=True)
@@ -837,6 +1104,249 @@ def annotate(
         finally:
             if _has_fcntl:
                 _fcntl.flock(lock_file, _fcntl.LOCK_UN)
+
+
+# -- auto-tag ----------------------------------------------------------------
+
+
+@cli.command("auto-tag")
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Maximum number of matching records to process",
+)
+@click.option(
+    "--retag-all",
+    is_flag=True,
+    help="Retag records even when they already have a category",
+)
+@click.option(
+    "--mapping-file",
+    type=click.Path(path_type=Path, exists=True),  # type: ignore[type-var]
+    default=None,
+    help="Optional YAML mapping of 'pattern: category' overrides",
+)
+@click.option("--dry-run", is_flag=True, help="Show category changes without rewriting the store")
+@click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+def auto_tag(
+    ctx: click.Context,
+    limit: int,
+    retag_all: bool,
+    mapping_file: Path | None,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """Assign categories to session records from trajectory-derived signals."""
+    store = SessionStore(sessions_dir=ctx.obj["sessions_dir"])
+    records = store.load_all()
+    if not records:
+        click.echo("No records in store.")
+        return
+
+    targets = _select_auto_tag_targets(records, limit=limit, retag_all=retag_all)
+    if not targets:
+        scope = "records" if retag_all else "untagged records"
+        click.echo(f"No {scope} matched the auto-tag selection.")
+        return
+
+    override_rules = _load_auto_tag_mapping(mapping_file) if mapping_file else []
+    results: list[dict[str, Any]] = []
+    changed = 0
+    unchanged = 0
+    skipped = 0
+
+    for record in targets:
+        row: dict[str, Any] = {
+            "session_id": record.session_id,
+            "previous_category": record.category,
+            "trajectory_path": record.trajectory_path,
+        }
+        if not record.trajectory_path:
+            row["status"] = "skipped"
+            row["reason"] = "missing trajectory_path"
+            results.append(row)
+            skipped += 1
+            continue
+
+        traj_path = Path(record.trajectory_path)
+        if not traj_path.exists():
+            row["status"] = "skipped"
+            row["reason"] = "trajectory_path does not exist"
+            results.append(row)
+            skipped += 1
+            continue
+
+        try:
+            extract_result = extract_from_path(traj_path)
+        except Exception as exc:
+            row["status"] = "skipped"
+            row["reason"] = f"signal extraction failed: {exc}"
+            results.append(row)
+            skipped += 1
+            continue
+
+        candidate_paths = [
+            value
+            for value in [
+                record.project,
+                record.journal_path,
+                record.trajectory_path,
+                *extract_result.get("file_writes", []),
+                *extract_result.get("journal_paths", []),
+            ]
+            if isinstance(value, str) and value
+        ]
+        override = _match_auto_tag_override(override_rules, candidate_paths)
+        inferred_category = cast(str | None, extract_result.get("inferred_category"))
+        category: str | None
+        if override is not None:
+            category, pattern = override
+            source = f"mapping:{pattern}"
+        else:
+            category = inferred_category
+            source = "signals"
+
+        if not category:
+            row["status"] = "skipped"
+            row["reason"] = "no category inferred"
+            results.append(row)
+            skipped += 1
+            continue
+
+        row["category"] = category
+        row["source"] = source
+        if record.category == category:
+            row["status"] = "unchanged"
+            unchanged += 1
+        else:
+            row["status"] = "updated" if not dry_run else "would-update"
+            changed += 1
+            if not dry_run:
+                record.category = category
+        results.append(row)
+
+    if changed and not dry_run:
+        store.rewrite(records)
+
+    if as_json:
+        click.echo(json.dumps(results, indent=2))
+    else:
+        for row in results:
+            status = row["status"]
+            session_id = str(row["session_id"])
+            if status == "skipped":
+                click.echo(f"{session_id:<12}  skipped      {row['reason']}")
+                continue
+            previous = row.get("previous_category") or "?"
+            current = row.get("category") or "?"
+            click.echo(
+                f"{session_id:<12}  {status:<11}  {previous:<14} -> {current:<14}  [{row['source']}]"
+            )
+
+        summary_verb = "Would tag" if dry_run else "Tagged"
+        click.echo(
+            f"\n{summary_verb} {changed} record(s); {unchanged} unchanged; {skipped} skipped."
+        )
+
+
+@cli.command()
+@click.option(
+    "--min-overlap",
+    type=click.FloatRange(0.0, 1.0),
+    default=0.6,
+    show_default=True,
+    help="Minimum Jaccard time-overlap (intersection/union) for two "
+    "same-harness records to count as duplicates",
+)
+@click.option("--dry-run", is_flag=True, help="Show the merge plan without rewriting the store")
+@click.option("--json", "as_json", is_flag=True, help="Output results as JSON")
+@click.pass_context
+def dedup(
+    ctx: click.Context,
+    min_overlap: float,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """Merge duplicate session records into the richer record.
+
+    Two records are duplicates when they share a harness and their time
+    intervals overlap by at least ``--min-overlap`` (Jaccard:
+    intersection/union). The richest record in each
+    group is kept and enriched with any metadata it was missing; the other
+    records are tagged with ``duplicate_of`` so analytics can filter them out.
+
+    Records are **never deleted** — trajectory/session data is preserved
+    (re-running is idempotent: already-merged duplicates are skipped).
+    """
+    store = SessionStore(sessions_dir=ctx.obj["sessions_dir"])
+    records = store.load_all()
+    if not records:
+        click.echo("No records in store.")
+        return
+
+    groups = _find_duplicate_groups(records, min_overlap=min_overlap)
+    if not groups:
+        click.echo("No duplicate session records found.")
+        return
+
+    results: list[dict[str, Any]] = []
+    merged_count = 0
+    for group in groups:
+        keeper = group[0]
+        dup_rows: list[dict[str, Any]] = []
+        for dup in group[1:]:
+            if dup._legacy_fields.get("duplicate_of"):
+                # Already merged in a prior run — keep idempotent.
+                continue
+            filled = _merge_into_keeper(keeper, dup, apply=not dry_run)
+            if not dry_run:
+                dup._legacy_fields["duplicate_of"] = keeper.session_id
+            dup_rows.append(
+                {
+                    "session_id": dup.session_id,
+                    "richness": _record_richness(dup),
+                    "merged_fields": filled,
+                    "status": "would-merge" if dry_run else "merged",
+                }
+            )
+            merged_count += 1
+        if dup_rows:
+            results.append(
+                {
+                    "keeper": keeper.session_id,
+                    "keeper_richness": _record_richness(keeper),
+                    "harness": keeper.harness or "unknown",
+                    "duplicates": dup_rows,
+                }
+            )
+
+    if not results:
+        click.echo("No new duplicates to merge (all already deduped).")
+        return
+
+    if merged_count and not dry_run:
+        store.rewrite(records)
+
+    if as_json:
+        click.echo(json.dumps(results, indent=2))
+    else:
+        for row in results:
+            click.echo(
+                f"keeper {row['keeper']} ({row['harness']}, richness={row['keeper_richness']}):"
+            )
+            for dup in row["duplicates"]:
+                fields = ", ".join(dup["merged_fields"]) or "no new fields"
+                click.echo(
+                    f"  {dup['status']:<11}  {dup['session_id']:<12}  "
+                    f"richness={dup['richness']:<3}  [{fields}]"
+                )
+        summary_verb = "Would merge" if dry_run else "Merged"
+        click.echo(
+            f"\n{summary_verb} {merged_count} duplicate record(s) into {len(results)} keeper(s)."
+        )
 
 
 # -- discover ----------------------------------------------------------------
