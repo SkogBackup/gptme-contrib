@@ -8,4 +8,9 @@ uv tool install -e packages/gptodo
 uv tool install -e packages/gptme-runloops
 uv tool install -e packages/gptme-whatsapp
 uv tool install -e packages/gptmail
-uv tool install -e packages/gptme-dashboard
+uv tool install -e "packages/gptme-dashboard[serve]"
+uv tool install -e "packages/aw-watcher-agent"
+uv tool install -e "packages/gptme-whatsapp"
+uv tool install -e "packages/gptme-codegraph"
+uv tool install -e "packages/gptme-agent"
+uv tool install -e "packages/gptme-forum"
