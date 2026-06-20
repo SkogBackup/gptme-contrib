@@ -2,7 +2,15 @@
 match:
   keywords:
   - file not found
+<<<<<<< HEAD
   - assert path
+||||||| f48bba0
+  - assert path
+  - missing file test
+  - loader test
+  - timezone assertion
+=======
+>>>>>>> upstream/master
   session_categories: [code]
 status: active
 description: "When writing data loader PRs for any data pipeline, apply these six patterns to produce production-quality code that passes automated review on the first cycle."

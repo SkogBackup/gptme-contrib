@@ -162,6 +162,7 @@ console = Console()
     help="Path to tasks directory (overrides auto-detection). Can also be set via GPTODO_TASKS_DIR env var.",
 )
 def cli(verbose, tasks_dir):
+<<<<<<< HEAD
     """gptodo — task management CLI for gptme agent workspaces.
 
     Features:
@@ -196,6 +197,46 @@ def cli(verbose, tasks_dir):
 
     See https://github.com/gptme/gptme-contrib for full documentation.
     """
+||||||| f48bba0
+    """Task verification and status CLI."""
+=======
+    """gptodo — task management CLI for gptme agent workspaces.
+
+    Features:
+    - Status views (list, show, status, next, ready)
+    - Task metadata editing (edit): state, priority, tags, dependencies, and more
+    - Recurring tasks (recur: 7d, weekly, monthly, or cron expressions)
+    - Dependency validation and blocking analysis (effective, check-waiting, dep)
+    - Sub-agent spawning and management (spawn, sessions, run)
+    - GitHub/Linear issue import and syncing (import, fetch, sync)
+    - Task locking, claims, and stale detection
+    - Link checking and task integrity verification
+
+    Frontmatter fields (set via `gptodo edit TASK --set field value`):
+        state: backlog|todo|active|waiting|ready_for_review|done|cancelled|someday
+        priority: high|medium|low
+        task_type: project|action
+        assigned_to: bob|erik|alice|gordon (or any string)
+        created: ISO 8601 date/datetime
+        recur: 7d|14d|24h|weekly|monthly|cron-expression (recurring tasks)
+        wait: ISO 8601 date/datetime (hide from queue until this date)
+        next_action: string (GTD)
+        waiting_for: string (GTD)
+        waiting_since: date (GTD)
+        parent: string (parent task ID)
+        success_criterion: string (verifiable "done" gate)
+        tracking_issue: string (human URL of the live coordination issue/PR)
+        upstream_coordination_id: string (machine claim key, e.g. github:OWNER/REPO#NUM)
+        depends: list (deprecated, use requires)
+        requires: list (dependency references)
+        tags: list
+        tracking: list (external issue/PR URLs)
+        related: list
+        output_types: list
+
+    See https://github.com/gptme/gptme-contrib for full documentation.
+    """
+>>>>>>> upstream/master
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=log_level)
 
@@ -705,6 +746,58 @@ def print_summary(console: Console, results: Dict[str, List[TaskInfo]], config: 
         console.print(f"\n{config.emoji} Summary: {total} total ({', '.join(summary_parts)})")
 
 
+def _build_status_json(dir_type: str, results: Dict[str, List[TaskInfo]]) -> Dict[str, Any]:
+    """Build a JSON-serializable status payload for one directory type.
+
+    Shape:
+        {
+          "type": "tasks",
+          "tasks": [<task_to_dict>, ...],   # every task, all states
+          "summary": {
+            "total": int,
+            "by_state": {"active": int, "backlog": int, ...},
+            "issues": int,      # tasks with validation problems
+            "untracked": int,   # files with no state
+          }
+        }
+
+    Each task in check_all() lands in exactly one bucket, so the flattened
+    "tasks" list has no duplicates and `total` equals its length.
+    """
+    config = CONFIGS[dir_type]
+    by_state: Dict[str, int] = {}
+    tasks: List[Dict[str, Any]] = []
+
+    for state in config.states:
+        items = results.get(state, [])
+        if items:
+            by_state[state] = len(items)
+            tasks.extend(task_to_dict(t) for t in items)
+
+    issues = results.get("issues", [])
+    untracked = results.get("untracked", [])
+    tasks.extend(task_to_dict(t) for t in issues)
+    tasks.extend(task_to_dict(t) for t in untracked)
+
+    # Tasks with validation issues are bucketed separately in check_all() and
+    # excluded from state buckets, so we count them into by_state here to keep
+    # by_state consistent with tasks[] (both should reflect actual task state).
+    for task in issues:
+        if task.state:
+            by_state[task.state] = by_state.get(task.state, 0) + 1
+
+    return {
+        "type": dir_type,
+        "tasks": tasks,
+        "summary": {
+            "total": len(tasks),
+            "by_state": by_state,
+            "issues": len(issues),
+            "untracked": len(untracked),
+        },
+    }
+
+
 def check_directory(
     console: Console, dir_type: str, repo_root: Path, compact: bool = False
 ) -> Dict[str, List[TaskInfo]]:
@@ -905,10 +998,32 @@ def _show_github_issues(
     default=None,
     help="GitHub repo for --github (default: auto-detect via gh CLI)",
 )
-def status(type, all, compact, summary, issues, github, github_repo):
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    help="Emit machine-readable JSON instead of rendered output (stable contract for scripts)",
+)
+def status(type, all, compact, summary, issues, github, github_repo, output_json):
     """Show status of tasks and other tracked items."""
     console = Console()
     repo_root = find_repo_root(Path.cwd())
+
+    # Machine-readable output: stable contract for scripts (avoids grepping
+    # rich-rendered human output, which depends on emoji/formatting). The
+    # display-only flags (--compact/--summary/--issues/--github) are ignored;
+    # consumers filter the full task list themselves.
+    if output_json:
+        if all:
+            payload: Dict[str, Any] = {"all": True, "types": {}}
+            for type_name in CONFIGS.keys():
+                results = StateChecker(repo_root, CONFIGS[type_name]).check_all()
+                payload["types"][type_name] = _build_status_json(type_name, results)
+        else:
+            results = StateChecker(repo_root, CONFIGS[type]).check_all()
+            payload = _build_status_json(type, results)
+        print(json.dumps(payload, indent=2))
+        return
 
     # Collect results from all directories
     all_results = {}
@@ -1485,7 +1600,14 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
         "waiting_for": {"type": "string"},
         "recur": {"type": "string"},  # Recurrence interval (7d, 24h, weekly, monthly)
         "parent": {"type": "string"},  # Parent task ID (for subtasks)
+<<<<<<< HEAD
         "success_criterion": {"type": "string"},  # Verifiable "done" gate
+||||||| f48bba0
+=======
+        "success_criterion": {"type": "string"},  # Verifiable "done" gate
+        "tracking_issue": {"type": "string"},  # Human URL of the live coordination issue/PR
+        "upstream_coordination_id": {"type": "string"},  # Machine claim key (github:OWNER/REPO#NUM)
+>>>>>>> upstream/master
         # List fields handled separately via --add/--remove
         "tags": {"type": "list"},
         "depends": {"type": "list"},  # Deprecated, use requires instead
@@ -1535,6 +1657,7 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
                 console.print(f"[red]Invalid {field}: {value}. Valid values: {valid}[/]")
                 return
         elif field_spec["type"] == "date":
+<<<<<<< HEAD
             # wait: accepts YYYY-MM-DD or YYYY-MM-DDTHH:MM; other date fields store full ISO datetime
             if field == "wait":
                 from gptodo.utils import parse_wait
@@ -1558,6 +1681,49 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
                         f"[red]Invalid {field} date format. Use ISO format (YYYY-MM-DD[THH:MM:SS+HH:MM])[/]"
                     )
                     return
+||||||| f48bba0
+            try:
+                # Parse and validate the date format
+                created_dt = datetime.fromisoformat(value)
+                # Convert to string format for storage
+                value = created_dt.isoformat()
+            except ValueError:
+                console.print(
+                    f"[red]Invalid {field} date format. Use ISO format (YYYY-MM-DD[THH:MM:SS+HH:MM])[/]"
+                )
+                return
+=======
+            # wait: accepts YYYY-MM-DD or YYYY-MM-DDTHH:MM; other date fields store full ISO datetime
+            if field == "wait":
+                from gptodo.utils import parse_wait
+
+                parsed = parse_wait(value)
+                if parsed is None:
+                    console.print(
+                        f"[red]Invalid {field} format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM[/]"
+                    )
+                    return
+                if isinstance(parsed, datetime):
+                    value = parsed.isoformat()
+                else:
+                    value = parsed.isoformat()
+            elif field == "waiting_since":
+                # Accepts YYYY-MM-DD or full ISO datetime (e.g. YYYY-MM-DDTHH:MM:SS+00:00)
+                try:
+                    datetime.fromisoformat(value)
+                except ValueError:
+                    console.print(f"[red]Invalid {field} format. Use YYYY-MM-DD or ISO datetime[/]")
+                    return
+            else:
+                try:
+                    created_dt = datetime.fromisoformat(value)
+                    value = created_dt.isoformat()
+                except ValueError:
+                    console.print(
+                        f"[red]Invalid {field} date format. Use ISO format (YYYY-MM-DD[THH:MM:SS+HH:MM])[/]"
+                    )
+                    return
+>>>>>>> upstream/master
         elif field_spec["type"] == "string":
             if field == "recur":
                 from gptodo.utils import is_valid_recur_value
@@ -1717,6 +1883,35 @@ def edit(task_ids, set_fields, add_fields, remove_fields, set_subtask):
                     # Normalize deprecated states at write time (defense in depth)
                     if field == "state":
                         value = normalize_state(value, warn=False)
+<<<<<<< HEAD
+||||||| f48bba0
+                    post.metadata[field] = value
+=======
+
+                    post.metadata[field] = value
+        # Auto-set waiting_since only when THIS edit explicitly sets state to waiting
+        # AND waiting_for is either already present or being set in the same edit.
+        # Guarding on waiting_for prevents an injected waiting_since from triggering
+        # the pre-commit hook error "waiting_since requires waiting_for".
+        transitioning_to_waiting = any(
+            op == "set" and field == "state" and value == "waiting" for op, field, value in changes
+        )
+        waiting_for_present = post.metadata.get("waiting_for") or any(
+            op == "set" and field == "waiting_for" and value is not None
+            for op, field, value in changes
+        )
+        if (
+            transitioning_to_waiting
+            and waiting_for_present
+            and not post.metadata.get("waiting_since")
+        ):
+            from datetime import datetime as _dt, timezone as _tz
+
+            # Full ISO datetime for intra-day resolution (ErikBjare request, 2026-06-16).
+            # validate_task_frontmatter.py's validate_timestamp() accepts both YYYY-MM-DD
+            # and full ISO datetime via datetime.fromisoformat().
+            post.metadata["waiting_since"] = _dt.now(_tz.utc).isoformat(timespec="seconds")
+>>>>>>> upstream/master
 
                     post.metadata[field] = value
         # Save changes

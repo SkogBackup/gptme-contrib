@@ -367,6 +367,7 @@ def test_automation_coexists_with_flat_fields_warns():
         assert (
             coexist_warnings
         ), "Coexisting 'automation' block and flat automated_by field should warn"
+<<<<<<< HEAD
 
 
 # confound_note field tests
@@ -418,3 +419,125 @@ def test_confound_note_wrong_type_rejected():
         validator.validate()
         confound_errors = [e for e in validator.errors if "confound_note" in e]
         assert confound_errors, "Non-string confound_note should produce an error"
+||||||| f48bba0
+=======
+
+
+# confound_note field tests
+
+
+def test_confound_note_string_accepted():
+    """A non-empty confound_note string should be accepted without errors."""
+    content = _VALID_LESSON.format(
+        extra='confound_note: "corrective lesson — fires in higher-harm contexts"'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert (
+            not confound_errors
+        ), f"Valid confound_note should not produce errors: {confound_errors}"
+
+
+def test_confound_note_empty_string_rejected():
+    """An empty confound_note string should produce an error."""
+    content = _VALID_LESSON.format(extra='confound_note: ""')
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert confound_errors, "Empty confound_note should produce an error"
+
+
+def test_confound_note_bool_rejected():
+    """A boolean confound_note should produce an error."""
+    content = _VALID_LESSON.format(extra="confound_note: true")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert confound_errors, "Boolean confound_note should produce an error"
+
+
+def test_confound_note_wrong_type_rejected():
+    """A non-string confound_note (e.g. integer) should produce an error."""
+    content = _VALID_LESSON.format(extra="confound_note: 42")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), content)
+        validator = LessonValidator(path)
+        validator.validate()
+        confound_errors = [e for e in validator.errors if "confound_note" in e]
+        assert confound_errors, "Non-string confound_note should produce an error"
+
+
+# An archived lesson that is long AND has no companion link — would normally
+# trigger both the companion-doc and length soft warnings.
+_ARCHIVED_LONG_LESSON = (
+    """\
+---
+match:
+  keywords:
+    - "test keyword phrase"
+status: archived
+---
+
+# Archived Test Lesson
+
+## Rule
+Test rule.
+
+## Context
+Test context.
+
+## Detection
+- Signal 1
+- Signal 2
+
+## Pattern
+```txt
+example
+```
+
+## Outcome
+"""
+    + "\n".join(f"- Benefit {i}" for i in range(120))
+    + "\n"
+)
+
+
+def test_archived_lesson_skips_length_warning():
+    """Archived lessons are frozen — no length nag even when over target."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), _ARCHIVED_LONG_LESSON)
+        validator = LessonValidator(path)
+        validator.validate()
+        length_warnings = [w for w in validator.warnings if "lines (target" in w]
+        assert not length_warnings, f"Unexpected length warnings: {length_warnings}"
+
+
+def test_archived_lesson_skips_companion_warning():
+    """Archived lessons should not warn about missing/unlinked companion docs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), _ARCHIVED_LONG_LESSON)
+        validator = LessonValidator(path)
+        validator.validate()
+        companion_warnings = [w for w in validator.warnings if "companion" in w.lower()]
+        assert (
+            not companion_warnings
+        ), f"Unexpected companion warnings: {companion_warnings}"
+
+
+def test_active_long_lesson_still_warns():
+    """Guard: the skip is archived-only — active lessons still get the length nag."""
+    active = _ARCHIVED_LONG_LESSON.replace("status: archived", "status: active")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_lesson(Path(tmp), active)
+        validator = LessonValidator(path)
+        validator.validate()
+        length_warnings = [w for w in validator.warnings if "lines (target" in w]
+        assert length_warnings, "Active long lesson should still warn about length"
+>>>>>>> upstream/master

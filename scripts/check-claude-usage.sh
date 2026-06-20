@@ -33,13 +33,13 @@ MODE=""
 NO_CACHE=false
 for arg in "$@"; do
     case "$arg" in
-        --json) MODE="json" ;;
+        --json|--jsonl) MODE="json" ;;
         --raw) MODE="raw" ;;
         --no-cache) NO_CACHE=true ;;
-        *) echo "Unknown arg: $arg" >&2; exit 1 ;;
     esac
 done
 
+<<<<<<< HEAD
 CACHE_FILE="/tmp/claude-usage-cache.json"
 CACHE_TTL="${CLAUDE_USAGE_CACHE_TTL:-600}"  # 10 minutes default
 CREDS_FILE="${HOME}/.claude/.credentials.json"
@@ -55,9 +55,37 @@ _creds_fingerprint() {
         || stat -Lf '%i:%m' "$CREDS_FILE" 2>/dev/null \
         || echo "0:0"
 }
+||||||| f48bba0
+CACHE_FILE="/tmp/claude-usage-cache.json"
+CACHE_TTL="${CLAUDE_USAGE_CACHE_TTL:-600}"  # 10 minutes default
+=======
+CACHE_FILE="${CLAUDE_USAGE_CACHE_FILE:-/tmp/claude-usage-cache.json}"
+FALLBACK_CACHE_FILE="${CLAUDE_USAGE_FALLBACK_CACHE_FILE:-/tmp/claude-usage-stale-fallback.json}"
+CACHE_TTL="${CLAUDE_USAGE_CACHE_TTL:-600}"
+
+# Determine credential file for fingerprinting.
+# NOTE: the real file is `.credentials.json` (dot-prefixed) — the old default
+# `credentials.json` (no dot) never existed, so the fingerprint was always the
+# missing-file sentinel and the cache was ALWAYS judged invalid → every periodic
+# caller did a full ~1-core /usage scrape instead of reusing the 10-min cache.
+CREDS_FILE="${CLAUDE_USAGE_CREDS_FILE:-$HOME/.claude/.credentials.json}"
+
+_creds_fingerprint() {
+    # Emit a cache-busting fingerprint for the current credential slot.
+    # Resolve symlinks so that a live slot switch (ln -sfn) changes the fingerprint.
+    local resolved
+    resolved=$(readlink -f "$CREDS_FILE" 2>/dev/null || echo "$CREDS_FILE")
+    if [ -f "$resolved" ]; then
+        stat -c '%i:%Y' "$resolved" 2>/dev/null || stat -f '%i:%m' "$resolved" 2>/dev/null || echo '0:0'
+    else
+        echo "0:0"
+    fi
+}
+>>>>>>> upstream/master
 
 # --- Cache check (JSON and human-readable modes only, not --raw) ---
 if [ "$MODE" != "raw" ] && [ "$NO_CACHE" = false ] && [ -f "$CACHE_FILE" ]; then
+<<<<<<< HEAD
     # stat mtime: -c %Y on Linux, -f %m on macOS/BSD
     CACHE_AGE=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0) ))
     CURRENT_FP=$(_creds_fingerprint)
@@ -68,33 +96,119 @@ if [ "$MODE" != "raw" ] && [ "$NO_CACHE" = false ] && [ -f "$CACHE_FILE" ]; then
             exit 0
         else
             # Render human-readable from cached JSON
+||||||| f48bba0
+    # stat mtime: -c %Y on Linux, -f %m on macOS/BSD
+    CACHE_AGE=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0) ))
+    if [ "$CACHE_AGE" -lt "$CACHE_TTL" ]; then
+        if [ "$MODE" = "json" ]; then
+            cat "$CACHE_FILE"
+            exit 0
+        else
+            # Render human-readable from cached JSON
+=======
+    # Check cache freshness: mtime <= CACHE_TTL seconds ago
+    cache_mtime=$(stat -c '%Y' "$CACHE_FILE" 2>/dev/null || stat -f '%m' "$CACHE_FILE" 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    cache_age=$((now_epoch - cache_mtime))
+    fp="$(_creds_fingerprint)"
+
+    python3 -c "
+import json, sys
+with open('$CACHE_FILE') as f:
+    cached = json.load(f)
+# Cache is valid if: fresh enough AND fingerprint matches current credential
+fresh = $cache_age < $CACHE_TTL
+fp_match = cached.get('_cred_fingerprint', '') == '$fp'
+if fresh and fp_match:
+    if '$MODE' == 'json':
+        print(json.dumps(cached, indent=2))
+    else:
+        print('Claude Max Subscription Usage')
+        print('=' * 60)
+        for key, label in [('five_hour', 'Session (5h)'), ('seven_day', 'Weekly (all)'), ('seven_day_sonnet', 'Weekly (Sonnet)')]:
+            info = cached.get(key)
+            if info and isinstance(info, dict):
+                util = info.get('utilization', 0)
+                remaining = 1 - util
+                bar_width = 30
+                filled = int(util * bar_width)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                time_left = info.get('time_left', '')
+                resets = info.get('resets', 'unknown')
+                print(f'  {label:20s} [{bar}] {util*100:4.0f}% used ({remaining*100:.0f}% left)')
+                print(f'  {\"\":20s} resets {resets}  ({time_left})')
+            else:
+                print(f'  {label:20s} N/A')
+        print()
+    sys.exit(0)
+sys.exit(1)
+" && exit 0
+fi
+
+# --- Single-scrape concurrency guard (thundering-herd protection) ---
+# Multiple periodic callers (bob-vitals, subscription-check, the telemetry
+# exporter) can all miss the cache in the same window and each launch a full
+# ~60-140s /usage scrape. Each scrape is a heavy claude TUI; piled up they
+# starve a small box (observed 2026-06-08: 12 concurrent on a 3-core VM, CPU
+# pressure ~70%, sessions timing out). Allow only ONE live scrape at a time; if
+# another holds the lock, serve the most recent cache (even if stale) rather
+# than duplicating the work. fd 9 stays held for the rest of the script and is
+# released automatically on exit.
+SCRAPE_LOCK="${CLAUDE_USAGE_SCRAPE_LOCK:-/tmp/claude-usage-scrape.lock}"
+# flock is Linux-only (util-linux) and absent on macOS. Guard is a no-op there;
+# concurrent scrapes on macOS are benign (no multi-service automated setup).
+# --no-cache explicitly requests a fresh scrape so we skip the guard to avoid
+# silently handing the caller stale data (the documented contract is "Force fresh fetch").
+# --raw is excluded for the same reason the TTL cache check above excludes it:
+# raw callers want the unformatted scrape output, and the lock-held fallback only
+# emits json/human-readable cache — serving that to a raw caller would silently
+# hand back formatted data instead of raw.
+if [ "$MODE" != "raw" ] && [ "$NO_CACHE" = false ] && command -v flock >/dev/null 2>&1; then
+    exec 9>"$SCRAPE_LOCK"
+    if ! flock -n 9; then
+        # Another scrape is running — serve the most recent cache (even if stale)
+        # rather than queuing up.
+        if [ -f "$CACHE_FILE" ]; then
+            fp="$(_creds_fingerprint)"
+>>>>>>> upstream/master
             python3 -c "
 import json, sys
 with open('$CACHE_FILE') as f:
-    result = json.load(f)
-cache_age = $CACHE_AGE
-print('Claude Max Subscription Usage (cached, {}s ago)'.format(cache_age))
-print('=' * 60)
-for key, label in [('five_hour', 'Session (5h)'), ('seven_day', 'Weekly (all)'), ('seven_day_sonnet', 'Weekly (Sonnet)')]:
-    info = result.get(key)
-    if info:
-        util = info['utilization']
-        remaining = 1 - util
-        bar_width = 30
-        filled = int(util * bar_width)
-        bar = chr(9608) * filled + chr(9617) * (bar_width - filled)
-        time_left = info.get('time_left', '')
-        resets = info['resets']
-        print(f'  {label:20s} [{bar}] {util*100:4.0f}% used ({remaining*100:.0f}% left)')
-        print(f'  {\"\":20s} resets {resets}  ({time_left})')
+    cached = json.load(f)
+if cached.get('_cred_fingerprint', '') == '$fp':
+    if '$MODE' == 'json':
+        print(json.dumps(cached, indent=2))
     else:
-        print(f'  {label:20s} N/A')
-print()
-"
-            exit 0
+        print('Claude Max Subscription Usage')
+        print('=' * 60)
+        for key, label in [('five_hour', 'Session (5h)'), ('seven_day', 'Weekly (all)'), ('seven_day_sonnet', 'Weekly (Sonnet)')]:
+            info = cached.get(key)
+            if info and isinstance(info, dict):
+                util = info.get('utilization', 0)
+                remaining = 1 - util
+                bar_width = 30
+                filled = int(util * bar_width)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                time_left = info.get('time_left', '')
+                resets = info.get('resets', 'unknown')
+                print(f'  {label:20s} [{bar}] {util*100:4.0f}% used ({remaining*100:.0f}% left)')
+                print(f'  {\"\":20s} resets {resets}  ({time_left})')
+            else:
+                print(f'  {label:20s} N/A')
+        print()
+    sys.exit(0)
+else:
+    sys.exit(1)  # cred mismatch
+" && exit 0
+            # Cache exists but credential fingerprint does not match the current slot.
+            echo "Warning: a usage scrape is already running; cached data belongs to a different credential slot." >&2
+            exit 1
         fi
+        # No cache at all — warn but exit cleanly (don't pile on).
+        echo "Warning: a usage scrape is already running and no cache is available." >&2
+        exit 0
     fi
-fi
+fi  # command -v flock
 
 SESSION_NAME="claude-usage-check-$$"
 TIMEOUT=25
@@ -158,24 +272,76 @@ tmux send-keys -t "$SESSION_NAME" "/usage"
 sleep 2
 tmux send-keys -t "$SESSION_NAME" Enter
 
-# Wait for usage data to render
+# Wait for the /usage TUI to load (CC v2.1.168 tab-based layout)
 for _ in $(seq 1 "$TIMEOUT"); do
     content=$(tmux capture-pane -t "$SESSION_NAME" -p -S -80 2>/dev/null || true)
+<<<<<<< HEAD
     if echo "$content" | grep -qiE '(Current week \(all models\)|Current week \(Sonnet only\)|not enabled)'; then
+||||||| f48bba0
+    if echo "$content" | grep -qiE '(%\s*used|not enabled|Extra usage|Resets)'; then
+=======
+    if echo "$content" | grep -qiE '(Esc to cancel|d to day|w to week|Nothing over 10%)'; then
+>>>>>>> upstream/master
         break
     fi
     sleep 1
 done
-sleep 1  # extra settle time for full render
-
-# Capture output
-OUTPUT=$(tmux capture-pane -t "$SESSION_NAME" -p -S -80 2>/dev/null || true)
+# Capture the "Current session / Current week" usage bars.
+#
+# Quirk (CC v2.1.168): the usage bars render *alongside* a "Scanning local
+# sessions…" pass that runs continuously and periodically redraws the pane,
+# briefly wiping the bars — so they visibly blink. Worse, the three windows
+# (Current session = 5h, Current week (all models) = 7d, Current week (Sonnet
+# only) = 7d Sonnet) paint progressively, so a single capture often catches only
+# the first one or two before the redraw (the intermittent "quota bars don't
+# show" / "Sonnet window missing" bug). No single fixed delay reliably catches
+# all three.
+#
+# Robust approach: tab away and back (Usage -> Stats -> Usage) to force fresh
+# renders, sample the pane many times, and ACCUMULATE every frame that contains
+# a bar into one buffer. The parser takes the last occurrence of each window
+# (later frames are more fully rendered), so all three are assembled across
+# frames even when no single frame has all of them. Stop early once all three
+# labels have been seen.
+# Do NOT use the 'w' week toggle — it can retrigger the scan.
+OUTPUT=""
+ACCUM=""
+for _outer in $(seq 1 12); do
+    tmux send-keys -t "$SESSION_NAME" Right   # away to Stats
+    sleep 0.5
+    tmux send-keys -t "$SESSION_NAME" Left    # back to Usage -> forces fresh render
+    sleep 0.8
+    for _inner in $(seq 1 8); do
+        content=$(tmux capture-pane -t "$SESSION_NAME" -p -S -80 2>/dev/null || true)
+        if echo "$content" | grep -qE '[0-9]+% used'; then
+            ACCUM="${ACCUM}"$'\n'"${content}"
+        fi
+        if echo "$content" | grep -qi 'Nothing over 10%'; then
+            ACCUM="${ACCUM}"$'\n'"${content}"
+            break
+        fi
+        sleep 0.3
+    done
+    # Stop once all three window labels have been accumulated.
+    if echo "$ACCUM" | grep -qi 'Current session' \
+        && echo "$ACCUM" | grep -qi 'Current week (all models)' \
+        && echo "$ACCUM" | grep -qi 'Current week (Sonnet only)'; then
+        break
+    fi
+    if echo "$ACCUM" | grep -qi 'Nothing over 10%'; then
+        break
+    fi
+done
+OUTPUT="$ACCUM"
+# Fall back to whatever is on screen if no bars were ever captured.
+[ -z "$OUTPUT" ] && OUTPUT=$(tmux capture-pane -t "$SESSION_NAME" -p -S -80 2>/dev/null || true)
 
 if [ "$MODE" = "raw" ]; then
     echo "$OUTPUT"
     exit 0
 fi
 
+<<<<<<< HEAD
 if echo "$OUTPUT" | grep -qi 'Loading usage data' \
     && ! echo "$OUTPUT" | grep -qiE '(Current week \(all models\)|Current week \(Sonnet only\)|not enabled)'; then
     echo "Error: Claude /usage never finished loading quota data." >&2
@@ -183,6 +349,17 @@ if echo "$OUTPUT" | grep -qi 'Loading usage data' \
     exit 3
 fi
 
+||||||| f48bba0
+=======
+# The "Scanning local sessions…" line coexists with the rendered bars (it is a
+# continuous background pass), so it is NOT on its own an error. Only warn when
+# we captured no usage bars at all — that's the genuine stuck/auth-failure case.
+if ! echo "$OUTPUT" | grep -qE '[0-9]+% used' \
+    && echo "$OUTPUT" | grep -qi 'Scanning local sessions'; then
+    echo "Warning: CC /usage produced no usage bars (still scanning / likely auth failure). Using fallback data." >&2
+fi
+
+>>>>>>> upstream/master
 # Parse the TUI output
 echo "$OUTPUT" | python3 -c "
 import sys, re, json
@@ -263,39 +440,242 @@ def format_time_left(reset_dt):
     else:
         return f'{int(total_sec / 60)}m left'
 
-# Generic parser: find label line, then scan next few lines for '% used' and 'Resets'
-labels = [
-    ('Current session', 'five_hour'),
-    ('Current week (all models)', 'seven_day'),
-    ('Current week (Sonnet only)', 'seven_day_sonnet'),
-]
-lines = text.split('\n')
-for label_text, key in labels:
-    for i, line in enumerate(lines):
-        if label_text in line:
-            # Search the next 3 lines for '% used' and 'Resets'
-            chunk = '\n'.join(lines[i:i+4])
-            pct_m = re.search(r'(\d+)%\s*used', chunk)
-            reset_m = re.search(r'Resets\s+(.+)', chunk)
-            if pct_m:
-                result[key] = {
-                    'utilization': int(pct_m.group(1)) / 100,
-                    'resets': reset_m.group(1).strip() if reset_m else 'unknown',
-                }
-            break
+# --- Parser for CC v2.1.168+ TUI ---
+# The new /usage TUI shows per-model usage in a section under 'Usage' tab.
+# Format examples:
+#   Last 24h / This week · these are independent characteristics...
+#   Opus              ████████░░░░░░░░░░  86% used · Resets Thu, 9pm
+#   Opus              ████████████████████  100% used · Resets ...
+#   Claude 3.5 Sonnet ██████░░░░░░░░░░░░░░  55% used · Resets ...
+# Or when usage is very low:
+#   Nothing over 10% in this period — try the other window.
+#
+# In the 'Session' section above the usage section, we also find:
+#   Total cost, duration, Usage: input/output tokens
+# The 5-hour session utilization is estimated from the session usage data.
 
+lines = text.split('\\n')
+
+# First check for the 'Nothing over 10%' empty state
+low_usage = 'Nothing over 10%' in text
+
+# --- Strategy: find usage bars per model ---
+# Look for lines that contain a model name, a usage bar (unicode blocks),
+# a percentage, and optionally 'Resets'.
+# Common model names: Opus, Sonnet, Claude 3.5, Haiku, Claude 4, etc.
+
+# Also extract session-level data from the Session section
+session_cost = None
+session_usage_total = 0  # Will estimate 5h utilization from this
+
+# First pass: find the 'Session' section and extract its data
+in_session = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == 'Session':
+        in_session = True
+        continue
+    if stripped and not stripped.startswith('Total') and not stripped.startswith('Usage:') and not stripped.startswith('  '):
+        # Check if this line is outside Session section
+        if not stripped.startswith('▔') and stripped not in ('', ' '):
+            in_session = False
+            continue
+    if in_session:
+        # Total cost:            $0.0000
+        cm = re.search(r'Total cost:\s+[$]?([\d.]+)', stripped)
+        if cm:
+            session_cost = float(cm.group(1))
+            continue
+        # Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+        um = re.search(r'Usage:\s+(\d+)', stripped)
+        if um:
+            session_usage_total += int(um.group(1))
+
+# --- Model usage extraction ---
+# Lines in the usage section look like:
+#   ModelName   ████░░  N% used · Resets <time>
+# The bar is made of unicode block chars (▀▁▂▃▄▅▆▇█░▒▓)
+
+# Collect all lines that might be model usage rows
+model_lines = []
+for line in lines:
+    stripped = line.strip()
+    # A model usage line contains a percentage and likely a bar character
+    has_pct = re.search(r'(\d+)%\s*used', stripped)
+    has_bar = bool(re.search(r'[█░▒▓▀▁▂▃▄▅▆▇▉▊▋▌▍▎▏]', stripped))
+    has_resets = 'Resets' in stripped
+    if has_pct and (has_bar or has_resets):
+        model_lines.append(stripped)
+
+# Parse each model line
+for line in model_lines:
+    # Match: model name, percentage, reset time
+    # Model names are at the start of the line, before the bar or percentage
+    # Examples:
+    # 'Opus              ████████░░░░░░░░░░  86% used · Resets Thu, 9pm'
+    # 'Claude 3.5 Sonnet ██████░░░░░░░░░░░░░░  55% used · Resets ...'
+    # 'Opus              ████████████████████  100% used · Resets ...'
+
+    pct_m = re.search(r'(\d+)%\s*used', line)
+    reset_m = re.search(r'Resets\s+(.+)', line)
+    if not pct_m:
+        continue
+
+    pct = int(pct_m.group(1)) / 100
+    reset_str = reset_m.group(1).strip() if reset_m else None
+
+    # Identify the model name (text before the bar or percentage)
+    # Strip the bar characters and percentage to extract model name
+    # Pattern: <model_name> <optional bar> <percentage>
+    stripped_line = re.sub(r'[█░▒▓▀▁▂▃▄▅▆▇▉▊▋▌▍▎▏\s]+', ' ', line)
+    # Now extract text before '%'
+    pct_idx = stripped_line.find('%')
+    if pct_idx > 0:
+        # Get text before the percentage
+        before_pct = stripped_line[:pct_idx].strip()
+        # Remove the number
+        before_pct = re.sub(r'\d+\s*$', '', before_pct).strip()
+        model_name = before_pct
+    else:
+        model_name = 'unknown'
+
+    # Skip very short names (noise)
+    if len(model_name) < 2:
+        continue
+
+    # Map model names to keys
+    name_lower = model_name.lower()
+    if 'sonnet' in name_lower:
+        key = 'seven_day_sonnet'
+        label = model_name
+    else:
+        # Opus and any other model → weekly Opus/general quota
+        key = 'seven_day'
+        label = model_name
+
+    result[key] = {
+        'model': label,
+        'utilization': pct,
+        'resets': reset_str if reset_str else 'unknown',
+    }
+
+
+# If no model lines found but we detected low usage, return zeros
 if not result:
-    print('Error: Could not parse usage data from CC output.', file=sys.stderr)
-    print('Run with --raw to see raw output.', file=sys.stderr)
-    sys.exit(1)
+    if low_usage:
+        # No usage to report — set all to 0
+        now = datetime.now(timezone.utc)
+        # Estimate next weekly reset (Thu 00:00 UTC = "Wed night / Thu morning")
+        days_until_thu = (3 - now.weekday()) % 7  # Mon=0, Thu=3
+        if days_until_thu == 0:  # today IS Thursday; midnight already passed
+            days_until_thu = 7
+        weekly_reset = now + timedelta(days=days_until_thu)
+        weekly_reset = weekly_reset.replace(hour=0, minute=0, second=0, microsecond=0)
+        weekly_secs = max(0, int((weekly_reset - now).total_seconds()))
+        weekly_reset_str = weekly_reset.strftime('%a, %-I%p')
 
-# Add time_left to JSON output
-for key in result:
-    reset_dt = parse_reset_time(result[key]['resets'])
-    if reset_dt:
-        delta = reset_dt - datetime.now(timezone.utc)
-        result[key]['resets_in_seconds'] = max(0, int(delta.total_seconds()))
-        result[key]['time_left'] = format_time_left(reset_dt)
+        # 5h window reset is ~5h from now (sliding, but approximate)
+        five_hour_reset = now + timedelta(hours=5)
+        five_hour_secs = int((five_hour_reset - now).total_seconds())
+        five_hour_reset_str = five_hour_reset.strftime('%-I:%M%p').lower()
+
+        result['five_hour'] = {
+            'utilization': 0.0,
+            'resets': five_hour_reset_str,
+            'resets_in_seconds': five_hour_secs,
+            'time_left': format_time_left(five_hour_reset),
+        }
+        result['seven_day'] = {
+            'utilization': 0.0,
+            'resets': weekly_reset_str,
+            'resets_in_seconds': weekly_secs,
+            'time_left': format_time_left(weekly_reset),
+        }
+        result['seven_day_sonnet'] = {
+            'utilization': 0.0,
+            'resets': weekly_reset_str,
+            'resets_in_seconds': weekly_secs,
+            'time_left': format_time_left(weekly_reset),
+        }
+    else:
+        # No model lines found and no low-usage signal.
+        # This is the CC v2.1.168+ characteristics-only format where the
+        # /usage TUI shows usage breakdowns (50% of usage was while 4+
+        # sessions) but no model-level utilization percentages.
+        # Try fallback chain before giving up.
+        for _attempt_path in ['$FALLBACK_CACHE_FILE']:
+            try:
+                with open(_attempt_path) as _f:
+                    fb = json.load(_f)
+                # Try FALLBACK_CACHE format first (has seven_day, five_hour keys)
+                if isinstance(fb, dict) and any(
+                    _k in fb for _k in ('five_hour', 'seven_day', 'seven_day_sonnet')
+                ):
+                    result = fb
+                    result['_source'] = 'fallback_cache'
+                    result['_warning'] = 'CC v2.1.168+ TUI no longer shows utilization percentages \u2014 using cached values (may be stale)'
+                    print('Warning: using fallback cache (CC v2.1.168 TUI does not show quota data).', file=sys.stderr)
+                    break
+                # Try subscription-reset-times format (slot keys like 'bob' or any username)
+                _bt = next(
+                    (v for v in fb.values()
+                     if isinstance(v, dict) and any(k in v for k in ('weekly_utilization', 'five_hour_utilization'))),
+                    None,
+                )
+                if _bt is not None:
+                    _wu = _bt.get('weekly_utilization', 0)
+                    _fh = _bt.get('five_hour_utilization', 0)
+                    _su = _bt.get('sonnet_weekly_utilization', 0)
+                    result = {
+                        'seven_day': {'utilization': float(_wu), 'resets': 'unknown'},
+                        'five_hour': {'utilization': float(_fh), 'resets': 'unknown'},
+                        'seven_day_sonnet': {'utilization': float(_su), 'resets': 'unknown'},
+                        '_source': 'subscription-reset-times',
+                        '_warning': 'CC v2.1.168 TUI does not show quota data \u2014 using stale values from subscription-reset-times.json',
+                    }
+                    print('Warning: using subscription-reset-times fallback (CC v2.1.168 TUI issue).', file=sys.stderr)
+                    break
+            except (OSError, json.JSONDecodeError):
+                continue
+        if not result:
+            print('Error: Could not parse usage data, and no fallback available.', file=sys.stderr)
+            print('Run with --raw to see raw output.', file=sys.stderr)
+            sys.exit(1)
+
+# Estimate five_hour (session) utilization from session cost data.
+# In CC Max billing, the 5-hour window cost is capped. We estimate utilization
+# as a fraction of the session cost / cap, or use the session usage data.
+if 'five_hour' not in result:
+    # Estimate based on what we know from the session section
+    # Claude Max session cap is ~\$15-20 per session. If session_cost is available
+    # and non-zero, calculate utilization as proportion.
+    if session_cost is not None and session_cost > 0:
+        # Assume ~\$15 per session cap (approximate for Claude Max)
+        est_cap = 15.0
+        est_util = min(1.0, session_cost / est_cap)
+        result['five_hour'] = {
+            'utilization': round(est_util, 2),
+            'resets': 'session_end',
+        }
+    elif low_usage:
+        # Already handled above, but double-check
+        pass
+
+# Add time_left and resets_in_seconds to all entries
+for key in list(result.keys()):
+    info = result[key]
+    if not isinstance(info, dict):
+        continue
+    reset_str = info.get('resets', '')
+    if reset_str and reset_str not in ('unknown', 'session_end'):
+        reset_dt = parse_reset_time(reset_str)
+        if reset_dt:
+            delta = reset_dt - datetime.now(timezone.utc)
+            info['resets_in_seconds'] = max(0, int(delta.total_seconds()))
+            info['time_left'] = format_time_left(reset_dt)
+    elif 'resets_in_seconds' not in info:
+        info['resets_in_seconds'] = 0
+        info['time_left'] = ''
 
 # --- Off-peak detection ---
 # Peak: 8 AM-2 PM ET (12:00-18:00 UTC) weekdays. Off-peak: everything else.
@@ -339,6 +719,7 @@ if seven_day and seven_day.get('resets_in_seconds') is not None:
         'status': 'underusing' if gap > 0.05 else ('overusing' if gap < -0.05 else 'on_track'),
     }
 
+<<<<<<< HEAD
 # Stamp the credential fingerprint into the cache so a later cache read can
 # detect a credential switch (different slot or rewritten slot) and bypass.
 # Format: '<resolved-target-inode>:<resolved-target-mtime>' (mtime as int).
@@ -355,11 +736,57 @@ except OSError:
     # incorrectly serve stale N/A data from a previous cache write.
     result['_cred_fingerprint'] = ''
 
+||||||| f48bba0
+=======
+# Stamp the credential fingerprint into the cache so a later cache read can
+# detect a credential switch (different slot or rewritten slot) and bypass.
+# Format: '<resolved-target-inode>:<resolved-target-mtime>' (mtime as int).
+# See _creds_fingerprint() in the surrounding bash for the matching reader.
+try:
+    _st = _os.stat('$CREDS_FILE')  # follows symlinks by default
+    result['_cred_fingerprint'] = f'{_st.st_ino}:{int(_st.st_mtime)}'
+except OSError:
+    # Must match the bash _creds_fingerprint() missing-file sentinel ('0:0'),
+    # not '' — otherwise the cache-read fp comparison never matches and the
+    # cache is permanently bypassed (every caller re-scrapes).
+    result['_cred_fingerprint'] = '0:0'
+
+>>>>>>> upstream/master
 # Write cache file (always, for both modes)
 cache_path = '$CACHE_FILE'
 try:
     with open(cache_path, 'w') as f:
         json.dump(result, f, indent=2)
+except OSError:
+    pass
+
+# Persist the last successful result as a fallback for when auth breaks
+# or the TUI format changes (CC v2.1.168+ characteristics-only format).
+# Only save when we have REAL utilization data (>5%) to avoid clobbering
+# the fallback with zeros during an auth outage.
+try:
+    _seven = result.get('seven_day', {})
+    _five = result.get('five_hour', {})
+    _sonnet = result.get('seven_day_sonnet', {})
+    _max_util = max(
+        (_seven.get('utilization', 0) if isinstance(_seven, dict) else 0),
+        (_five.get('utilization', 0) if isinstance(_five, dict) else 0),
+        (_sonnet.get('utilization', 0) if isinstance(_sonnet, dict) else 0),
+    )
+    # Only save fallback when at least 2 of the 3 live windows have data
+    # above noise threshold, to avoid persisting a partially-captured state.
+    _live_windows = sum(
+        1 for k in ('five_hour', 'seven_day', 'seven_day_sonnet')
+        if isinstance(result.get(k), dict)
+        and result[k].get('utilization', 0) > 0.05
+    )
+    if (
+        _max_util > 0.05
+        and result.get('_source') not in ('fallback_cache', 'subscription-reset-times')
+        and _live_windows >= 2
+    ):
+        with open('$FALLBACK_CACHE_FILE', 'w') as _f:
+            json.dump(result, _f, indent=2)
 except OSError:
     pass
 

@@ -1,9 +1,18 @@
 ---
 match:
   keywords:
+<<<<<<< HEAD
     - "update gptme-contrib"
     - "update submodule to latest"
     - "submodule is behind"
+||||||| f48bba0
+    - "update submodule to latest"
+    - "submodule is behind"
+    - "update gptme-contrib"
+    - "bump the submodule"
+=======
+    - "update gptme-contrib"
+>>>>>>> upstream/master
   session_categories: [cleanup]
 status: active
 description: "When doing periodic workspace maintenance, update the gptme-contrib submodule and verify that shared infrastructure symlinks are intact."

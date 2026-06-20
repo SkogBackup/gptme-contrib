@@ -1,10 +1,35 @@
 ---
 match:
   keywords:
+<<<<<<< HEAD
     - "--comments | tail"
     - "gh issue view --comments"
     - "gh pr view --comments"
   session_categories: [cross-repo, code]
+||||||| f48bba0
+    - "truncating github comment output"
+    - "respond to stale context when conversation evolved"
+    - "read entire issue thread before responding"
+    - "missing newer comments that supersede earlier"
+    - "gh pr view --comments | head"
+    - "not reading the whole issue"
+    - "investigate the github issue"
+    - "read the github issue"
+    - "read the issue thread"
+    - "respond to a github issue"
+    - "review pr comments"
+    - "look at the pr discussion"
+    - "check the github discussion"
+    - "reading the issue"
+    - "looking at the issue"
+    - "looking at the pr"
+    - "let me check the issue"
+    - "checking the issue"
+=======
+    - "--comments | tail"
+    - "gh issue view --comments"
+  session_categories: [cross-repo, code]
+>>>>>>> upstream/master
 status: active
 description: "NEVER truncate GitHub comment output."
 ---

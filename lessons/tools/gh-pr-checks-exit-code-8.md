@@ -2,11 +2,18 @@
 match:
   keywords:
     - "exit code 8"
+<<<<<<< HEAD
     - "gh pr checks pending"
     - "checks still pending"
     - "checks still in progress"
     - "waiting for checks"
   session_categories: [cross-repo, code, monitoring]
+||||||| f48bba0
+    - "checks still pending"
+=======
+    - "waiting for checks"
+  session_categories: [cross-repo, code, monitoring]
+>>>>>>> upstream/master
 status: active
 generated_from:
   sessions: 538

@@ -14,8 +14,10 @@ conversation when ready.
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
@@ -37,6 +39,7 @@ _IGNORABLE_ERROR_PREFIXES = (
     "WARNING  Failed to load plugin ",  # gptme plugin discovery noise
     "WARNING  OpenTelemetry dependencies not available",
 )
+<<<<<<< HEAD
 # Substrings that mark benign shell-pipeline noise from commands the subagent
 # itself ran (e.g. `find ... | xargs grep ... | head`).  SIGPIPE (signal 13) is
 # the normal result of a downstream consumer closing the pipe early; it is
@@ -48,6 +51,32 @@ _IGNORABLE_ERROR_SUBSTRINGS = ("terminated by signal 13",)
 # These mean "ran out of time", not a generic crash.
 _TIMEOUT_RETURNCODES = frozenset({124, 143})
 _KILLED_RETURNCODE = 137  # 128 + SIGKILL (timeout kill-after or OOM kill)
+||||||| f48bba0
+=======
+# Substrings that mark benign shell-pipeline noise from commands the subagent
+# itself ran (e.g. `find ... | xargs grep ... | head`).  SIGPIPE (signal 13) is
+# the normal result of a downstream consumer closing the pipe early; it is
+# never the real reason a lookup failed and must not be surfaced as the
+# subagent error.
+_IGNORABLE_ERROR_SUBSTRINGS = ("terminated by signal 13",)
+# Returncodes that indicate the subagent was killed by a timeout wrapper
+# (`timeout` exits 124 on expiry; 143 = 128+SIGTERM from the timeout wrapper).
+# These mean "ran out of time", not a generic crash.
+_TIMEOUT_RETURNCODES = frozenset({124, 143})
+_KILLED_RETURNCODE = 137  # 128 + SIGKILL (timeout kill-after or OOM kill)
+# Subprocess-level timeout for each mode.  The asyncio-level safety net
+# (``self.timeout``, default 300 s) should rarely fire when these are set
+# correctly — it only catches pathological hangs where ``timeout(1)`` itself
+# fails to terminate the child.
+_FAST_MODE_SUBPROCESS_TIMEOUT_SECONDS = 30
+_SMART_MODE_SUBPROCESS_TIMEOUT_SECONDS = 120
+# ``timeout(1)`` is a GNU coreutils binary available on Linux but not macOS.
+# When it is missing we fall back to Python-level asyncio timeout handling.
+_TIMEOUT_BINARY_AVAILABLE = shutil.which("timeout") is not None
+# How many recently-completed task records to keep for subagent_status queries.
+# The model can see these to understand whether a task succeeded, timed out, or errored.
+_MAX_RECENT_COMPLETIONS = 5
+>>>>>>> upstream/master
 _DEFAULT_TRANSCRIPT_TAIL_TURNS = 8
 _DEFAULT_TRANSCRIPT_TAIL_CHARS = 1_600
 
@@ -132,6 +161,9 @@ class GptmeToolBridge:
         self._pending_tasks: dict[str, PendingTask] = {}
         self._task_counter = 0
         self._completed_timings: list[dict[str, object]] = []
+        # Short-lived buffer of recently-completed tasks so subagent_status can
+        # distinguish "timed out" from "succeeded" from "never started".
+        self._recent_completions: deque[dict] = deque(maxlen=_MAX_RECENT_COMPLETIONS)
 
     @staticmethod
     def _parse_env_int(name: str, *, default: int, minimum: int = 0) -> int:
@@ -440,6 +472,34 @@ class GptmeToolBridge:
 
         logger.info(f"Task {task_id} complete: {response_text[:100]}...")
 
+        # Record completion for subagent_status queries so the model can
+        # distinguish timed-out tasks from successful ones.
+        completion_status = (
+            "success"
+            if result.success
+            else (
+                "timed_out"
+                if (pending is not None and pending.returncode in _TIMEOUT_RETURNCODES)
+                else "error"
+            )
+        )
+        self._recent_completions.append(
+            {
+                "task_id": task_id,
+                "task": task[:_MAX_TASK_PREVIEW],
+                "status": completion_status,
+                "returncode": pending.returncode if pending is not None else None,
+                "elapsed_seconds": round(
+                    (pending.completed_at or time.monotonic()) - pending.started_at, 1
+                )
+                if pending is not None
+                else None,
+                "output_preview": (result.output or "")[:200]
+                if result.success
+                else None,
+            }
+        )
+
         # Inject result into conversation
         if self.on_result:
             await self.on_result(response_text)
@@ -469,12 +529,30 @@ class GptmeToolBridge:
         )
         logger.debug(f"Response file: {response_file}")
 
-        cmd = [
-            self.gptme_path,
-            "--non-interactive",
-            "--context",
-            "files",
-        ]
+        subprocess_timeout_seconds = (
+            _FAST_MODE_SUBPROCESS_TIMEOUT_SECONDS
+            if mode == "fast"
+            else _SMART_MODE_SUBPROCESS_TIMEOUT_SECONDS
+        )
+
+        if _TIMEOUT_BINARY_AVAILABLE:
+            cmd = [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=5s",
+                f"{subprocess_timeout_seconds}s",
+                self.gptme_path,
+                "--non-interactive",
+                "--context",
+                "files",
+            ]
+        else:
+            cmd = [
+                self.gptme_path,
+                "--non-interactive",
+                "--context",
+                "files",
+            ]
         # Keep project prompt files but skip context_cmd. This avoids pulling in
         # scripts/context.sh while still giving the subagent its runtime rules.
         if model:
@@ -528,14 +606,34 @@ class GptmeToolBridge:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(_read_stdout(), _read_stderr(), process.wait()),
-                    timeout=self.timeout,
+                    timeout=(
+                        self.timeout
+                        if _TIMEOUT_BINARY_AVAILABLE
+                        else subprocess_timeout_seconds
+                    ),
                 )
             except asyncio.TimeoutError:
                 process.kill()
+                # on_completed is never called by the subprocess path when
+                # Python's asyncio.wait_for fires, so pending.returncode stays
+                # None.  Set it explicitly so _handle_subagent_result records
+                # "timed_out" rather than "error" in recent_completions.
+                if on_completed:
+                    on_completed(124, time.monotonic())
+                if _TIMEOUT_BINARY_AVAILABLE:
+                    error_msg = (
+                        "Subagent timed out at the emergency safety limit before it "
+                        "could finish. Try a narrower, more specific question."
+                    )
+                else:
+                    error_msg = (
+                        "Subagent timed out before it could finish. "
+                        "Try a narrower, more specific question."
+                    )
                 return ToolResult(
                     success=False,
                     output="",
-                    error=f"Subagent timed out after {self.timeout}s",
+                    error=error_msg,
                 )
             except asyncio.CancelledError:
                 process.kill()
@@ -707,10 +805,12 @@ class GptmeToolBridge:
                 for tid, entry in self._pending_tasks.items()
                 if not entry.task.done()
             ]
+            recent = list(self._recent_completions)
             return {
                 "status": "ok",
                 "pending_count": len(pending),
                 "pending": pending,
+                "recent_completions": recent,
             }
 
         if name == "subagent_cancel":

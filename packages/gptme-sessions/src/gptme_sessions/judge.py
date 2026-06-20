@@ -63,7 +63,8 @@ class JudgeVerdict(TypedDict, total=False):
 JUDGE_SYSTEM = """\
 You are evaluating an AI agent's work session for strategic value.
 Return ONLY a JSON object with two keys: "score" (float 0.0-1.0) and "reason" (string, 1 sentence).
-Do not wrap in markdown code blocks."""
+Do not wrap in markdown code blocks.
+IMPORTANT: Use the FULL 0.0-1.0 range. Do not cluster scores at 0.7-0.8. Reserve 0.9+ for exceptional sessions; assign 0.1-0.3 for minimal or blocked sessions."""
 
 JUDGE_PROMPT_TEMPLATE = """\
 ## Session Category
@@ -102,6 +103,7 @@ category itself targets goal #1:
   top-priority goal *or* is a category-best example of compounding work.
 
 Key principle: ONE impactful deliverable > FIVE small deliverables.
+<<<<<<< HEAD
 
 ## Agent Goals (ordered by priority)
 {goals}
@@ -239,6 +241,165 @@ def format_intent_context(intent: dict | None) -> str:
     if alignment is not None:
         lines.append(f"- **Self-assigned alignment**: {alignment}")
     return "\n".join(lines) + "\n"
+||||||| f48bba0
+Evaluate impact and goal-alignment, not quantity.
+=======
+
+## Agent Goals (ordered by priority)
+{goals}
+
+## Worked Examples
+The following worked examples show how the rubric applies to real session
+shapes, explaining *why* specific categories earn their score range:
+
+**Example 1 (infrastructure, ~0.78)**: A session normalizes a flaky CI health
+check that has been producing false alerts for a week. It discovers the stale
+worker accumulation, removes the redundant probes, and adds a regression test.
+This session scores ~0.78 because:
+- Infrastructure compounding: every future session inherits a cleaner CI signal.
+- The artifact (test + config fix) is self-verifying and durable.
+- The work is not "revenue work" — that is irrelevant. The within-category
+  value is high: it permanently reduced future friction.
+
+**Example 2 (cleanup, ~0.75)**: A session audits lesson keywords using the LOO
+analysis tool, removes 8 dead keywords whose delta was harmfully negative, and
+updates a companion doc with the audit rationale. This session scores ~0.75
+because:
+- The removed keywords measurably improved agent behavior (validated by
+  LOO effect-size delta).
+- The artifact (keyword changes + companion doc) is durable — every future
+  agent session benefits without extra effort.
+- Busywork-versus-value boundary: the session only removed *harmful* keywords,
+  not all dead weight. It stopped at the value line.
+
+**Example 3 (research, ~0.72)**: A session reads an arXiv paper on tool-use
+reliability, writes a structured research note connecting the findings to the
+agent's architecture, and files a targeted idea-backlog entry. This session
+scores ~0.72 because:
+- The research note is a durable artifact that future sessions reference.
+- It connects abstract findings to concrete, actionable next steps (e.g.,
+  "try two-pass prompting on high-stakes turns").
+- It does *not* score higher because it produced no code change, no test, no
+  automated verification — the impact is mediated through future sessions'
+  ability to use the insight.
+
+**Example 4 (code, ~0.92)**: A session ships a new subagent cancellation API
+(``subagent_cancel()``), adds 12 unit tests covering normal completion and
+timeout, gets Greptile 5/5, and merges cleanly. This session scores ~0.92 because:
+- It directly advances a top-priority goal (subagent reliability, a P1 feature).
+- The artifact is self-verifying (tests), durable (merged), and has no rework.
+- 0.92 rather than 1.0 because no end-to-end integration test was added.
+
+**Example 5 (infrastructure, ~0.15)**: A session starts planning a memory
+cleanup, but every file it tries to modify is locked by a parallel session's
+git stash. It re-checks task state, finds the work already done, writes a
+one-line journal entry, and ends. This session scores ~0.15 because:
+- No artifact was produced — the work was already done by someone else.
+- The only output is a journal entry acknowledging the NOOP.
+- 0.15 rather than 0.0 because the loose-end check and duplicate detection
+  were correct agent behavior — pure NOOP would be 0.0.
+
+Key principle across all five: the grade follows from *within-category*
+execution quality, compounding value, and durability — not from whether the
+category number matches a top goal. Use scores below 0.5 when output is
+minimal, blocked, or duplicated, and scores above 0.85 only for sessions
+that ship a durable, high-impact deliverable.
+
+## Forbidden Constructions
+Do NOT invoke any of the following as a penalty rationale:
+- "low priority", "Tier 3", "Tier 5", "not a top goal"
+- "misaligned with top goals" or "misaligned with top-priority"
+- "not revenue-generating" or "not revenue work"
+- "below the top revenue-generating goal"
+- "fallback tier" or "lower-tier work" (in a negative sense)
+
+These phrases are category signals, NOT quality signals. Penalize only
+on actual execution quality: thrashing, no-shipped-artifact, over-engineering,
+or invented work — not on what tier or priority the category occupies.
+
+## Routing-Aware Adjustment
+If a `## Routing Context` block above states the session legitimately
+routed to lower-tier work because higher-tier work was unavailable
+(blocked / waiting / no actionable items), score primarily on execution
+quality within the chosen scope. Do not penalize for non-advancement of
+top-priority goals beyond −0.15 below the execution-quality score: the
+selector — not the agent — decided what was eligible.
+If no `## Routing Context` block is present, ignore this adjustment and
+apply the default rubric.
+
+## Intent→Outcome Alignment
+When a `## Session Intent` block is present above, separately rate how well
+the session's actual output matched its declared intent. This is a *separate*
+axis from the execution-quality score — a good pivot still gets a high
+execution score but lower alignment.
+
+If no `## Session Intent` block is present, omit the alignment fields.
+
+**Alignment scale**:
+- 0.9-1.0: Session exactly hit its declared objective and produced the
+  expected artifact (or superseded it with a better outcome).
+- 0.7-0.8: Session achieved its objective but the artifact was partial or
+  the scope drifted slightly.
+- 0.5-0.6: Session delivered something useful, but it materially diverged
+  from the declared objective (pivot).
+- 0.3-0.4: Session touched the intent area but produced a different or
+  weakly-related outcome.
+- 0.0-0.2: Session output is unrelated to the declared intent.
+
+**Alignment verdict** (`pivot_verdict`):
+- ``"on_track"``: The session hit its declared objective and produced the
+  expected artifact (or clearly superseded it with a better outcome).
+- ``"partial"``: The session mostly achieved the objective, but the artifact
+  was partial or the scope drifted slightly.
+- ``"pivot"``: The session delivered something useful, but it materially
+  diverged from the declared objective.
+- ``"off_target"``: The session output is unrelated or only weakly related
+  to the declared intent.
+
+**Self-assigned calibration**: If the session already self-assigned an
+alignment verdict (``on_track`` / ``partial`` / ``pivot`` / ``off_target``),
+use it as calibration — your score should agree in direction unless you
+have strong evidence otherwise.
+
+Return JSON: {{"score": <float>, "reason": "<1 sentence>", "alignment_score": <float or null>, "pivot_verdict": <"on_track"|"partial"|"pivot"|"off_target"|null>}}"""
+
+
+def format_intent_context(intent: dict | None) -> str:
+    """Render an `## Session Intent` block from a pre-session intent payload.
+
+    Returns an empty string when ``intent`` is None or lacks the required fields.
+    The string is plugged into ``JUDGE_PROMPT_TEMPLATE`` between the Routing
+    Context and Session Journal blocks (before the rubric).
+
+    Expected keys (all required for a non-empty return):
+    - ``session_id`` (str): Canonical session ID.
+    - ``lane`` (str): CASCADE tier/category, e.g. ``"Tier3:internal-code"``.
+    - ``objective`` (str): One-sentence session goal.
+    - ``expected_artifact`` (str): One-sentence concrete output.
+    - ``outcome_alignment`` (str | None): Self-assigned alignment verdict
+      (``"on_track"``, ``"partial"``, ``"pivot"``, ``"off_target"``, or None).
+
+    The presence of ``outcome_alignment`` switches the block from pre-session
+    intent (no self-grade yet) to post-session intent (self-assigned verdict
+    included as judge calibration signal).
+    """
+    if not intent or not isinstance(intent, dict):
+        return ""
+    required = {"objective", "expected_artifact", "lane"}
+    if not required.issubset(intent):
+        return ""
+    lines = [
+        "",
+        "## Session Intent",
+        f"- **Objective**: {intent['objective']}",
+        f"- **Expected artifact**: {intent['expected_artifact']}",
+        f"- **Lane**: {intent['lane']}",
+    ]
+    alignment = intent.get("outcome_alignment")
+    if alignment is not None:
+        lines.append(f"- **Self-assigned alignment**: {alignment}")
+    return "\n".join(lines) + "\n"
+>>>>>>> upstream/master
 
 
 DEFAULT_GOALS = """\
@@ -427,6 +588,16 @@ def _strip_anthropic_prefix(model: str) -> str:
     return model.removeprefix("anthropic/") if model.startswith("anthropic/") else model
 
 
+# Models that require temperature=1.0 (Anthropic extended-thinking variants).
+_EXTENDED_THINKING_PREFIXES = ("claude-3-7-",)
+
+
+def _is_extended_thinking_model(model: str) -> bool:
+    """Return True for models that require temperature=1.0 (extended-thinking API constraint)."""
+    bare = _strip_anthropic_prefix(model)
+    return any(bare.startswith(p) for p in _EXTENDED_THINKING_PREFIXES)
+
+
 def _judge_backend(model: str) -> str:
     if _is_anthropic_direct_model(model):
         return "anthropic-direct"
@@ -554,6 +725,7 @@ def _judge_via_anthropic_direct(
     *,
     model: str,
     api_key: str | None,
+    temperature: float = 0.3,
 ) -> dict | None:
     """Call the judge via the direct Anthropic SDK (legacy path)."""
     try:
@@ -567,6 +739,16 @@ def _judge_via_anthropic_direct(
         logger.warning("No Anthropic API key found; direct judge unavailable")
         return None
 
+    # Extended-thinking models require temperature=1.0; guard against future
+    # DEFAULT_JUDGE_MODEL changes that would otherwise cause an API 400.
+    effective_temperature = 1.0 if _is_extended_thinking_model(model) else temperature
+    if effective_temperature != temperature:
+        logger.debug(
+            "Extended-thinking model %s requires temperature=1.0; overriding %.2f",
+            model,
+            temperature,
+        )
+
     try:
         client = anthropic.Anthropic(api_key=key)
         response = client.messages.create(
@@ -574,6 +756,7 @@ def _judge_via_anthropic_direct(
             max_tokens=150,
             system=JUDGE_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
+            temperature=effective_temperature,
         )
         text = getattr(response.content[0], "text", "").strip()
     except Exception as exc:
@@ -584,7 +767,13 @@ def _judge_via_anthropic_direct(
 
 
 def _judge_via_gptme(prompt: str, *, model: str) -> dict | None:
-    """Call the judge via ``gptme.llm.reply`` for non-Anthropic-direct models."""
+    """Call the judge via ``gptme.llm.reply`` for non-Anthropic-direct models.
+
+    Temperature is not explicitly set here — gptme.llm.reply defaults to the
+    model API default (typically 1.0 for Claude), which already provides
+    sufficient variance. The caller's ``temperature`` param is applied by
+    the anthropic-direct path only.
+    """
     try:
         from gptme.init import init as init_gptme
         from gptme.llm import reply
@@ -631,8 +820,15 @@ def judge_session(
     goals: str = DEFAULT_GOALS,
     model: str = DEFAULT_JUDGE_MODEL,
     api_key: str | None = None,
+<<<<<<< HEAD
     cascade_context: dict | None = None,
     intent: dict | None = None,
+||||||| f48bba0
+=======
+    cascade_context: dict | None = None,
+    intent: dict | None = None,
+    temperature: float = 0.3,
+>>>>>>> upstream/master
 ) -> dict | None:
     """Score a session's strategic value using an LLM judge.
 
@@ -648,6 +844,7 @@ def judge_session(
             installed.
         api_key: Anthropic API key (Anthropic-direct path only). Falls
             back to env/config if not provided.
+<<<<<<< HEAD
         cascade_context: Optional CASCADE selector payload describing
             which tier the session legitimately routed to. When the
             payload signals a Tier 3 fallback (higher-tier work was
@@ -663,6 +860,27 @@ def judge_session(
             Expected keys: ``session_id``, ``lane``, ``objective``,
             ``expected_artifact``, and optionally ``outcome_alignment``
             (self-assigned pre-closeout verdict).
+||||||| f48bba0
+=======
+        cascade_context: Optional CASCADE selector payload describing
+            which tier the session legitimately routed to. When the
+            payload signals a Tier 3 fallback (higher-tier work was
+            blocked), the prompt instructs the judge to score primarily
+            on execution quality rather than penalize for not advancing
+            top-priority goals. See :func:`format_routing_context` for
+            the recognised keys. Pass ``None`` (default) to keep prompt
+            behaviour unchanged.
+        intent: Optional pre-session intent dict (Phase 3: intent contract).
+            When provided, an ``## Session Intent`` block is injected into
+            the prompt and the judge is asked to return ``alignment_score``
+            and ``pivot_verdict`` fields alongside ``score`` and ``reason``.
+            Expected keys: ``session_id``, ``lane``, ``objective``,
+            ``expected_artifact``, and optionally ``outcome_alignment``
+            (self-assigned pre-closeout verdict).
+        temperature: Sampling temperature for the judge model (default 0.3).
+            Higher values increase score variance; 0.0 produces near-constant
+            scores that undermine calibration.
+>>>>>>> upstream/master
 
     Returns:
         Dict with keys ``score`` (float), ``reason`` (str), ``model`` (str),
@@ -685,7 +903,9 @@ def judge_session(
     )
 
     if _is_anthropic_direct_model(model):
-        return _judge_via_anthropic_direct(prompt, model=model, api_key=api_key)
+        return _judge_via_anthropic_direct(
+            prompt, model=model, api_key=api_key, temperature=temperature
+        )
     return _judge_via_gptme(prompt, model=model)
 
 
@@ -697,8 +917,15 @@ def judge_session_with_fallback(
     default_model: str = DEFAULT_JUDGE_MODEL,
     fallback_models: tuple[str, ...] = (),
     api_key: str | None = None,
+<<<<<<< HEAD
     cascade_context: dict | None = None,
     intent: dict | None = None,
+||||||| f48bba0
+=======
+    cascade_context: dict | None = None,
+    intent: dict | None = None,
+    temperature: float = 0.3,
+>>>>>>> upstream/master
 ) -> dict | None:
     """Score a session, trying fallback models if the primary is unavailable.
 
@@ -709,8 +936,15 @@ def judge_session_with_fallback(
         default_model: Primary judge model. Tried first.
         fallback_models: Additional models to try in order when the primary fails.
         api_key: Anthropic API key (Anthropic-direct path only).
+<<<<<<< HEAD
         cascade_context: Optional CASCADE selector payload. See :func:`judge_session`.
         intent: Optional pre-session intent dict. See :func:`judge_session`.
+||||||| f48bba0
+=======
+        cascade_context: Optional CASCADE selector payload. See :func:`judge_session`.
+        intent: Optional pre-session intent dict. See :func:`judge_session`.
+        temperature: Sampling temperature forwarded to :func:`judge_session`.
+>>>>>>> upstream/master
 
     Returns:
         Dict with keys ``score``, ``reason``, ``model`` or ``None`` if all models fail.
@@ -729,8 +963,15 @@ def judge_session_with_fallback(
             goals=goals,
             model=model,
             api_key=api_key,
+<<<<<<< HEAD
             cascade_context=cascade_context,
             intent=intent,
+||||||| f48bba0
+=======
+            cascade_context=cascade_context,
+            intent=intent,
+            temperature=temperature,
+>>>>>>> upstream/master
         )
         if result is not None:
             return result
@@ -877,8 +1118,15 @@ def judge_and_writeback(
     model: str = DEFAULT_JUDGE_MODEL,
     fallback_models: tuple[str, ...] = (),
     api_key: str | None = None,
+<<<<<<< HEAD
     cascade_context: dict | None = None,
     intent: dict | None = None,
+||||||| f48bba0
+=======
+    cascade_context: dict | None = None,
+    intent: dict | None = None,
+    temperature: float = 0.3,
+>>>>>>> upstream/master
 ) -> dict[str, Any]:
     """Judge a session and persist the verdict via SessionStore.
 
@@ -893,8 +1141,15 @@ def judge_and_writeback(
             default_model=model,
             fallback_models=fallback_models,
             api_key=api_key,
+<<<<<<< HEAD
             cascade_context=cascade_context,
             intent=intent,
+||||||| f48bba0
+=======
+            cascade_context=cascade_context,
+            intent=intent,
+            temperature=temperature,
+>>>>>>> upstream/master
         )
     else:
         verdict = judge_session(
@@ -903,8 +1158,15 @@ def judge_and_writeback(
             goals=goals,
             model=model,
             api_key=api_key,
+<<<<<<< HEAD
             cascade_context=cascade_context,
             intent=intent,
+||||||| f48bba0
+=======
+            cascade_context=cascade_context,
+            intent=intent,
+            temperature=temperature,
+>>>>>>> upstream/master
         )
     if verdict is None:
         return {"status": "failed"}

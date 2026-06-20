@@ -476,7 +476,44 @@ def _build_resume_instructions(
 _PROVIDER_OPENAI = "openai"
 _PROVIDER_GROK = "grok"
 _VALID_PROVIDERS = (_PROVIDER_OPENAI, _PROVIDER_GROK)
+<<<<<<< HEAD
 _VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+||||||| f48bba0
+=======
+_VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+# Friendly provider descriptions for truthful runtime self-reporting. The
+# realtime voice model otherwise confabulates an unrelated identity (observed
+# 2026-06-05: claiming "Claude 3.5 Sonnet" on a Grok-powered call) when a caller
+# asks what is powering the conversation.
+_PROVIDER_DISPLAY = {
+    _PROVIDER_OPENAI: "OpenAI's realtime voice API",
+    _PROVIDER_GROK: "xAI's Grok realtime voice API",
+}
+
+
+def _build_runtime_identity_instructions(provider: str, model: str | None) -> str:
+    """Return a truthful runtime-identity block for the active voice provider.
+
+    The realtime model has no inherent knowledge of which provider/model is
+    serving the live call, so when asked "what model are you running on?" it
+    confabulates. This block states the ground truth so the model answers
+    honestly instead of guessing an unrelated vendor.
+    """
+    display = _PROVIDER_DISPLAY.get(provider, f"the {provider} realtime voice API")
+    model_clause = f" (model: {model})" if model else ""
+    return (
+        "RUNTIME IDENTITY:\n"
+        f"- This live voice conversation is served by {display}{model_clause}.\n"
+        "- If the caller asks what model or provider is powering this call, answer "
+        "truthfully with that. Do NOT claim to be Claude, GPT, or any other model "
+        "unless it matches the provider above.\n"
+        "- Your text-based gptme persona and code-lookup subagent may run on a "
+        "different model; only describe the live voice provider above when asked "
+        "about the current call. If you are genuinely unsure, say so rather than "
+        "guessing a vendor."
+    )
+>>>>>>> upstream/master
 
 
 def _get_twilio_field(payload: dict, camel_name: str, snake_name: str) -> str | None:
@@ -523,7 +560,16 @@ class VoiceServer:
         else:
             self._api_key = openai_api_key or _get_openai_api_key()
         self.workspace = workspace or _detect_agent_repo()
-        self._instructions = _load_project_instructions(self.workspace)
+        # Prepend a truthful runtime-identity block so the voice model can answer
+        # "what model is powering this call?" honestly instead of confabulating.
+        # Built from self.provider/self.model, so it applies to every downstream
+        # call path (caller, resume, standup, handoff) that derives from
+        # self._instructions.
+        self._instructions = (
+            _build_runtime_identity_instructions(self.provider, self.model)
+            + "\n\n"
+            + _load_project_instructions(self.workspace)
+        )
         self.resume_window_seconds = int(
             _get_config_env("GPTME_VOICE_RESUME_WINDOW_SECONDS")
             or _DEFAULT_RESUME_WINDOW_SECONDS
@@ -1517,7 +1563,18 @@ class VoiceServer:
 
                         return _on_audio
 
+                    def _make_on_speech_started(_stream_sid: str):
+                        async def _on_speech_started() -> None:
+                            logger.debug(
+                                "Caller speech detected; clearing Twilio playback buffer for %s",
+                                _stream_sid,
+                            )
+                            await self._send_twilio_clear(websocket, _stream_sid)
+
+                        return _on_speech_started
+
                     on_audio = _make_on_audio(stream_sid)
+<<<<<<< HEAD
                     on_ai_transcript, on_user_transcript, _twilio_hangup = (
                         self._make_transcript_callbacks(
                             transcript=transcript,
@@ -1526,6 +1583,24 @@ class VoiceServer:
                             call_sid=call_sid,
                         )
                     )
+||||||| f48bba0
+
+                    def on_ai_transcript(text: str) -> None:
+                        _append_transcript_turn(transcript, "assistant", text)
+
+                    def on_user_transcript(text: str) -> None:
+                        _append_transcript_turn(transcript, "user", text)
+=======
+                    on_speech_started = _make_on_speech_started(stream_sid)
+                    on_ai_transcript, on_user_transcript, _twilio_hangup = (
+                        self._make_transcript_callbacks(
+                            transcript=transcript,
+                            websocket=websocket,
+                            source="twilio",
+                            call_sid=call_sid,
+                        )
+                    )
+>>>>>>> upstream/master
 
                     # Try to claim a pre-warmed session (no handoff/standup for inbound fresh calls)
                     prewarm_eligible = (
@@ -1540,6 +1615,7 @@ class VoiceServer:
                         realtime_client.on_audio = on_audio
                         realtime_client.on_ai_transcript = on_ai_transcript
                         realtime_client.on_user_transcript = on_user_transcript
+                        realtime_client.on_speech_started = on_speech_started
                     else:
                         # Cold path: build session from scratch
                         bootstrap = await self._build_session_bootstrap(
@@ -1563,6 +1639,7 @@ class VoiceServer:
                             on_audio=on_audio,
                             on_ai_transcript=on_ai_transcript,
                             on_user_transcript=on_user_transcript,
+                            on_speech_started=on_speech_started,
                         )
 
                     # Wire tool bridge BEFORE connect/activate so on_function_call
@@ -1638,6 +1715,13 @@ class VoiceServer:
             "media": {"payload": audio_b64},
         }
         await websocket.send_text(json.dumps(message))
+
+    async def _send_twilio_clear(self, websocket, stream_sid: str) -> None:
+        """Flush any queued assistant audio from Twilio's playback buffer."""
+
+        await websocket.send_text(
+            json.dumps({"event": "clear", "streamSid": stream_sid})
+        )
 
     def _build_session_config(
         self,

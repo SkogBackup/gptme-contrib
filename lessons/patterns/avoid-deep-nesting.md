@@ -2,12 +2,19 @@
 match:
   keywords:
   - "deeply nested"
+<<<<<<< HEAD
   - "deep nesting"
   - "nesting levels"
   - "nested conditionals"
   - "guard clause"
   - "guard clauses"
   - "early return"
+||||||| f48bba0
+  - "early return"
+=======
+  - "deep nesting"
+  - "nesting levels"
+>>>>>>> upstream/master
 status: active
 description: "Refactor code when nesting exceeds 3-4 levels using guard clauses, function extraction, or condition inversion."
 ---

@@ -2,7 +2,20 @@
 description: "When submitting PRs from a fork, secrets in the parent repo are not available — avoid workflows that require them"
 match:
   keywords:
+<<<<<<< HEAD
     - "ANTHROPIC_API_KEY not set"
+||||||| f48bba0
+    - "secret not accessible via fork"
+    - "push directly to repo"
+    - "ANTHROPIC_API_KEY not set"
+    - "permission denied pushing to org repo"
+    - "fork PR failing CI"
+    - "CI secret not available"
+=======
+    - "fork PR secrets"
+    - "fork CI missing secrets"
+    - "push directly to org"
+>>>>>>> upstream/master
   session_categories: [code, cross-repo]
 status: active
 ---

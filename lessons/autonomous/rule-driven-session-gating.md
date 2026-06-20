@@ -10,7 +10,23 @@ tags:
 - orchestration
 match:
   keywords:
+<<<<<<< HEAD
   - cost optimization
+||||||| f48bba0
+  - inference cost
+  - monitoring sessions
+  - session gating
+  - no-op sessions
+  - skip session
+  - session orchestration
+  - routine monitoring
+  - cost optimization
+=======
+    - "skip sessions when nothing to do"
+    - "lightweight check before spawning"
+    - "session gating"
+  session_categories: [autonomous, infrastructure]
+>>>>>>> upstream/master
 ---
 
 # Rule-Driven Session Gating for Monitoring Agents

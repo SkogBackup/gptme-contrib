@@ -3,7 +3,10 @@ import logging
 from pathlib import Path
 
 import pytest
-from gptme_voice.realtime.tool_bridge import GptmeToolBridge
+from gptme_voice.realtime.tool_bridge import (
+    _TIMEOUT_BINARY_AVAILABLE,
+    GptmeToolBridge,
+)
 
 
 class _FakeStream:
@@ -136,7 +139,14 @@ def test_execute_uses_legacy_env_override_for_smart_model() -> None:
             result = await bridge._execute("Inspect recent voice changes", mode="smart")
 
         assert result.success is True
-        assert tuple(captured["args"])[:7] == (
+        args = tuple(captured["args"])
+        assert args[:4] == (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            "120s",
+        )
+        assert args[4:11] == (
             "gptme",
             "--non-interactive",
             "--context",
@@ -145,7 +155,7 @@ def test_execute_uses_legacy_env_override_for_smart_model() -> None:
             "openai-subscription/gpt-5.4",
             "--tool-format",
         )
-        assert tuple(captured["args"])[7] == "tool"
+        assert args[11] == "tool"
 
     asyncio.run(_exercise())
 
@@ -167,9 +177,16 @@ def test_execute_uses_fast_model_override_without_touching_smart() -> None:
             result = await bridge._execute("Inspect recent voice changes", mode="fast")
 
         assert result.success is True
-        assert "--model" in tuple(captured["args"])
-        model_index = tuple(captured["args"]).index("--model") + 1
-        assert tuple(captured["args"])[model_index] == "openai/gpt-5-mini"
+        args = tuple(captured["args"])
+        assert args[:4] == (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            "30s",
+        )
+        assert "--model" in args
+        model_index = args.index("--model") + 1
+        assert args[model_index] == "openai/gpt-5-mini"
 
     asyncio.run(_exercise())
 
@@ -191,7 +208,14 @@ def test_execute_uses_smart_model_override_without_touching_fast() -> None:
             result = await bridge._execute("Inspect recent voice changes", mode="smart")
 
         assert result.success is True
-        assert tuple(captured["args"])[:7] == (
+        args = tuple(captured["args"])
+        assert args[:4] == (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            "120s",
+        )
+        assert args[4:11] == (
             "gptme",
             "--non-interactive",
             "--context",
@@ -200,7 +224,7 @@ def test_execute_uses_smart_model_override_without_touching_fast() -> None:
             "openai-subscription/gpt-5.4",
             "--tool-format",
         )
-        assert tuple(captured["args"])[7] == "tool"
+        assert args[11] == "tool"
 
     asyncio.run(_exercise())
 
@@ -221,7 +245,14 @@ def test_execute_uses_env_override_for_gptme_path() -> None:
             result = await bridge._execute("Inspect recent voice changes", mode="smart")
 
         assert result.success is True
-        assert tuple(captured["args"])[0] == "/fake/bin/gptme"
+        args = tuple(captured["args"])
+        assert args[:5] == (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            "120s",
+            "/fake/bin/gptme",
+        )
 
     asyncio.run(_exercise())
 
@@ -243,6 +274,12 @@ def test_execute_fast_mode_keeps_context_files() -> None:
             await bridge._execute("quick lookup", mode="fast")
 
         args = tuple(captured["args"])
+        assert args[:4] == (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            "30s",
+        )
         assert "--context" in args
         assert "files" in args
         assert "--non-interactive" in args
@@ -267,8 +304,72 @@ def test_execute_smart_mode_keeps_context_loading() -> None:
             await bridge._execute("detailed analysis", mode="smart")
 
         args = tuple(captured["args"])
-        assert "--context" in args
-        assert "files" in args
+        assert args[:8] == (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            "120s",
+            "gptme",
+            "--non-interactive",
+            "--context",
+            "files",
+        )
+
+    asyncio.run(_exercise())
+
+
+def test_execute_fast_mode_uses_subprocess_timeout_wrapper() -> None:
+    async def _exercise() -> None:
+        captured: dict[str, object] = {}
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return _FakeProcess(returncode=0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+            bridge = GptmeToolBridge(workspace="/fake/workspace")
+            await bridge._execute("quick lookup", mode="fast")
+
+        args = tuple(captured["args"])
+        if _TIMEOUT_BINARY_AVAILABLE:
+            assert args[:4] == (
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=5s",
+                "30s",
+            )
+        else:
+            assert args[0] == bridge.gptme_path
+
+    asyncio.run(_exercise())
+
+
+def test_execute_smart_mode_uses_subprocess_timeout_wrapper() -> None:
+    async def _exercise() -> None:
+        captured: dict[str, object] = {}
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return _FakeProcess(returncode=0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+            bridge = GptmeToolBridge(workspace="/fake/workspace")
+            await bridge._execute("deep lookup", mode="smart")
+
+        args = tuple(captured["args"])
+        if _TIMEOUT_BINARY_AVAILABLE:
+            assert args[:4] == (
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=5s",
+                "120s",
+            )
+        else:
+            assert args[0] == bridge.gptme_path
 
     asyncio.run(_exercise())
 
@@ -763,6 +864,7 @@ def test_subagent_status_lists_pending_dispatch() -> None:
     asyncio.run(_exercise())
 
 
+<<<<<<< HEAD
 def test_subagent_dispatch_defaults_to_fast_mode() -> None:
     """Missing mode should still dispatch on the fast live-call path."""
 
@@ -800,6 +902,163 @@ def test_subagent_dispatch_defaults_to_fast_mode() -> None:
     asyncio.run(_exercise())
 
 
+||||||| f48bba0
+=======
+def test_subagent_status_shows_recent_completion_on_success() -> None:
+    """After a task completes, subagent_status should list it in recent_completions."""
+
+    async def _exercise() -> None:
+        async def _fake_create_subprocess_exec(*_args, **_kwargs):
+            return _FakeProcess(
+                returncode=0, stdout="Dashboard has 3 sub-dashboards.\n"
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+            bridge = GptmeToolBridge(workspace="/fake/workspace", timeout=10)
+
+            dispatch = await bridge.handle_function_call(
+                "subagent", {"task": "list dashboards", "mode": "fast"}
+            )
+            task_id = dispatch["task_id"]
+
+            # Let the background task finish
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            status = await bridge.handle_function_call("subagent_status", {})
+            assert status["pending_count"] == 0
+            recent = status["recent_completions"]
+            assert len(recent) == 1
+            entry = recent[0]
+            assert entry["task_id"] == task_id
+            assert entry["status"] == "success"
+            assert entry["returncode"] == 0
+            assert entry["elapsed_seconds"] is not None
+            assert "list dashboards" in entry["task"]
+
+    asyncio.run(_exercise())
+
+
+def test_subagent_status_shows_recent_timeout() -> None:
+    """A timed-out task (returncode=124) should appear as 'timed_out' in recent_completions."""
+
+    async def _exercise() -> None:
+        # Simulate a timeout: process exits immediately with rc=124 (UNIX timeout cmd)
+        async def _fake_create_subprocess_exec(*_args, **_kwargs):
+            return _FakeProcess(returncode=124, stdout="partial result\n")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+            bridge = GptmeToolBridge(workspace="/fake/workspace", timeout=10)
+
+            dispatch = await bridge.handle_function_call(
+                "subagent", {"task": "explore dashboard portal", "mode": "fast"}
+            )
+            task_id = dispatch["task_id"]
+
+            # Let the background task finish
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            status = await bridge.handle_function_call("subagent_status", {})
+            assert status["pending_count"] == 0
+            recent = status["recent_completions"]
+            assert len(recent) == 1
+            entry = recent[0]
+            assert entry["task_id"] == task_id
+            assert entry["status"] == "timed_out"
+            assert entry["returncode"] == 124
+            assert "explore dashboard portal" in entry["task"]
+
+    asyncio.run(_exercise())
+
+
+def test_subagent_status_shows_asyncio_timeout() -> None:
+    """Python asyncio.TimeoutError path records 'timed_out', not 'error'.
+
+    When asyncio.wait_for fires (Python-side timeout), on_completed is never
+    called by the subprocess path, so pending.returncode stays None without the
+    fix.  Verify the explicit on_completed(124, ...) call in the handler makes
+    the status surface correctly.
+    """
+
+    async def _exercise() -> None:
+        class _SlowProcess(_FakeProcess):
+            async def wait(self) -> int:
+                await asyncio.sleep(1000)
+                return 0  # never reached
+
+        async def _fake_create_subprocess_exec(*_args, **_kwargs):
+            return _SlowProcess(returncode=0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+            # Very short timeout so asyncio.wait_for fires immediately
+            bridge = GptmeToolBridge(workspace="/fake/workspace", timeout=0.01)
+
+            dispatch = await bridge.handle_function_call(
+                "subagent",
+                {"task": "slow task that triggers asyncio timeout", "mode": "fast"},
+            )
+            task_id = dispatch["task_id"]
+
+            # Let the background task run and hit the timeout
+            for _ in range(50):
+                await asyncio.sleep(0.001)
+
+            status = await bridge.handle_function_call("subagent_status", {})
+            assert status["pending_count"] == 0
+            recent = status["recent_completions"]
+            assert len(recent) == 1
+            entry = recent[0]
+            assert entry["task_id"] == task_id
+            assert (
+                entry["status"] == "timed_out"
+            ), f"expected timed_out, got {entry['status']}"
+            assert entry["returncode"] == 124
+
+    asyncio.run(_exercise())
+
+
+def test_subagent_dispatch_defaults_to_fast_mode() -> None:
+    """Missing mode should still dispatch on the fast live-call path."""
+
+    async def _exercise() -> None:
+        class _SlowProcess(_FakeProcess):
+            async def wait(self) -> int:
+                await asyncio.sleep(5)
+                return 0
+
+        async def _fake_create_subprocess_exec(*_args, **_kwargs):
+            return _SlowProcess(returncode=0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+            bridge = GptmeToolBridge(workspace="/fake/workspace", timeout=10)
+
+            dispatch = await bridge.handle_function_call(
+                "subagent", {"task": "check one thing"}
+            )
+            assert dispatch["status"] == "dispatched"
+            task_id = dispatch["task_id"]
+
+            await asyncio.sleep(0)
+
+            status = await bridge.handle_function_call("subagent_status", {})
+            assert status["status"] == "ok"
+            assert status["pending_count"] == 1
+            entry = status["pending"][0]
+            assert entry["task_id"] == task_id
+            assert entry["mode"] == "fast"
+            assert entry["model"] == bridge.model_fast
+
+            await bridge.handle_function_call("subagent_cancel", {"task_id": task_id})
+
+    asyncio.run(_exercise())
+
+
+>>>>>>> upstream/master
 def test_completed_subagent_logs_timing_summary(caplog) -> None:
     async def _exercise() -> None:
         async def _fake_create_subprocess_exec(*_args, **_kwargs):

@@ -13,11 +13,13 @@ import pytest
 from gptme_voice.realtime.audio import AudioConverter
 from gptme_voice.realtime.server import (
     RecentCallRecord,
+    SessionBootstrap,
     TranscriptTurn,
     VoiceServer,
     _assistant_committed_hangup,
     _build_caller_instructions,
     _build_resume_instructions,
+    _build_runtime_identity_instructions,
     _get_twilio_field,
     _lookup_caller_identity,
     _should_trigger_hangup_transcript_fallback,
@@ -69,15 +71,40 @@ class _DummyBrowserWebSocket:
         self.binary_messages.append(message)
 
 
+class _DummyTwilioWebSocket(_DummyWebSocket):
+    def __init__(self, incoming: list[dict[str, object]]) -> None:
+        super().__init__()
+        self._incoming = [json.dumps(message) for message in incoming]
+        self.accepted = False
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    def iter_text(self):
+        async def _gen():
+            for message in self._incoming:
+                yield message
+
+        return _gen()
+
+    @property
+    def query_params(self) -> dict[str, str]:
+        return {}
+
+
 class _FakeRealtimeClient:
     def __init__(self) -> None:
         self.sent_audio: list[bytes] = []
         self.commit_count = 0
         self.disconnect_kwargs: dict[str, object] | None = None
+        self.activate_session_count = 0
         self.on_function_call = None
 
     async def connect(self) -> None:
         return None
+
+    async def activate_session(self) -> None:
+        self.activate_session_count += 1
 
     async def send_audio(self, audio_data: bytes) -> None:
         self.sent_audio.append(audio_data)
@@ -130,6 +157,38 @@ def test_build_caller_instructions_known_number_from_people_dir() -> None:
     assert "Erik Bjäreholt" in result
     assert "+46700000001" in result
     assert "You are Bob." in result
+
+
+def test_build_runtime_identity_instructions_grok() -> None:
+    result = _build_runtime_identity_instructions("grok", None)
+    assert "Grok" in result
+    assert "xAI" in result
+    # Must explicitly forbid the observed confabulation.
+    assert "Claude" in result
+    assert "GPT" in result
+    assert "truthfully" in result.lower()
+    # No model alias supplied → no model clause.
+    assert "model:" not in result
+
+
+def test_build_runtime_identity_instructions_openai_with_model() -> None:
+    result = _build_runtime_identity_instructions("openai", "gpt-realtime")
+    assert "OpenAI" in result
+    assert "gpt-realtime" in result
+    assert "model: gpt-realtime" in result
+
+
+def test_build_runtime_identity_instructions_unknown_provider() -> None:
+    # Unknown provider should still produce a non-confabulating block.
+    result = _build_runtime_identity_instructions("anthropic", None)
+    assert "anthropic" in result
+
+
+def test_voice_server_prepends_runtime_identity_to_instructions() -> None:
+    server = VoiceServer(provider="grok")
+    # The runtime-identity block leads the base instructions for every call path.
+    assert server._instructions.startswith("RUNTIME IDENTITY:")
+    assert "Grok" in server._instructions
 
 
 def test_lookup_caller_identity_uses_call_name_when_present() -> None:
@@ -351,6 +410,114 @@ def test_handle_browser_websocket_resamples_binary_pcm_and_commits(
     assert fake_client.commit_count == 1
     assert fake_client.disconnect_kwargs is not None
     assert fake_client.disconnect_kwargs["commit_audio"] is True
+
+
+def test_handle_twilio_websocket_wires_speech_started_clear_callback_cold_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _exercise() -> None:
+        server = VoiceServer()
+        websocket = _DummyTwilioWebSocket(
+            [
+                {"event": "connected"},
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ123",
+                        "callSid": "CA123",
+                        "customParameters": {},
+                    },
+                },
+                {"event": "stop"},
+            ]
+        )
+        fake_client = _FakeRealtimeClient()
+        captured_kwargs: dict[str, object] = {}
+
+        async def _fake_build_session_bootstrap(
+            *,
+            caller_id: str,
+            from_number: str = "",
+            handoff_id: str | None = None,
+            standup_brief: str | None = None,
+        ) -> SessionBootstrap:
+            return SessionBootstrap("You are Bob.")
+
+        def _fake_make_client(_session_cfg, **kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_client
+
+        async def _fake_on_call_end(*args, **kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(
+            server, "_build_session_bootstrap", _fake_build_session_bootstrap
+        )
+        monkeypatch.setattr(server, "_make_client", _fake_make_client)
+        monkeypatch.setattr(server, "_on_call_end", _fake_on_call_end)
+        monkeypatch.setattr(
+            "gptme_voice.realtime.server.GptmeToolBridge", _DummyToolBridge
+        )
+
+        await server.handle_twilio_websocket(websocket)
+
+        assert websocket.accepted is True
+        assert "on_speech_started" in captured_kwargs
+
+        on_speech_started = captured_kwargs["on_speech_started"]
+        assert callable(on_speech_started)
+        await on_speech_started()
+
+        assert {"event": "clear", "streamSid": "MZ123"} in [
+            json.loads(m) for m in websocket.messages
+        ]
+
+    asyncio.run(_exercise())
+
+
+def test_handle_twilio_websocket_rebinds_speech_started_clear_callback_on_prewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _exercise() -> None:
+        server = VoiceServer()
+        websocket = _DummyTwilioWebSocket(
+            [
+                {"event": "connected"},
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ123",
+                        "callSid": "CA123",
+                        "customParameters": {"from_number": "+46700000001"},
+                    },
+                },
+                {"event": "stop"},
+            ]
+        )
+        fake_client = _FakeRealtimeClient()
+
+        async def _fake_on_call_end(*args, **kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(server, "_claim_prewarm", lambda _from_number: fake_client)
+        monkeypatch.setattr(server, "_on_call_end", _fake_on_call_end)
+        monkeypatch.setattr(
+            "gptme_voice.realtime.server.GptmeToolBridge", _DummyToolBridge
+        )
+
+        await server.handle_twilio_websocket(websocket)
+
+        assert websocket.accepted is True
+        assert fake_client.activate_session_count == 1
+        assert callable(fake_client.on_speech_started)
+
+        await fake_client.on_speech_started()
+
+        assert {"event": "clear", "streamSid": "MZ123"} in [
+            json.loads(m) for m in websocket.messages
+        ]
+
+    asyncio.run(_exercise())
 
 
 def test_build_resume_instructions_includes_prior_transcript() -> None:
