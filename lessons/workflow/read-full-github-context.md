@@ -27,7 +27,6 @@ match:
     - "checking the issue"
 =======
     - "--comments | tail"
-    - "gh issue view --comments"
   session_categories: [cross-repo, code]
 >>>>>>> upstream/master
 status: active

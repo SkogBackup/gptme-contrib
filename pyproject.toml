@@ -50,24 +50,9 @@ members = ["packages/*", "plugins/*"]
 exclude = ["packages/__pycache__", "plugins/__pycache__", "packages/tasks"]
 
 [tool.uv.sources]
-gptme-runloops = { workspace = true }
-gptme-retrieval = { workspace = true }
-gptme-user-memories = { workspace = true }
-gptme-warpgrep = { workspace = true }
-gptme-consortium = { workspace = true }
-gptme-youtube = { workspace = true }
-gptme-ace = { workspace = true }
-gptme-tts = { workspace = true }
-gptme-attention-tracker = { workspace = true }
-gptme-hooks-examples = { workspace = true }
-gptme-gptodo = { workspace = true }
-gptme-wrapped = { workspace = true }
-gptme-gupp = { workspace = true }
-gptme-imagen = { workspace = true }
-gptme-ralph = { workspace = true }
-gptme-claude-code = { workspace = true }
-gptme-lsp = { workspace = true }
-gptme-forum = { workspace = true }
+gptme = { git = "https://github.com/gptme/gptme.git", branch = "master" }
+gptme-sessions = { workspace = true }
+gptme-usage = { workspace = true }
 gptodo = { workspace = true }
 gptme-voice = { workspace = true }
 gptme-sessions = { workspace = true }
