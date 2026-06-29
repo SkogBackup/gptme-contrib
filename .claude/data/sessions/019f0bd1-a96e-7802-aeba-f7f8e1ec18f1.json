@@ -1,0 +1,9 @@
+{
+  "session_id": "019f0bd1-a96e-7802-aeba-f7f8e1ec18f1",
+  "prompts": [
+    "Yeah.",
+    "Repository: /home/skogix/.local/src/gptme-contrib. User requested autonomous team coordination. Read-only assessment only. Identify the repository's actual work queue and current highest-priority actionable items. Inspect local routing/instruction files first, then issue/task/TODO/planning files and current branch status. Do not modify anything. Preserve the user's 8 uncommitted files. Return: (1) exact queue sources and paths, (2) ranked actionable tasks with evidence, (3) whether any task is sufficiently specified for implementation, (4) blockers.",
+    "Repository: /home/skogix/.local/src/gptme-contrib. User requested autonomous team coordination. Read-only assessment only. Audit current git state and collaboration signals: branch/upstream divergence, uncommitted paths and their apparent purpose, recent commits, configured remotes, and any local notification/inbox artifacts or GitHub issues/PRs if safely accessible. Do not edit, stage, commit, or push. Return concise evidence and warn about overlap risks for delegated changes."
+  ],
+  "agent_name": "Synth"
+}

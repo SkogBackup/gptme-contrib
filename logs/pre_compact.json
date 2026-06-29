@@ -1,0 +1,11 @@
+[
+  {
+    "session_id": "019f13b8-3423-7d33-a755-a2290b456fe1",
+    "turn_id": "019f13b8-34c8-79c3-9154-ed615bc1936e",
+    "transcript_path": null,
+    "cwd": "/home/skogix/.local/src/gptme-contrib",
+    "hook_event_name": "PreCompact",
+    "model": "gpt-5.5",
+    "trigger": "auto"
+  }
+]

@@ -1,0 +1,29 @@
+[
+  {
+    "session_id": "019f0bd1-a96e-7802-aeba-f7f8e1ec18f1",
+    "transcript_path": "/home/skogix/.codex/sessions/2026/06/28/rollout-2026-06-28T03-21-57-019f0bd1-a96e-7802-aeba-f7f8e1ec18f1.jsonl",
+    "cwd": "/home/skogix/.local/src/gptme-contrib",
+    "hook_event_name": "SessionStart",
+    "model": "gpt-5.5",
+    "permission_mode": "bypassPermissions",
+    "source": "resume"
+  },
+  {
+    "session_id": "019f13b8-3423-7d33-a755-a2290b456fe1",
+    "transcript_path": null,
+    "cwd": "/home/skogix/.local/src/gptme-contrib",
+    "hook_event_name": "SessionStart",
+    "model": "gpt-5.4-mini",
+    "permission_mode": "bypassPermissions",
+    "source": "startup"
+  },
+  {
+    "session_id": "019f13b8-3423-7d33-a755-a2290b456fe1",
+    "transcript_path": null,
+    "cwd": "/home/skogix/.local/src/gptme-contrib",
+    "hook_event_name": "SessionStart",
+    "model": "gpt-5.4-mini",
+    "permission_mode": "bypassPermissions",
+    "source": "compact"
+  }
+]

@@ -32,11 +32,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE=""
 NO_CACHE=false
 for arg in "$@"; do
-    case "$arg" in
-        --json|--jsonl) MODE="json" ;;
-        --raw) MODE="raw" ;;
-        --no-cache) NO_CACHE=true ;;
-    esac
+  case "$arg" in
+  --json | --jsonl) MODE="json" ;;
+  --raw) MODE="raw" ;;
+  --no-cache) NO_CACHE=true ;;
+  esac
 done
 
 CACHE_FILE="${CODEX_USAGE_CACHE_FILE:-/tmp/codex-usage-cache.json}"
@@ -44,15 +44,15 @@ CACHE_TTL="${CODEX_USAGE_CACHE_TTL:-180}"
 
 # --- Cache check ---
 if [ "$NO_CACHE" = false ] && [ -f "$CACHE_FILE" ]; then
-    cache_age=$(( $(date +%s) - $(stat -c '%Y' "$CACHE_FILE" 2>/dev/null || stat -f '%m' "$CACHE_FILE" 2>/dev/null || echo 0) ))
-    if [ "$cache_age" -lt "$CACHE_TTL" ]; then
-        case "$MODE" in
-            json) cat "$CACHE_FILE" ;;
-            raw)  echo "(cached)" ;;
-            *)    echo "(cached, use --json or --no-cache for fresh data)" ;;
-        esac
-        exit 0
-    fi
+  cache_age=$(($(date +%s) - $(stat -c '%Y' "$CACHE_FILE" 2>/dev/null || stat -f '%m' "$CACHE_FILE" 2>/dev/null || echo 0)))
+  if [ "$cache_age" -lt "$CACHE_TTL" ]; then
+    case "$MODE" in
+    json) cat "$CACHE_FILE" ;;
+    raw) echo "(cached)" ;;
+    *) echo "(cached, use --json or --no-cache for fresh data)" ;;
+    esac
+    exit 0
+  fi
 fi
 
 # --- Single-scrape concurrency guard ---
@@ -61,27 +61,27 @@ fi
 SCRAPE_LOCK="${CODEX_USAGE_SCRAPE_LOCK:-/tmp/codex-usage-scrape.lock}"
 exec 9>"$SCRAPE_LOCK"
 if command -v flock &>/dev/null && ! flock -n 9; then
-    if [ -f "$CACHE_FILE" ]; then
-        case "$MODE" in
-            json) cat "$CACHE_FILE" ;;
-            *)    echo "(another scrape in progress; serving cached result)" ;;
-        esac
-        exit 0
-    fi
-    echo "Error: another codex-usage scrape is already running" >&2
-    exit 1
+  if [ -f "$CACHE_FILE" ]; then
+    case "$MODE" in
+    json) cat "$CACHE_FILE" ;;
+    *) echo "(another scrape in progress; serving cached result)" ;;
+    esac
+    exit 0
+  fi
+  echo "Error: another codex-usage scrape is already running" >&2
+  exit 1
 fi
 
 # --- Dependency checks ---
 if ! command -v tmux &>/dev/null; then
-    echo "Error: tmux is required" >&2
-    exit 1
+  echo "Error: tmux is required" >&2
+  exit 1
 fi
 
-CODEX_BIN="${CODEX_BIN:-$HOME/.npm-global/bin/codex}"
+CODEX_BIN="${CODEX_BIN:-$HOME/.local/bin/codex}"
 if [ ! -x "$CODEX_BIN" ]; then
-    echo "Error: codex binary not found at $CODEX_BIN" >&2
-    exit 1
+  echo "Error: codex binary not found at $CODEX_BIN" >&2
+  exit 1
 fi
 
 # --- Pre-suppress update prompt ---
@@ -91,7 +91,7 @@ fi
 # Setting dismissed_version = latest_version silently suppresses the prompt.
 VERSION_FILE="$HOME/.codex/version.json"
 if [ -f "$VERSION_FILE" ]; then
-    python3 - <<'PYEOF'
+  python3 - <<'PYEOF'
 import json, os
 vf_path = os.path.expanduser("~/.codex/version.json")
 with open(vf_path) as vf:
@@ -109,13 +109,13 @@ TIMEOUT=45
 
 # --- Cleanup handler ---
 _cleanup() {
-    tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+  tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 }
 trap _cleanup EXIT
 
 # --- Start codex in a headless tmux session ---
 tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
-    "$CODEX_BIN --ask-for-approval never 2>&1; sleep 2"
+  "$CODEX_BIN --ask-for-approval never 2>&1; sleep 2"
 
 # --- Wait for codex to become ready, dismissing any residual update prompt ---
 # Readiness detection notes (codex 0.137.0):
@@ -131,30 +131,30 @@ tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
 #     `OpenAI Codex (vX.Y.Z)` or a line beginning with the prompt glyph.
 _initialized=false
 for _i in $(seq 1 "$TIMEOUT"); do
-    content=$(tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null || true)
+  content=$(tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null || true)
 
-    # Dismiss only the INTERACTIVE update menu (not the informational banner)
-    if echo "$content" | grep -qE 'Update now|Skip until next version'; then
-        tmux send-keys -t "$SESSION_NAME" Down Down Enter
-        sleep 2
-        continue
-    fi
+  # Dismiss only the INTERACTIVE update menu (not the informational banner)
+  if echo "$content" | grep -qE 'Update now|Skip until next version'; then
+    tmux send-keys -t "$SESSION_NAME" Down Down Enter
+    sleep 2
+    continue
+  fi
 
-    # Ready when the launch banner or the input prompt glyph is present
-    if echo "$content" | grep -qE 'OpenAI Codex \(v|^[[:space:]]*[›>] '; then
-        _initialized=true
-        break
-    fi
+  # Ready when the launch banner or the input prompt glyph is present
+  if echo "$content" | grep -qE 'OpenAI Codex \(v|^[[:space:]]*[›>] '; then
+    _initialized=true
+    break
+  fi
 
-    sleep 1
+  sleep 1
 done
 
 if [ "$_initialized" = false ]; then
-    echo "Error: codex failed to start within ${TIMEOUT}s" >&2
-    if [ "$MODE" = "raw" ]; then
-        tmux capture-pane -t "$SESSION_NAME" -p -S -200 2>/dev/null || true
-    fi
-    exit 1
+  echo "Error: codex failed to start within ${TIMEOUT}s" >&2
+  if [ "$MODE" = "raw" ]; then
+    tmux capture-pane -t "$SESSION_NAME" -p -S -200 2>/dev/null || true
+  fi
+  exit 1
 fi
 
 # --- Settle: the launch banner can render before the input field accepts keys.
@@ -174,58 +174,59 @@ sleep 3
 # --- Capture output (retry rounds for progressive rendering) ---
 ACCUM=""
 for _round in $(seq 1 15); do
-    sleep 1
-    content=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
-    if echo "$content" | grep -qE '[0-9]+% left'; then
-        ACCUM="$content"
-        # Extra wait for Spark section to render
-        sleep 2
-        content2=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
-        if echo "$content2" | grep -qE '(Spark|% left)'; then
-            ACCUM="$content2"
-        fi
-        break
+  sleep 1
+  content=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
+  if echo "$content" | grep -qE '[0-9]+% left'; then
+    ACCUM="$content"
+    # Extra wait for Spark section to render
+    sleep 2
+    content2=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
+    if echo "$content2" | grep -qE '(Spark|% left)'; then
+      ACCUM="$content2"
     fi
+    break
+  fi
 done
 
 # --- Retry once if the first /status attempt produced nothing (input may have
 # been dropped during a slow startup under load). ---
 if [ -z "$ACCUM" ]; then
-    tmux send-keys -t "$SESSION_NAME" "/status"
-    sleep 2
-    tmux send-keys -t "$SESSION_NAME" Enter
-    for _round in $(seq 1 12); do
-        sleep 1
-        content=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
-        if echo "$content" | grep -qE '[0-9]+% left'; then
-            ACCUM="$content"
-            sleep 2
-            content2=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
-            if echo "$content2" | grep -qE '(Spark|% left)'; then
-                ACCUM="$content2"
-            fi
-            break
-        fi
-    done
+  tmux send-keys -t "$SESSION_NAME" "/status"
+  sleep 2
+  tmux send-keys -t "$SESSION_NAME" Enter
+  for _round in $(seq 1 12); do
+    sleep 1
+    content=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
+    if echo "$content" | grep -qE '[0-9]+% left'; then
+      ACCUM="$content"
+      sleep 2
+      content2=$(tmux capture-pane -t "$SESSION_NAME" -p -S -150 2>/dev/null || true)
+      if echo "$content2" | grep -qE '(Spark|% left)'; then
+        ACCUM="$content2"
+      fi
+      break
+    fi
+  done
 fi
 
 # --- Raw mode: dump and exit ---
 if [ "$MODE" = "raw" ]; then
-    echo "$ACCUM"
-    exit 0
+  echo "$ACCUM"
+  exit 0
 fi
 
 # --- Validate capture ---
 if [ -z "$ACCUM" ]; then
-    echo "Error: no usage data captured from codex /status" >&2
-    tmux capture-pane -t "$SESSION_NAME" -p -S -200 2>/dev/null >&2 || true
-    exit 1
+  echo "Error: no usage data captured from codex /status" >&2
+  tmux capture-pane -t "$SESSION_NAME" -p -S -200 2>/dev/null >&2 || true
+  exit 1
 fi
 
 # --- Parse usage via Python ---
 # Normalizes "% left" → utilization (0.0–1.0, where 1.0 = fully consumed)
 # Pass captured output via env var to avoid competing stdin redirections (SC2261).
-JSON=$(CODEX_ACCUM="$ACCUM" REPO_ROOT="$REPO_ROOT" python3 << 'PYEOF'
+JSON=$(
+  CODEX_ACCUM="$ACCUM" REPO_ROOT="$REPO_ROOT" python3 <<'PYEOF'
 import json, os, re, sys
 from datetime import datetime, timezone, timedelta
 
@@ -334,11 +335,11 @@ import json,sys
 d=json.load(sys.stdin)
 assert isinstance(d.get('main'), dict)
 " 2>/dev/null; then
-    echo "$JSON" > "$CACHE_FILE"
-    case "$MODE" in
-        json) echo "$JSON" ;;
-        *)
-            CODEX_JSON="$JSON" python3 << 'PYEOF'
+  echo "$JSON" >"$CACHE_FILE"
+  case "$MODE" in
+  json) echo "$JSON" ;;
+  *)
+    CODEX_JSON="$JSON" python3 <<'PYEOF'
 import json, os
 d = json.loads(os.environ["CODEX_JSON"])
 print("Codex Subscription Usage")
@@ -371,11 +372,11 @@ if spark.get("five_hour") or spark.get("weekly"):
             bar = "█" * filled + "░" * (bar_width - filled)
             print(f"  {label:20s} [{bar}] {util*100:4.0f}% used ({left}% left)")
 PYEOF
-            ;;
-    esac
+    ;;
+  esac
 else
-    echo "Error: failed to parse codex usage output" >&2
-    echo "Raw captured output:" >&2
-    echo "$ACCUM" >&2
-    exit 1
+  echo "Error: failed to parse codex usage output" >&2
+  echo "Raw captured output:" >&2
+  echo "$ACCUM" >&2
+  exit 1
 fi

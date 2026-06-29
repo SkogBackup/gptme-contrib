@@ -1,0 +1,26 @@
+[
+  {
+    "session_id": "019f0bd1-a96e-7802-aeba-f7f8e1ec18f1",
+    "turn_id": "019f12ec-90d4-7b11-938c-ce72d2d5db7d",
+    "transcript_path": "/home/skogix/.codex/sessions/2026/06/29/rollout-2026-06-29T12-28-41-019f12ec-906c-7182-bdb9-99c0e6f44347.jsonl",
+    "cwd": "/home/skogix/.local/src/gptme-contrib",
+    "hook_event_name": "SubagentStart",
+    "model": "gpt-5.5",
+    "permission_mode": "bypassPermissions",
+    "agent_id": "019f12ec-906c-7182-bdb9-99c0e6f44347",
+    "agent_type": "explorer",
+    "logged_at": "2026-06-29T12:28:44.001338"
+  },
+  {
+    "session_id": "019f0bd1-a96e-7802-aeba-f7f8e1ec18f1",
+    "turn_id": "019f12ec-91d4-7c12-b9fb-b3b59bd75ca5",
+    "transcript_path": "/home/skogix/.codex/sessions/2026/06/29/rollout-2026-06-29T12-28-41-019f12ec-9178-75f2-8cf1-3ec35b5dfc2a.jsonl",
+    "cwd": "/home/skogix/.local/src/gptme-contrib",
+    "hook_event_name": "SubagentStart",
+    "model": "gpt-5.5",
+    "permission_mode": "bypassPermissions",
+    "agent_id": "019f12ec-9178-75f2-8cf1-3ec35b5dfc2a",
+    "agent_type": "explorer",
+    "logged_at": "2026-06-29T12:28:44.173168"
+  }
+]
